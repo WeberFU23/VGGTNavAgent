@@ -1,0 +1,168 @@
+"""VGGT-SLAM 建图客户端。在 habitat (python 3.9) 环境中运行，只依赖 numpy。
+
+用法::
+
+    client = MappingClient(port=5555)
+    client.reset_map()                    # 每个 episode 开始
+    info = client.feed_frame(rgb)         # 每个动作步喂当前 RGB
+    pose = client.get_latest_pose()       # 最新关键帧位姿 (cam2world, 4x4) 或 None
+    poses, frame_ids = client.get_all_poses()
+    points, colors = client.get_map_points()
+
+注意：返回位姿是单目相对尺度，世界系锚定第一个子图；
+米制尺度需要通过已知动作步长（前进 0.25m）另行标定。
+"""
+
+import socket
+import uuid
+
+import numpy as np
+
+from mapping.protocol import recv_msg, send_msg
+
+
+class MappingClient:
+    def __init__(self, host="127.0.0.1", port=5555, timeout=120.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._sock = None
+        self._session_id = uuid.uuid4().hex
+        self._request_seq = 0
+
+    def _connect(self):
+        if self._sock is None:
+            self._sock = socket.create_connection(
+                (self.host, self.port), timeout=self.timeout)
+
+    def _request(self, header, payload=b"", retries=1):
+        header = dict(header)
+        self._request_seq += 1
+        header["request_id"] = f"{self._session_id}:{self._request_seq}"
+        for attempt in range(retries + 1):
+            try:
+                self._connect()
+                send_msg(self._sock, header, payload)
+                resp, resp_payload = recv_msg(self._sock)
+                if not resp.get("ok"):
+                    raise RuntimeError(f"mapping server error: {resp}")
+                return resp, resp_payload
+            except (ConnectionError, OSError):
+                self.close()
+                if attempt >= retries:
+                    raise
+        raise RuntimeError("unreachable")
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            finally:
+                self._sock = None
+
+    # ------------------------------------------------------------------
+    def ping(self):
+        resp, _ = self._request({"cmd": "ping"})
+        return True
+
+    def reset_map(self):
+        resp, _ = self._request({"cmd": "reset_map"})
+        return resp
+
+    def flush_map(self):
+        """提交不足一个完整子图的尾部关键帧，并等待处理完成。"""
+        resp, _ = self._request({"cmd": "flush_map"})
+        return resp
+
+    def feed_frame(self, rgb):
+        """喂入一帧 RGB (H, W, 3) uint8，返回关键帧筛选等信息。"""
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        resp, _ = self._request(
+            {"cmd": "feed", "shape": list(rgb.shape)}, rgb.tobytes())
+        return resp
+
+    def get_state(self):
+        resp, _ = self._request({"cmd": "get_state"})
+        return resp
+
+    def wait_idle(self, timeout=60.0, poll=0.2):
+        """等待服务端完成在途子图处理。返回 True 表示已空闲。
+
+        用于 agent pacing：Habitat 离散步执行速度远快于 SLAM 吞吐，
+        忙时短暂等待可避免关键帧缓冲被裁剪丢弃。
+        """
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.get_state().get("busy"):
+                return True
+            time.sleep(poll)
+        return False
+
+    def get_latest_pose(self):
+        """返回最新关键帧的 cam2world 4x4 位姿，尚无可位姿时返回 None。"""
+        resp, _ = self._request({"cmd": "get_latest_pose"})
+        if not resp.get("has_pose"):
+            return None
+        return np.asarray(resp["pose"], dtype=np.float32).reshape(4, 4)
+
+    def get_all_poses(self):
+        """返回 (poses (N,4,4) cam2world, frame_ids list)；无数据返回 (None, [])。"""
+        resp, _ = self._request({"cmd": "get_all_poses"})
+        if not resp.get("has_pose"):
+            return None, []
+        poses = np.asarray(resp["poses"], dtype=np.float32).reshape(-1, 4, 4)
+        return poses, list(resp["frame_ids"])
+
+    def get_map_points(self, max_points=200000):
+        """返回 (points (N,3) float32, colors (N,3) uint8)。"""
+        resp, payload = self._request({"cmd": "get_map", "max_points": max_points})
+        n = resp.get("num_points", 0)
+        if n == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        points = np.frombuffer(payload[: n * 12], dtype=np.float32).reshape(n, 3)
+        colors = np.frombuffer(payload[n * 12:], dtype=np.uint8).reshape(n, 3)
+        return points.copy(), colors.copy()
+
+    def get_intrinsics(self):
+        """返回 VGGT 预测的各子图首帧内参列表（预处理图像坐标系）。"""
+        resp, _ = self._request({"cmd": "get_intrinsics"})
+        return resp.get("intrinsics", [])
+
+    def query_text(self, text, top_k=5):
+        """CLIP 检索 top-K 关键帧。返回 [{frame_id, score, pose, ...}]。"""
+        resp, _ = self._request({"cmd": "query_text", "text": text,
+                                 "top_k": top_k})
+        return resp.get("results", [])
+
+    def ground_object(self, text, top_k=3):
+        """SAM3 实例定位。返回 [{found, point, sam_score, frame_id, ...}]。"""
+        resp, _ = self._request({"cmd": "ground_object", "text": text,
+                                 "top_k": top_k})
+        return resp.get("results", [])
+
+    def resolve_candidate(self, candidate_id):
+        """在最新图优化坐标系中重新计算候选的 3D 点。"""
+        resp, _ = self._request(
+            {"cmd": "resolve_candidate", "candidate_id": candidate_id})
+        return resp
+
+    def get_candidate_evidence(self, candidate_id):
+        """返回候选的紧凑 mask-overlay JPEG，供 VLM 复核。"""
+        resp, payload = self._request(
+            {"cmd": "candidate_evidence", "candidate_id": candidate_id})
+        return resp, payload
+
+    def ground_frame(self, rgb, text):
+        """对当前实时帧做 SAM3 分割（到达前视觉确认）。
+        返回 {found, score, bbox, mask_ratio}。"""
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        resp, _ = self._request(
+            {"cmd": "ground_frame", "text": text,
+             "shape": list(rgb.shape)}, rgb.tobytes())
+        return resp
+
+    def shutdown_server(self):
+        resp, _ = self._request({"cmd": "shutdown"})
+        self.close()
+        return resp

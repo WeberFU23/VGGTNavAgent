@@ -124,6 +124,30 @@ class MappingClient:
         colors = np.frombuffer(payload[n * 12:], dtype=np.uint8).reshape(n, 3)
         return points.copy(), colors.copy()
 
+    def get_frame_points(self, stride=6):
+        """逐帧世界系稠密点。返回 [{frame_id, pose (4,4), points (N,3)
+        float32（NaN=无效）, rows (N,) int32 原始图像行号}]。"""
+        resp, payload = self._request(
+            {"cmd": "get_frame_points", "stride": stride})
+        frames = []
+        offset = 0
+        for meta in resp.get("frames", []):
+            n = meta["h"] * meta["w"]
+            pts = np.frombuffer(payload[offset: offset + n * 12],
+                                dtype=np.float32).reshape(n, 3)
+            offset += n * 12
+            rows = np.repeat(
+                np.arange(meta["h"], dtype=np.int32) * meta["stride"],
+                meta["w"])
+            frames.append({
+                "frame_id": meta["frame_id"],
+                "pose": np.asarray(meta["pose"], dtype=np.float32)
+                .reshape(4, 4),
+                "points": pts.copy(),
+                "rows": rows,
+            })
+        return frames
+
     def get_intrinsics(self):
         """返回 VGGT 预测的各子图首帧内参列表（预处理图像坐标系）。"""
         resp, _ = self._request({"cmd": "get_intrinsics"})

@@ -297,6 +297,44 @@ class MappingServer:
         payload = points.tobytes() + colors.tobytes()
         return {"num_points": len(points)}, payload
 
+    def get_frame_points(self, stride):
+        """逐帧返回世界系稠密点（NaN=低置信无效点）+ 位姿，用于客户端
+        做逐帧局部地板锚定的自由空间投票（全局点云在子图边界有重影，
+        直接分层不可靠）。
+
+        返回 ({"frames": [{frame_id, h, w, stride, pose}]}, payload)，
+        payload 按 frames 顺序拼接每帧 (h*w, 3) float32 点。
+        """
+        stride = max(int(stride), 1)
+        with self.data_lock:
+            metas, chunks = [], []
+            for submap in self.solver.map.ordered_submaps_by_key():
+                if submap.get_lc_status():
+                    continue
+                poses = submap.get_all_poses_world(self.solver.graph)
+                fids = submap.get_frame_ids()
+                for index in range(len(submap.pointclouds)):
+                    hom = self.solver.graph.get_homography(
+                        index + submap.get_id())
+                    pts = submap.pointclouds[index][::stride, ::stride, :]
+                    conf = submap.conf_masks[index][::stride, ::stride] \
+                        > submap.conf_threshold
+                    hh, ww = pts.shape[:2]
+                    flat = pts.reshape(-1, 3).astype(np.float64)
+                    flat = np.hstack(
+                        [flat, np.ones((len(flat), 1))])
+                    world = (hom @ flat.T).T
+                    world = (world[:, :3] / world[:, 3:]).astype(np.float32)
+                    world[~conf.reshape(-1)] = np.nan
+                    metas.append({
+                        "frame_id": int(fids[index]) if fids else index,
+                        "h": hh, "w": ww, "stride": stride,
+                        "pose": np.asarray(
+                            poses[index], dtype=np.float32).tolist(),
+                    })
+                    chunks.append(world.tobytes())
+        return {"frames": metas}, b"".join(chunks)
+
     def get_intrinsics(self):
         """返回 VGGT 预测的各子图首帧内参（预处理图像坐标系，518 宽）。"""
         with self.data_lock:
@@ -571,6 +609,10 @@ class MappingServer:
             rgb = np.frombuffer(payload, dtype=np.uint8).reshape(shape)
             return {"ok": True, **self.ground_frame(
                 rgb, header["text"])}, b""
+        if cmd == "get_frame_points":
+            resp, payload_out = self.get_frame_points(
+                int(header.get("stride", 6)))
+            return {"ok": True, **resp}, payload_out
         if cmd == "shutdown":
             return {"ok": True, "shutdown": True}, b""
         return {"ok": False, "error": f"unknown cmd: {cmd}"}, b""

@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents import navigator as nav
+from agents.memory import InstanceMemory
 from agents.nav_agent import NavAgent
 from decision import StrategicDecision, TargetSpec, VLMDecisionClient
 
@@ -127,8 +128,19 @@ def test_multi_target_finish_policy():
     agent._target_count = None
     agent._reported_count = 1
     agent._no_hit_queries = 5
-    obs = SimpleNamespace(step_count=80, max_steps=100)
+    agent.target_text = "sink"
+    agent.memory = InstanceMemory()
+    agent.explore_replan_interval = 25
+    agent._last_frontier_step = 80
+    agent._last_frontier_count = 0
+    agent._frontier_empty_streak = 3
+    agent.finish_frontier_patience = 3
+    agent._last_map_growth_step = 0
+    agent.finish_map_stable_steps = 50
+    obs = SimpleNamespace(step_count=95, max_steps=100)
     assert agent._should_finish(obs)
+    agent._last_frontier_count = 1
+    assert not agent._should_finish(obs)
 
 
 def test_instruction_only_target_phrase():
@@ -140,6 +152,16 @@ def test_instruction_only_target_phrase():
     agent._target_count = None
     obs = SimpleNamespace(goal_text="Find any bag.")
     assert agent._target_phrase(obs) == "bag"
+    agent.target_spec = None
+    agent._target_mode = "many"
+    agent._target_count = 2
+    obs.goal_text = "Find exactly two baskets."
+    assert agent._target_phrase(obs) == "baskets"
+    agent.target_spec = None
+    agent._target_mode = "all"
+    agent._target_count = None
+    obs.goal_text = "Go to all sink objects."
+    assert agent._target_phrase(obs) == "sink objects"
     agent.target_spec = None
     obs.goal_text = "Navigate to the red fabric chair with wooden legs."
     assert agent._target_phrase(obs) == "red fabric chair with wooden legs"
@@ -194,7 +216,7 @@ def test_vlm_candidate_integration():
     agent._target_count = None
     agent._reported_count = 0
     agent._no_hit_queries = 0
-    agent._bad_points = []
+    agent.memory = InstanceMemory()
     agent._explore_hint = "none"
     agent._explore_hint_steps = 0
     agent.vlm_candidate_conf = 0.35
@@ -208,7 +230,24 @@ def test_vlm_candidate_integration():
     selected, evidence = agent._vlm_candidate_decision(obs, candidates)
     assert selected["candidate_id"] == "c2"
     assert evidence == b"jpeg-c2"
-    assert len(agent._bad_points) == 1
+    assert sum(1 for n in agent.memory.nodes
+               if n.status == "rejected") == 1
+
+
+def test_runtime_memory_route_uses_persistent_instances():
+    agent = object.__new__(NavAgent)
+    agent.memory = InstanceMemory()
+    agent.target_text = "bag"
+    agent._target_mode = "many"
+    agent._target_count = 2
+    agent._reported_count = 0
+    agent._current_aligned_xy = lambda: (0.0, 0.0)
+    for x in (10.0, 2.0, 5.0):
+        agent.memory.add_or_merge(
+            "bag", [x, 0, 0], 0.9, 0.5,
+            status="confirmed", candidate_id=f"c{x}")
+    ordered = agent._ordered_memory_nodes()
+    assert [float(nd.point[0]) for nd in ordered] == [2.0, 5.0]
 
 def test_grid_and_astar():
     _, _, poses_q, points_q = make_scene()
@@ -296,6 +335,108 @@ def test_nearest_traversable():
     print("nearest_traversable OK:", cell, "->", near)
 
 
+def test_freespace_connectivity():
+    """点云自由空间：真房间连通、镜面鬼房间被连通域剔除、桌面成障碍。"""
+    rng = np.random.default_rng(7)
+    pts = []
+    # 真房间地板 10x6m
+    xs = np.arange(0, 10.001, 0.15)
+    ys = np.arange(0, 6.001, 0.15)
+    gx, gy = np.meshgrid(xs, ys)
+    pts.append(np.stack([gx.ravel(), gy.ravel(),
+                         rng.normal(0, 0.01, gx.size)], axis=1))
+    # 四面围墙（无门），高 0~2m
+    for wall_x, wall_y in ((0.0, None), (10.0, None), (None, 0.0), (None, 6.0)):
+        t = np.arange(0.0, (6.0 if wall_y is not None else 10.0) + 1e-6, 0.1)
+        z = np.arange(0.0, 2.0 + 1e-6, 0.1)
+        mt, mz = np.meshgrid(t, z)
+        if wall_x is not None:
+            pts.append(np.stack([np.full(mt.size, wall_x), mt.ravel(),
+                                 mz.ravel()], axis=1))
+        else:
+            pts.append(np.stack([mt.ravel(), np.full(mt.size, wall_y),
+                                 mz.ravel()], axis=1))
+    # 桌面 1x1m，高 0.75m
+    tx = np.arange(7.0, 8.001, 0.1)
+    ty = np.arange(4.0, 5.001, 0.1)
+    tx, ty = np.meshgrid(tx, ty)
+    pts.append(np.stack([tx.ravel(), ty.ravel(),
+                         np.full(tx.size, 0.75)], axis=1))
+    # 镜面鬼房间：墙外 x∈[11,14] 的假地板（镜子反射产生的假深度）
+    mx = np.arange(11.0, 14.001, 0.15)
+    my = np.arange(0.0, 6.001, 0.15)
+    mx, my = np.meshgrid(mx, my)
+    pts.append(np.stack([mx.ravel(), my.ravel(),
+                         rng.normal(0, 0.01, mx.size)], axis=1))
+    points = np.concatenate(pts)
+
+    # 相机轨迹：真房间内 z=1.5 的折线
+    cam = np.stack([np.linspace(1, 9, 17),
+                    1.0 + 1.5 * np.sin(np.linspace(0, math.pi, 17)),
+                    np.full(17, 1.5)], axis=1)
+
+    grid = nav.OccupancyGrid.build(points, cam)
+    assert grid is not None
+
+    c_room = grid.world_to_cell([5.0, 3.0, 1.5])
+    c_mirror = grid.world_to_cell([12.5, 3.0, 1.5])
+    c_wall = grid.world_to_cell([0.0, 3.0, 1.5])
+    c_table = grid.world_to_cell([7.5, 4.5, 1.5])
+
+    assert grid.traversable(c_room), "真房间中心应可行走"
+    assert not grid.free[c_mirror[1], c_mirror[0]], \
+        "镜面鬼房间不连通，应被剔除"
+    assert grid.obstacle[c_wall[1], c_wall[0]], "墙应是障碍"
+    assert not grid.traversable(c_table), "桌面（0.75m）应在障碍层"
+    print("freespace connectivity OK: room free, mirror/wall/table blocked")
+
+
+def test_frame_points_freespace():
+    """逐帧投票自由空间：底部行锚定地板，房间连通、墙成障碍、门洞可穿。"""
+    rng = np.random.default_rng(3)
+    # 地板 10x6 z=0
+    xs = np.arange(0, 10.001, 0.15)
+    ys = np.arange(0, 6.001, 0.15)
+    gx, gy = np.meshgrid(xs, ys)
+    floor = np.stack([gx.ravel(), gy.ravel(),
+                      rng.normal(0, 0.005, gx.size)], axis=1)
+    floor_rows = np.full(len(floor), 95, dtype=np.int32)
+    # 墙 x=5，门洞 y∈[2,3]
+    walls = []
+    for y0, y1 in ((0.0, 2.0), (3.0, 6.0)):
+        wy = np.arange(y0, y1 + 1e-6, 0.05)
+        wz = np.arange(0.0, 2.0 + 1e-6, 0.05)
+        my, mz = np.meshgrid(wy, wz)
+        walls.append(np.stack([np.full(my.size, 5.0), my.ravel(),
+                               mz.ravel()], axis=1))
+    wall = np.concatenate(walls)
+    wall_rows = np.full(len(wall), 50, dtype=np.int32)
+
+    pts = np.concatenate([floor, wall]).astype(np.float32)
+    rows = np.concatenate([floor_rows, wall_rows])
+    frames = []
+    for cx in (1.0, 9.0):
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, 3] = [cx, 3.0, 1.5]
+        frames.append({"points": pts, "rows": rows, "pose": pose,
+                       "frame_id": len(frames)})
+
+    grid = nav.OccupancyGrid.from_frame_points(frames, np.eye(3))
+    assert grid is not None
+    c_left = grid.world_to_cell([2.5, 3.0, 1.5])
+    c_right = grid.world_to_cell([7.5, 3.0, 1.5])
+    c_wall = grid.world_to_cell([5.0, 0.5, 1.5])
+    c_door = grid.world_to_cell([5.0, 2.5, 1.5])
+    assert grid.traversable(c_left), "左房间应可行走"
+    assert grid.traversable(c_right), "右房间应可行走"
+    assert grid.obstacle[c_wall[1], c_wall[0]], "墙应是障碍"
+    assert grid.traversable(c_door), "门洞应可通行"
+    # 两侧连通（门洞连通性）：A* 应能找到从左到右的路径
+    path = grid.astar([2.5, 3.0], [7.5, 3.0])
+    assert path is not None, "经门洞的路径应存在"
+    print("frame_points freespace OK: rooms free, wall blocked, door open")
+
+
 if __name__ == "__main__":
     test_gravity_alignment()
     test_gravity_alignment_straight_trajectory()
@@ -303,7 +444,10 @@ if __name__ == "__main__":
     test_multi_target_finish_policy()
     test_instruction_only_target_phrase()
     test_vlm_candidate_integration()
+    test_runtime_memory_route_uses_persistent_instances()
     test_grid_and_astar()
     test_path_follower()
     test_nearest_traversable()
+    test_freespace_connectivity()
+    test_frame_points_freespace()
     print("ALL TESTS PASSED")

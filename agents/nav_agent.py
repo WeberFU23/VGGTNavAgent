@@ -24,7 +24,11 @@ import numpy as np
 
 from benchmark_api import Action
 from agents import navigator as nav
+from agents import planner
+from agents import skeleton as skel
+from agents.belief import BeliefMap
 from agents.mapping_agent import MappingAgent
+from agents.memory import InstanceMemory
 from decision import TargetSpec, VLMDecisionClient
 
 
@@ -38,6 +42,12 @@ class NavAgent(MappingAgent):
         self.verify_min = float(os.environ.get("NAV_VERIFY_MIN", "0.25"))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
         self.finish_patience = int(os.environ.get("NAV_FINISH_PATIENCE", "5"))
+        self.finish_frontier_patience = int(os.environ.get(
+            "NAV_FINISH_FRONTIER_PATIENCE", "3"))
+        self.finish_map_stable_steps = int(os.environ.get(
+            "NAV_FINISH_MAP_STABLE_STEPS", "100"))
+        self.instance_merge_m = float(os.environ.get(
+            "NAV_INSTANCE_MERGE_M", "0.75"))
         self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "3"))
         self.vlm_candidate_limit = int(
             os.environ.get("NAV_VLM_CANDIDATE_LIMIT", "4"))
@@ -67,8 +77,7 @@ class NavAgent(MappingAgent):
         self._verify_failures = 0
         self._scanning = False          # 到达后原地 360° 扫描确认中
         self._scan_steps = 0
-        self._bad_points = []           # 扫描确认失败的目标点（地图坐标）
-        self._found_points = []
+        self.memory = InstanceMemory()  # 多目标实例记忆（确认/访问/拉黑）
         self._reported_count = 0
         self._no_hit_queries = 0
         self._target_mode = "any"
@@ -79,6 +88,27 @@ class NavAgent(MappingAgent):
         self._explore_hint = "none"
         self._explore_hint_steps = 0
         self._last_finish_vlm_step = -10 ** 9
+        # 前沿引导探索状态
+        self._explore_follower = None
+        self._last_explore_plan = -10 ** 9
+        self.explore_replan_interval = int(
+            os.environ.get("NAV_EXPL_REPLAN_INTERVAL", "25"))
+        self.explore_enabled = os.environ.get(
+            "NAV_FRONTIER_EXPLORE", "1") == "1"
+        # 节点信念（CLIP 先验）引导探索排序
+        self.belief = BeliefMap()
+        self.explore_belief_weight = float(
+            os.environ.get("NAV_BELIEF_WEIGHT", "1.0"))
+        self._frontier_empty_streak = 0
+        self._last_frontier_count = None
+        self._last_frontier_step = -10 ** 9
+        self._recent_frontiers = []
+        self._last_map_submaps = 0
+        self._last_map_growth_step = 0
+        self.frontier_cooldown_steps = int(os.environ.get(
+            "NAV_FRONTIER_COOLDOWN_STEPS", "100"))
+        self.frontier_cooldown_m = float(os.environ.get(
+            "NAV_FRONTIER_COOLDOWN_M", "1.0"))
 
     def reset(self):
         super().reset()
@@ -107,6 +137,15 @@ class NavAgent(MappingAgent):
             "", text, flags=re.IGNORECASE)
         text = re.sub(r"^(?:any|a|an|the)\s+", "", text,
                       flags=re.IGNORECASE)
+        # Quantifiers describe benchmark completion semantics, not the visual
+        # category passed to CLIP/SAM.  This matters when VLM parsing is not
+        # configured (for example, "exactly two baskets" -> "baskets").
+        text = re.sub(
+            r"^(?:(?:exactly|at\s+least|at\s+most)\s+)?"
+            r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+",
+            "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:all|every)\s+(?:the\s+)?", "", text,
+                      flags=re.IGNORECASE)
         fallback = text.strip().rstrip(".!?") or source
         spec = None
         if self.vlm.enabled:
@@ -123,9 +162,11 @@ class NavAgent(MappingAgent):
         return self.target_spec.grounding_query
 
     def _explore_action(self, observation):
-        """执行 VLM 给出的短宏提示；碰撞恢复始终优先。"""
+        """前沿引导探索：活跃探索路径优先，其次 VLM 短宏提示，
+        碰撞恢复最优先，构建失败回退随机游走。"""
         if self._last_motion_failed:
             self._explore_hint_steps = 0
+            self._explore_follower = None      # 碰撞后旧路径不可信
             return super()._explore_action(observation)
         if self._explore_hint_steps > 0:
             action_by_hint = {
@@ -138,7 +179,138 @@ class NavAgent(MappingAgent):
             if action is not None:
                 self._explore_hint_steps -= 1
                 return int(action)
+        if not self.explore_enabled:
+            return super()._explore_action(observation)
+        # 活跃探索路径：跟随；走完后立即尝试选新目标
+        action = self._explore_follow(observation)
+        if action is not None:
+            return action
+        if observation.step_count - self._last_explore_plan \
+                >= self.explore_replan_interval:
+            self._plan_exploration(observation)
+            action = self._explore_follow(observation)
+            if action is not None:
+                return action
         return super()._explore_action(observation)
+
+    # ------------------------------------------------------------------
+    # 前沿引导探索
+    # ------------------------------------------------------------------
+    def _explore_follow(self, observation):
+        """跟随探索路径一步。返回动作；无路径/走完/走丢返回 None。"""
+        fl = self._explore_follower
+        if fl is None:
+            return None
+        try:
+            poses, frame_ids = self.client.get_all_poses()
+            if poses is not None and len(poses) >= 3:
+                order = np.argsort(frame_ids)
+                fid = int(np.asarray(frame_ids)[order][-1])
+                pose = np.asarray(poses, dtype=np.float64)[order][-1]
+                if fid > fl.anchor_frame:
+                    fl.update_anchor(pose, self.align_R, fid)
+                    for a in self.calibrator.actions[fid - 1:]:
+                        fl.dead_reckon(a)
+        except Exception:
+            pass
+        action, arrived = fl.next_action()
+        if arrived or action is None:
+            self._explore_follower = None
+            # 到达短 frontier 后保留正常重规划间隔，避免每一步重新选择
+            # 同一个已经到达的边界。
+            self._last_explore_plan = observation.step_count
+            return None
+        fl.dead_reckon(int(action))
+        return int(action)
+
+    def _plan_exploration(self, observation):
+        """重建自由空间栅格，选 frontier 目标并规划探索路径。"""
+        self._last_explore_plan = observation.step_count
+        try:
+            poses, frame_ids = self.client.get_all_poses()
+            if poses is None or len(poses) < 8:
+                return
+            poses64 = np.asarray(poses, dtype=np.float64)
+            if self.align_R is None:
+                self.align_R = nav.gravity_alignment(
+                    poses64, cam_up=nav.mount_compensated_cam_up())
+            frames = self.client.get_frame_points(stride=6)
+            if not frames:
+                return
+            grid = nav.OccupancyGrid.from_frame_points(
+                frames, self.align_R)
+            if grid is None:
+                return
+        except Exception as e:
+            print(f"[NavAgent] 探索栅格构建失败: {e}")
+            return
+
+        order = np.argsort(frame_ids)
+        cur = poses64[order][-1][:3, 3] @ self.align_R.T
+        # 尺度：栅格尺规（相机离地 1.5m）比在线标定更直接
+        scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
+
+        # 骨架拓扑：实例记忆挂载 + 节点信念更新
+        graph = skel.build_skeleton_graph(grid)
+        if graph is not None:
+            self.memory.attach_to_skeleton(graph)
+            self.belief.update(self.client, graph, self.target_text,
+                               self.align_R, observation.step_count)
+
+        clusters = skel.frontier_clusters(grid, min_size=5)
+        try:
+            num_submaps = int(self.client.get_state().get("num_submaps", 0))
+            if num_submaps > self._last_map_submaps:
+                self._last_map_growth_step = observation.step_count
+                self._last_map_submaps = num_submaps
+        except Exception:
+            pass
+        self._last_frontier_count = len(clusters)
+        self._last_frontier_step = observation.step_count
+        if clusters:
+            self._frontier_empty_streak = 0
+        else:
+            self._frontier_empty_streak += 1
+        self._recent_frontiers = [
+            item for item in self._recent_frontiers
+            if observation.step_count - item[1] <= self.frontier_cooldown_steps
+        ]
+        # 过滤太近（<1m，已看过）并打分：
+        # 大小/(1+距离m) × (1+信念权重×节点信念)
+        cands = []
+        for c in clusters:
+            d_units = math.hypot(c["world"][0] - cur[0],
+                                 c["world"][1] - cur[1])
+            d_m = d_units * scale if scale else d_units
+            if scale and d_m < 1.0:
+                continue
+            if scale and any(
+                    math.hypot(c["world"][0] - old_xy[0],
+                               c["world"][1] - old_xy[1]) * scale
+                    < self.frontier_cooldown_m
+                    for old_xy, _old_step in self._recent_frontiers):
+                continue
+            belief = self.belief.belief_at(c["world"], graph)
+            score = c["size"] / (1.0 + d_m) * \
+                (1.0 + self.explore_belief_weight * belief)
+            cands.append((score, c))
+        cands.sort(key=lambda t: -t[0])
+
+        for _, c in cands[:5]:
+            path = grid.astar(cur[:2], c["world"])
+            if path is None or len(path) < 2:
+                continue
+            path = grid.shortcut(path)
+            fl = nav.PathFollower(
+                scale=scale or 1.0, reach_m=self.reach_m)
+            fl.set_path(path)
+            self._explore_follower = fl
+            self._recent_frontiers.append((
+                np.asarray(c["world"], dtype=np.float64)[:2],
+                observation.step_count))
+            print(f"[NavAgent] step={observation.step_count} 探索目标 "
+                  f"frontier size={c['size']} 路径 {len(path)} 点")
+            return
 
     def _set_explore_hint(self, hint):
         self._explore_hint = str(hint or "none")
@@ -202,14 +374,64 @@ class NavAgent(MappingAgent):
         self.target_candidate_id = None
         self.follower = None
         self.grid = None
-        self.align_R = None
+        self._explore_follower = None
         self._plan_failures = 0
         self._scanning = False
         self._selected_evidence = None
 
+    def _merge_dist(self):
+        """实例合并/黑名单距离（统一对齐地图单位）。"""
+        scale = self.calibrator.current_scale() or 1.0
+        return getattr(self, "instance_merge_m", 0.75) / scale
+
+    def _ensure_alignment(self):
+        """每个 episode 固定一套重力对齐坐标，供地图、记忆、TSP 共用。"""
+        if self.align_R is not None:
+            return True
+        try:
+            poses, _frame_ids = self.client.get_all_poses()
+            if poses is None or len(poses) < 3:
+                return False
+            self.align_R = nav.gravity_alignment(
+                np.asarray(poses, dtype=np.float64),
+                cam_up=nav.mount_compensated_cam_up())
+            return True
+        except Exception:
+            return False
+
+    def _aligned_point(self, point):
+        point = np.asarray(point, dtype=np.float64)
+        align_R = getattr(self, "align_R", None)
+        return align_R @ point if align_R is not None else point
+
+    def _raw_point(self, point):
+        point = np.asarray(point, dtype=np.float64)
+        align_R = getattr(self, "align_R", None)
+        return align_R.T @ point if align_R is not None else point
+
+    def _refresh_memory_candidates(self):
+        """回环/图优化后按 candidate_id 刷新持久实例坐标。"""
+        if not self._ensure_alignment():
+            return
+        for node in self.memory.nodes:
+            if not node.candidate_id:
+                continue
+            try:
+                resolved = self.client.resolve_candidate(node.candidate_id)
+                if resolved.get("found"):
+                    self.memory.refresh_point(
+                        node, self._aligned_point(resolved["point"]))
+            except Exception:
+                pass
+
     def _report_found(self):
         if self.target_point is not None:
-            self._found_points.append(self.target_point.copy())
+            node, _ = self.memory.add_or_merge(
+                self.target_text, self._aligned_point(self.target_point), 1.0,
+                merge_dist=self._merge_dist(), status="confirmed",
+                step=getattr(self, "_last_report_step", 0),
+                candidate_id=self.target_candidate_id)
+            self.memory.mark_visited(node)
         self._reported_count += 1
         self._no_hit_queries = 0
         self.mode = "reported"
@@ -218,7 +440,11 @@ class NavAgent(MappingAgent):
 
     def _reject_current_target(self, observation):
         if self.target_point is not None:
-            self._bad_points.append(self.target_point.copy())
+            node, is_new = self.memory.add_or_merge(
+                self.target_text, self._aligned_point(self.target_point), 0.0,
+                merge_dist=self._merge_dist(), status="rejected")
+            if not is_new:
+                self.memory.mark_rejected(node)
         print(f"[NavAgent] step={observation.step_count} VLM 拒绝当前候选")
         self._clear_current_target()
         self.mode = "explore"
@@ -242,7 +468,8 @@ class NavAgent(MappingAgent):
             "required_count": self._target_count,
             "reported_instance_count": self._reported_count,
             "recent_queries_without_new_candidate": self._no_hit_queries,
-            "rejected_or_duplicate_location_count": len(self._bad_points),
+            "rejected_or_duplicate_location_count": sum(
+                1 for n in self.memory.nodes if n.status == "rejected"),
             "has_agent_estimated_metric_scale":
                 self.calibrator.current_scale() is not None,
             **mapping_state,
@@ -253,10 +480,22 @@ class NavAgent(MappingAgent):
             return self._reported_count >= int(self._target_count)
         if self._target_mode == "all":
             late = observation.step_count >= int(0.8 * observation.max_steps)
-            ready = self._reported_count > 0 and late and \
-                self._no_hit_queries >= self.finish_patience
-            if not ready or not self.vlm.enabled:
-                return ready
+            frontier_fresh = observation.step_count - self._last_frontier_step \
+                <= 2 * self.explore_replan_interval
+            no_pending = not self.memory.unvisited(self.target_text)
+            geometric_ready = self._reported_count > 0 and late and no_pending and \
+                self._no_hit_queries >= self.finish_patience and \
+                frontier_fresh and self._last_frontier_count == 0 and \
+                self._frontier_empty_streak >= self.finish_frontier_patience
+            fallback_late = observation.step_count >= int(
+                0.95 * observation.max_steps)
+            map_stable = observation.step_count - self._last_map_growth_step \
+                >= self.finish_map_stable_steps
+            fallback_ready = geometric_ready and fallback_late and map_stable
+            if not self.vlm.enabled:
+                return fallback_ready
+            if not geometric_ready:
+                return False
             if observation.step_count - self._last_finish_vlm_step < \
                     self.query_interval:
                 return False
@@ -266,7 +505,7 @@ class NavAgent(MappingAgent):
                 observation.goal_text, self.target_spec,
                 self._decision_state(observation), observation.rgb)
             if decision is None:
-                return ready
+                return fallback_ready
             self._set_explore_hint(decision.exploration_hint)
             print(f"[NavAgent] VLM FINISH 判断: {decision.decision} "
                   f"conf={decision.confidence:.2f} reason={decision.reason}")
@@ -341,18 +580,112 @@ class NavAgent(MappingAgent):
         print(f"[NavAgent] step={observation.step_count} 360° 扫描未确认，"
               f"拉黑目标点（累计 {self._verify_failures} 次）")
         if self.target_point is not None:
-            self._bad_points.append(self.target_point.copy())
+            node, is_new = self.memory.add_or_merge(
+                self.target_text, self._aligned_point(self.target_point), 0.0,
+                merge_dist=self._merge_dist(), status="rejected")
+            if not is_new:
+                self.memory.mark_rejected(node)
         self._clear_current_target()
         self.mode = "explore"
         return self._explore_action(observation)
 
     def _is_bad_point(self, point):
-        """目标点是否在黑名单附近（1.5m 内）。"""
-        scale = self.calibrator.current_scale() or 1.0
-        for bp in self._bad_points + self._found_points:
-            if np.linalg.norm(point - bp) * scale < 1.5:
-                return True
-        return False
+        """目标点是否接近已拒绝/已访问实例（默认 0.75m，可配置）。"""
+        dist = self._merge_dist()
+        aligned = self._aligned_point(point)
+        return self.memory.is_rejected(self.target_text, aligned, dist) or \
+            self.memory.is_visited(self.target_text, aligned, dist)
+
+    def _order_by_route(self, eligible):
+        """候选实例按开路径 TSP 重排（欧氏距离近似），失败时保持原序。"""
+        try:
+            start = None
+            if self.follower is not None and self.follower.anchor_frame >= 0:
+                start = (self.follower.x, self.follower.y)
+            else:
+                poses, frame_ids = self.client.get_all_poses()
+                if poses is not None and len(poses) and self.align_R is not None:
+                    order = np.argsort(frame_ids)
+                    cur = np.asarray(poses, dtype=np.float64)[order][-1]
+                    cur = cur[:3, 3] @ self.align_R.T
+                    start = (float(cur[0]), float(cur[1]))
+            if start is None:
+                return eligible
+            goals = [tuple(self._aligned_point(h["point"])[:2])
+                     for h in eligible]
+
+            def euclid(a, b):
+                return math.hypot(a[0] - b[0], a[1] - b[1])
+
+            order = planner.route_order(start, goals, euclid)
+            return [eligible[i] for i in order]
+        except Exception as e:
+            print(f"[NavAgent] TSP 排序失败，保持原序: {e}")
+            return eligible
+
+    def _current_aligned_xy(self):
+        if not self._ensure_alignment():
+            return None
+        try:
+            poses, frame_ids = self.client.get_all_poses()
+            if poses is None or not len(poses):
+                return None
+            order = np.argsort(frame_ids)
+            point = np.asarray(poses, dtype=np.float64)[order][-1][:3, 3]
+            aligned = self._aligned_point(point)
+            return float(aligned[0]), float(aligned[1])
+        except Exception:
+            return None
+
+    def _ordered_memory_nodes(self):
+        """从持久 confirmed memory 产生当前模式的真实规划序列。"""
+        instances = self.memory.unvisited(self.target_text)
+        if not instances:
+            return []
+        start = self._current_aligned_xy()
+        if start is None:
+            return instances
+
+        def euclid(a, b):
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        if self._target_mode == "many":
+            need = max(int(self._target_count or 0) - self._reported_count, 0)
+            ordered, _gap = planner.plan_multi(
+                start, instances, euclid, need=need)
+            return ordered
+        if self._target_mode == "all":
+            ordered, _gap = planner.plan_multi(
+                start, instances, euclid, need=len(instances))
+            return ordered
+        selected = planner.select_goal_any(start, instances, euclid)
+        return [selected] if selected is not None else []
+
+    def _activate_memory_target(self, observation):
+        """选择持久实例、经 VLM/fallback 审阅，并规划第一段。"""
+        nodes = self._ordered_memory_nodes()
+        if not nodes:
+            return False
+        candidates = [{
+            "candidate_id": nd.candidate_id,
+            "point": self._raw_point(nd.point).tolist(),
+            "sam_score": nd.score,
+            "frame_id": nd.frame_id,
+            "memory_iid": nd.iid,
+        } for nd in nodes[:self.vlm_candidate_limit]]
+        best, evidence = self._vlm_candidate_decision(observation, candidates)
+        if best is None:
+            return False
+        self.target_point = np.asarray(best["point"], dtype=np.float64)
+        self.target_candidate_id = best.get("candidate_id")
+        self._selected_evidence = evidence
+        self._no_hit_queries = 0
+        self._explore_follower = None
+        print(f"[NavAgent] 从实例记忆选择 #{best.get('memory_iid')} "
+              f"sam={best.get('sam_score', 0.0):.3f}")
+        if self._plan_to_target(observation):
+            self.mode = "nav"
+        return True
 
     def _maybe_query_target(self, observation):
         step = observation.step_count
@@ -375,6 +708,11 @@ class NavAgent(MappingAgent):
 
         phrase = self._target_phrase(observation)
         self.target_text = phrase
+        self._ensure_alignment()
+        self._refresh_memory_candidates()
+        # 先完成已经看见但尚未访问的持久实例，再继续扩大搜索空间。
+        if self._activate_memory_target(observation):
+            return
         try:
             results = self.client.ground_object(
                 phrase, top_k=self.ground_top_k)
@@ -400,26 +738,25 @@ class NavAgent(MappingAgent):
             self._vlm_candidate_decision(observation, [])
             print(f"[NavAgent] step={step} '{phrase}' 命中均被拉黑或分数不足")
             return
-        best, evidence = self._vlm_candidate_decision(
-            observation, eligible[:self.vlm_candidate_limit])
-        if best is None:
+        # 所有当前命中先写入 confirmed memory；planner 随后对持久集合规划，
+        # 而不是只对这一次查询的临时候选排序。
+        for hit in eligible:
+            self.memory.add_or_merge(
+                self.target_text, self._aligned_point(hit["point"]),
+                hit.get("sam_score", 0.0), merge_dist=self._merge_dist(),
+                status="confirmed", frame_id=hit.get("frame_id"),
+                step=step, candidate_id=hit.get("candidate_id"))
+        if not self._activate_memory_target(observation):
             self._no_hit_queries += 1
             print(f"[NavAgent] step={step} VLM 建议继续探索")
-            return
-        self.target_point = np.asarray(best["point"], dtype=np.float64)
-        self.target_candidate_id = best.get("candidate_id")
-        self._selected_evidence = evidence
-        self._no_hit_queries = 0
-        print(f"[NavAgent] step={step} 定位 '{phrase}' sam="
-              f"{best['sam_score']:.3f} point={self.target_point.round(2)}")
-        if self._plan_to_target(observation):
-            self.mode = "nav"
 
     def _vlm_candidate_decision(self, observation, candidates):
         """返回 (selected candidate, evidence bytes)；无 VLM 时取最高 SAM。"""
         if not self.vlm.enabled:
             return (candidates[0], None) if candidates else (None, None)
-        self._target_phrase(observation)
+        # This helper is also used on no-hit/VLM-only paths, so do not rely on
+        # _maybe_query_target having initialized the memory category first.
+        self.target_text = self._target_phrase(observation)
         evidence_by_id = {}
         for candidate in candidates:
             candidate_id = candidate.get("candidate_id")
@@ -443,8 +780,12 @@ class NavAgent(MappingAgent):
         for candidate_id in decision.rejected_candidate_ids:
             rejected = by_id.get(candidate_id)
             if rejected is not None:
-                self._bad_points.append(np.asarray(
-                    rejected["point"], dtype=np.float64))
+                node, is_new = self.memory.add_or_merge(
+                    self.target_text,
+                    self._aligned_point(rejected["point"]),
+                    0.0, merge_dist=self._merge_dist(), status="rejected")
+                if not is_new:
+                    self.memory.mark_rejected(node)
         print(f"[NavAgent] VLM 候选判断: {decision.decision} "
               f"candidate={decision.candidate_id} conf={decision.confidence:.2f} "
               f"reason={decision.reason}")
@@ -466,7 +807,8 @@ class NavAgent(MappingAgent):
         pose = np.asarray(poses, dtype=np.float64)[order][-1]
         if self.align_R is None:
             self.align_R = nav.gravity_alignment(
-                np.asarray(poses, dtype=np.float64))
+                np.asarray(poses, dtype=np.float64),
+                cam_up=nav.mount_compensated_cam_up())
         scale = self.calibrator.current_scale()
         if self.follower is None:
             self.follower = nav.PathFollower(scale=scale, reach_m=self.reach_m)
@@ -488,14 +830,14 @@ class NavAgent(MappingAgent):
                 resolved = self.client.resolve_candidate(
                     self.target_candidate_id)
                 if not resolved.get("found"):
-                    print("[NavAgent] 候选在最新地图中无法重投影，重新查询")
-                    self._clear_current_target()
-                    return False
-                self.target_point = np.asarray(
-                    resolved["point"], dtype=np.float64)
+                    print("[NavAgent] 候选缓存已失效，使用记忆中的最近坐标")
+                    self.target_candidate_id = None
+                else:
+                    self.target_point = np.asarray(
+                        resolved["point"], dtype=np.float64)
             except Exception as e:
-                print(f"[NavAgent] 候选重投影失败: {e}")
-                return False
+                print(f"[NavAgent] 候选重投影失败，使用记忆坐标: {e}")
+                self.target_candidate_id = None
         scale = self.calibrator.current_scale()
         if scale is None:
             return False
@@ -511,9 +853,31 @@ class NavAgent(MappingAgent):
 
         cam_centers = np.asarray(poses, dtype=np.float64)[:, :3, 3] \
             @ self.align_R.T
-        # 面包屑栅格：目标必然在走过的地方附近（从历史关键帧检出），
-        # 沿轨迹网络规划，不依赖脆弱的地板/障碍高度分层
-        self.grid = nav.OccupancyGrid.from_trajectory(cam_centers)
+        # 自由空间栅格：优先逐帧局部地板锚定投票（对抗子图间漂移），
+        # 其次全局点云双切片，最后回退面包屑走廊（保底）。
+        self.grid = None
+        try:
+            frames = self.client.get_frame_points(stride=6)
+            if frames:
+                self.grid = nav.OccupancyGrid.from_frame_points(
+                    frames, self.align_R)
+        except Exception as e:
+            print(f"[NavAgent] 逐帧栅格构建异常: {e}")
+            self.grid = None
+        if self.grid is None:
+            try:
+                pts, _cols = self.client.get_map_points(max_points=800000)
+                if pts is not None and len(pts) > 1000:
+                    pts_aligned = np.asarray(pts, dtype=np.float64) \
+                        @ self.align_R.T
+                    self.grid = nav.OccupancyGrid.build(
+                        pts_aligned, cam_centers)
+            except Exception as e:
+                print(f"[NavAgent] 点云栅格构建异常: {e}")
+                self.grid = None
+        if self.grid is None:
+            print("[NavAgent] 点云栅格不可用，回退轨迹走廊")
+            self.grid = nav.OccupancyGrid.from_trajectory(cam_centers)
         if self.grid is None:
             print("[NavAgent] 栅格构建失败（点数不足）")
             return False

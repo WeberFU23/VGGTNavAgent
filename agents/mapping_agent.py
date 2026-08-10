@@ -67,6 +67,17 @@ class MappingAgent:
         """pacing + 喂帧，并仅用 RGB 变化估计上一前进动作是否失败。"""
         if self.episode_id is None:
             self.episode_id = observation.episode_id
+            try:
+                self.client.set_episode(self.episode_id)
+            except Exception:
+                pass
+            self._frame_save_dir = None
+            save_root = os.environ.get("NAV_SAVE_FRAMES_DIR")
+            if save_root:
+                self._frame_save_dir = os.path.join(
+                    save_root, str(self.episode_id))
+                os.makedirs(self._frame_save_dir, exist_ok=True)
+                print(f"[MappingAgent] 逐帧 RGB 保存到 {self._frame_save_dir}")
 
         # pacing：上一轮喂帧时服务端繁忙则先等它空闲，避免关键帧缓冲
         # 被裁剪丢帧。阻塞不消耗 episode 步数预算（步数按 act 次数计）。
@@ -96,6 +107,26 @@ class MappingAgent:
             ch, cw = int(h * crop_frac), int(w * crop_frac)
             y0, x0 = (h - ch) // 2, (w - cw) // 2
             rgb = rgb[y0:y0 + ch, x0:x0 + cw]
+        # 诊断：逐帧保存喂给 SLAM/CLIP 的 RGB（默认与原观测一致）。
+        # server 端 feed_frame 也会全量保存；此处为 agent 侧冗余。
+        if getattr(self, "_frame_save_dir", None):
+            try:
+                arr = np.asarray(rgb)
+                if arr.ndim == 3 and arr.shape[2] == 3:
+                    img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                elif arr.ndim == 3 and arr.shape[2] == 4:
+                    img = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+                else:
+                    img = arr
+                cv2.imwrite(
+                    os.path.join(
+                        self._frame_save_dir,
+                        f"rgb_{observation.step_count:05d}.jpg"),
+                    img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            except Exception as exc:
+                if getattr(self, "_frame_save_err", False) is False:
+                    self._frame_save_err = True
+                    print(f"[MappingAgent] 逐帧 RGB 保存失败: {exc}")
         info = self.client.feed_frame(rgb)
         self._server_busy = bool(info.get("busy"))
         if observation.step_count % 20 == 0:

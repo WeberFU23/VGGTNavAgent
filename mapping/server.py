@@ -14,6 +14,7 @@ VGGT 前向 + 因子图优化，查询接口随时可取最新位姿与全局点
 """
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -43,6 +44,8 @@ def _parse_args():
                         help="开启 viser 可视化（占用 8080 端口）")
     parser.add_argument("--no-semantic", action="store_true",
                         help="关闭 CLIP 语义记忆（query_text/ground_object 不可用）")
+    parser.add_argument("--diag-dir", type=str, default="mapping_diag",
+                        help="语义查询诊断目录：JSONL 记录 + top-K 帧图像转储")
     return parser.parse_args()
 
 
@@ -120,6 +123,15 @@ class MappingServer:
 
         os.makedirs(args.keyframe_dir, exist_ok=True)
 
+        # 语义查询诊断：JSONL 逐条记录 CLIP top-K 与 SAM 结果，并转储
+        # top-K 帧图像（keyframe_dir 会在 reset_map 时清空，必须单独留档）。
+        self.diag_dir = args.diag_dir
+        self.diag_lock = threading.Lock()
+        self._current_episode = None
+        self._diag_fp = None
+        self._diag_frame_dir = None
+        os.makedirs(self.diag_dir, exist_ok=True)
+
     # ------------------------------------------------------------------
     # 帧输入与子图处理
     # ------------------------------------------------------------------
@@ -127,6 +139,17 @@ class MappingServer:
         """喂入一帧 RGB (H, W, 3) uint8。返回处理信息 dict。"""
         self.num_frames += 1
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        # 诊断：逐帧保存全部 RGB（JPEG，文件名即 frame_id），供离线
+        # "目标是否进入视野"核查。episode 目录由 set_episode 创建。
+        if self._current_episode and self._diag_frame_dir:
+            try:
+                cv2.imwrite(
+                    os.path.join(
+                        self._diag_frame_dir,
+                        f"rgb_{self.num_frames:06d}.jpg"),
+                    bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            except Exception:
+                pass
         is_keyframe = self.solver.flow_tracker.compute_disparity(
             bgr, self.args.min_disparity)
 
@@ -348,6 +371,55 @@ class MappingServer:
     # ------------------------------------------------------------------
     # 语义查询
     # ------------------------------------------------------------------
+    def _set_episode(self, episode_id):
+        """记录当前 episode，并切换诊断 JSONL 输出。"""
+        episode_id = str(episode_id or "unknown").strip()
+        if episode_id == self._current_episode:
+            return
+        with self.diag_lock:
+            if self._diag_fp is not None:
+                try:
+                    self._diag_fp.close()
+                except Exception:
+                    pass
+                self._diag_fp = None
+            self._current_episode = episode_id
+            self._diag_frame_dir = os.path.join(
+                self.diag_dir, f"{episode_id}_frames")
+            os.makedirs(self._diag_frame_dir, exist_ok=True)
+            self._diag_fp = open(
+                os.path.join(self.diag_dir, f"{episode_id}_queries.jsonl"),
+                "a", encoding="utf-8")
+            print(f"[server] 诊断 episode={episode_id} -> {self.diag_dir}",
+                  flush=True)
+
+    def _diag_write(self, record):
+        """线程安全地写一条诊断 JSONL。"""
+        record = dict(record)
+        record.setdefault("episode", self._current_episode)
+        record.setdefault("t", time.strftime("%H:%M:%S"))
+        with self.diag_lock:
+            if self._diag_fp is None:
+                return
+            try:
+                self._diag_fp.write(json.dumps(record) + "\n")
+                self._diag_fp.flush()
+            except Exception:
+                pass
+
+    def _diag_dump_frame(self, frame, frame_id, tag):
+        """把一帧图像转储到诊断目录，返回相对文件名。"""
+        if self._diag_frame_dir is None:
+            return None
+        try:
+            from torchvision.transforms.functional import to_pil_image
+            name = f"{tag}_frame_{int(frame_id):06d}.png"
+            to_pil_image(frame).save(
+                os.path.join(self._diag_frame_dir, name))
+            return name
+        except Exception:
+            return None
+
     def _semantic_topk(self, text, top_k):
         """CLIP 检索 top-K 关键帧，返回 [(score, submap_id, frame_index)]。
 
@@ -402,6 +474,11 @@ class MappingServer:
                     "frame_id": int(frame_ids[idx]) if idx < len(frame_ids) else -1,
                     "pose": np.asarray(pose).tolist(),
                 })
+        self._diag_write({
+            "cmd": "query_text", "text": text, "top_k": top_k,
+            "topk": [{"frame_id": r["frame_id"], "submap_id": r["submap_id"],
+                      "clip_score": r["score"]} for r in results],
+        })
         return {"results": results}
 
     def ground_object(self, text, top_k):
@@ -412,28 +489,49 @@ class MappingServer:
 
         results = []
         prompts = self.grounder.expand_prompts(text)
+        diag_frames = []
         for item in self.query_text(text, top_k)["results"]:
             sid, idx = item["submap_id"], item["frame_index"]
+            fid = item["frame_id"]
             with self.data_lock:
                 submap = self.solver.map.get_submap(sid)
                 frame = submap.get_frame_at_index(idx)
+            dump_name = self._diag_dump_frame(frame, fid, "topk")
             with self.gpu_lock:
                 masks, boxes, scores, best_prompt = self.grounder.ground(
                     to_pil_image(frame), prompts)
             entry = dict(item)
+            sam_info = {"mask_count": int(len(scores)), "best_prompt": best_prompt}
             if len(masks) == 0:
                 entry["found"] = False
                 results.append(entry)
             else:
+                sam_info["masks"] = []
                 for mask_index in np.argsort(-scores):
+                    mask = masks[mask_index]
                     candidate = self._register_candidate(
-                        sid, idx, item["frame_id"], masks[mask_index],
-                        boxes[mask_index], scores[mask_index], best_prompt)
+                        sid, idx, fid, mask, boxes[mask_index],
+                        scores[mask_index], best_prompt)
                     resolved = self.resolve_candidate(candidate["candidate_id"])
                     instance = dict(entry)
                     instance.update(candidate)
                     instance.update(resolved)
                     results.append(instance)
+                    sam_info["masks"].append({
+                        "candidate_id": candidate["candidate_id"],
+                        "sam_score": float(scores[mask_index]),
+                        "bbox": [float(v) for v in boxes[mask_index]],
+                        "mask_ratio": float(mask.sum()) / float(mask.size),
+                    })
+            diag_frames.append({
+                "frame_id": fid, "submap_id": sid,
+                "clip_score": item["score"], "found": entry.get("found", False),
+                "sam": sam_info, "dump": dump_name,
+            })
+        self._diag_write({
+            "cmd": "ground_object", "text": text, "top_k": top_k,
+            "prompts": prompts, "frames": diag_frames,
+        })
         return {"results": results}
 
     def _register_candidate(self, sid, idx, frame_id, mask, bbox, score, prompt):
@@ -582,6 +680,9 @@ class MappingServer:
             return {"ok": True, **self.flush_map()}, b""
         if cmd == "get_state":
             return {"ok": True, **self.get_state()}, b""
+        if cmd == "set_episode":
+            self._set_episode(header.get("episode_id"))
+            return {"ok": True}, b""
         if cmd == "get_latest_pose":
             return {"ok": True, **self.get_latest_pose()}, b""
         if cmd == "get_all_poses":

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents import navigator as nav
 from agents.memory import InstanceMemory
 from agents.nav_agent import NavAgent
+from benchmark_api import Action
 from decision import StrategicDecision, TargetSpec, VLMDecisionClient
 
 
@@ -451,3 +452,19 @@ if __name__ == "__main__":
     test_freespace_connectivity()
     test_frame_points_freespace()
     print("ALL TESTS PASSED")
+
+
+
+
+def test_expand_prompts_basket():
+    """basket 同义词展开 + 复数归一化（"baskets" 也能匹配 "basket" 条目）。"""
+    from mapping.semantic import Sam3Grounder
+    g = Sam3Grounder()
+    out = g.expand_prompts("basket")
+    assert out[0] == "basket"
+    assert "laundry basket" in out and "storage basket" in out and "hamper" in out
+    out2 = g.expand_prompts("baskets")
+    assert out2[0] == "baskets"
+    assert "laundry baskets" in out2
+    # 无同义词的类别保持原样
+    assert g.expand_prompts("sink") == ["sink"]

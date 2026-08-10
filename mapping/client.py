@@ -69,6 +69,12 @@ class MappingClient:
         resp, _ = self._request({"cmd": "reset_map"})
         return resp
 
+    def set_episode(self, episode_id):
+        """告知服务端当前 episode，用于语义查询诊断日志归档。"""
+        resp, _ = self._request(
+            {"cmd": "set_episode", "episode_id": str(episode_id)})
+        return resp
+
     def flush_map(self):
         """提交不足一个完整子图的尾部关键帧，并等待处理完成。"""
         resp, _ = self._request({"cmd": "flush_map"})

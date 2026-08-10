@@ -48,7 +48,7 @@ class NavAgent(MappingAgent):
             "NAV_FINISH_MAP_STABLE_STEPS", "100"))
         self.instance_merge_m = float(os.environ.get(
             "NAV_INSTANCE_MERGE_M", "0.75"))
-        self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "3"))
+        self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "5"))
         self.vlm_candidate_limit = int(
             os.environ.get("NAV_VLM_CANDIDATE_LIMIT", "4"))
         self.vlm_candidate_conf = float(

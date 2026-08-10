@@ -57,9 +57,13 @@ class Sam3Grounder:
     # SAM3 对提示词措辞敏感（实测 "tv monitor" 得分 0.12 而
     # "flat screen tv" 0.64）。此处为已知难处理的类别名配置同义变体，
     # 查询时多个变体各跑一次，取最高分变体的结果。
+    # basket 类别实测 CLIP 检索 0.21-0.24 无区分度，同义词可小幅
+    # 提升 0.22 -> 0.25，且 SAM3 措辞敏感，值得展开。
     PROMPT_SYNONYMS = {
         "tv monitor": ["flat screen tv", "television", "tv"],
         "couch": ["sofa"],
+        "basket": ["laundry basket", "storage basket", "hamper"],
+        "baskets": ["laundry baskets", "storage baskets", "baskets with handles"],
     }
 
     def __init__(self, confidence_threshold=0.25, device="cuda"):
@@ -86,37 +90,47 @@ class Sam3Grounder:
         # 整个推理需包在 bf16 autocast 下，否则 bf16 中间激活撞上 fp32 权重。
         with torch.no_grad(), \
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # backbone 前向昂贵，只做一次；多个文本变体只重跑轻量解码
+            # backbone 前向昂贵，只做一次；多个文本变体只重跑轻量解码。
+            # 注意：SAM3 的 set_text_prompt 复用并原地覆盖同一个 output
+            # 对象，循环结束后保存的引用会指向最后一个变体（可能为空），
+            # 因此必须在循环内立即把结果拷贝到 CPU。
             state = self._processor.set_image(pil_img)
-            best = None
+            best = None  # (top_score, masks_np, boxes_np, scores_np, prompt)
             for prompt in variants:
                 output = self._processor.set_text_prompt(
                     state=state, prompt=prompt)
                 scores = output["scores"].float()
                 top = float(scores.max()) if scores.numel() else 0.0
                 if best is None or top > best[0]:
-                    best = (top, output, prompt)
+                    best = (top,
+                            output["masks"].float().cpu().numpy(),
+                            output["boxes"].float().cpu().numpy(),
+                            scores.float().cpu().numpy(),
+                            prompt)
         if best is None:
             return (np.zeros((0, pil_img.height, pil_img.width), dtype=bool),
                     np.zeros((0, 4), dtype=np.float32),
                     np.zeros((0,), dtype=np.float32), None)
-        output = best[1]
-        masks = output["masks"].cpu().numpy()
-        # autocast 下输出为 bf16，numpy 不支持，先转 fp32
-        boxes = output["boxes"].float().cpu().numpy()
-        scores = output["scores"].float().cpu().numpy()
+        _top, masks, boxes, scores, best_prompt = best
         if masks.ndim == 4 and masks.shape[1] == 1:
             masks = masks[:, 0]
-        # The selected prompt is recorded while evaluating variants; avoid a
-        # second decoder pass merely to recover its name.
-        best_prompt = best[2]
         return masks.astype(bool), boxes, scores, best_prompt
 
     def expand_prompts(self, text):
-        """原始提示 + 同义变体（去重，保持顺序）。"""
+        """原始提示 + 同义变体（去重，保持顺序）。
+
+        复数与单数都尝试查同义词表（"baskets" -> "basket" 条目），
+        避免 "Find exactly two baskets" 得到的 "baskets" 匹配不上。
+        """
         text = str(text).strip()
         variants = [text]
-        for syn in self.PROMPT_SYNONYMS.get(text.lower(), []):
-            if syn not in variants:
-                variants.append(syn)
+        base = text[:-1] if text.endswith("s") and len(text) > 1 else text
+        seen_keys = set()
+        for key in (text.lower(), base.lower()):
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            for syn in self.PROMPT_SYNONYMS.get(key, []):
+                if syn not in variants:
+                    variants.append(syn)
         return variants

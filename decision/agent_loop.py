@@ -19,7 +19,8 @@ ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "VERIFY", "REPORT_FOUND",
            "SCAN", "REJECT", "EXPLORE", "FINISH")
 
 EVENT_ACTIONS = {
-    "candidate_review": {"GOTO_INSTANCE", "EXPLORE", "VERIFY"},
+    "world_state_updated": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE",
+                            "VERIFY"},
     "arrival": {"REPORT_FOUND", "SCAN", "REJECT"},
     "scan_complete": {"REPORT_FOUND", "REJECT", "EXPLORE"},
     "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE", "FINISH"},
@@ -165,10 +166,10 @@ class DecisionLoop:
                  "\nWorld state:\n"
                  + json.dumps(world_state, ensure_ascii=False)]
         event_guidance = {
-            "candidate_review": (
-                "\nChoose among the confirmed candidate instances shown in "
-                "the state/images. Use GOTO_INSTANCE only for a plausible "
-                "full semantic match; otherwise EXPLORE or VERIFY."),
+            "world_state_updated": (
+                "\nInstances and reachable frontiers were refreshed together. "
+                "Choose globally among GOTO_INSTANCE, GOTO_FRONTIER, VERIFY, "
+                "and EXPLORE. Do not assume instances always take priority."),
             "arrival": (
                 "\nThe first extra image is current RGB; later images are "
                 "historical evidence. Use REPORT_FOUND only when the visible "
@@ -263,9 +264,14 @@ class DecisionLoop:
         task = world_state.get("task", {})
         unexplored = term.get("unexplored_ratio")
         unresolved = term.get("unresolved_anchor_count", 1)
+        reachable_frontiers = term.get(
+            "reachable_frontier_count", term.get("frontier_count", 1))
+        pending_instances = term.get("pending_instance_count", 1)
         ok = unexplored is not None \
             and unexplored < self.finish_unexplored_max \
-            and unresolved == 0
+            and unresolved == 0 \
+            and reachable_frontiers == 0 \
+            and pending_instances == 0
         if task.get("mode") == "many" and task.get("expected") is not None:
             ok = ok and task.get("found", 0) >= task["expected"]
         if ok:

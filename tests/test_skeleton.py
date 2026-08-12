@@ -98,10 +98,43 @@ def test_frontier_does_not_wrap_edges():
     assert sk.frontier_clusters(grid, min_size=1) == []
 
 
+def test_observed_hole_is_not_frontier():
+    """已观测但未分类的稀疏点云孔洞不能被当作未知区域。"""
+    free = np.zeros((20, 20), dtype=bool)
+    free[4:16, 4:16] = True
+    free[9:11, 9:11] = False
+    obstacle = np.zeros_like(free)
+    observed = free.copy()
+    observed[9:11, 9:11] = True
+    grid = OccupancyGrid(1.0, np.zeros(2), free, obstacle,
+                         observed=observed)
+    clusters = sk.frontier_clusters(grid, min_size=1)
+    assert all(not (8 <= c["cell"][0] <= 12 and
+                    8 <= c["cell"][1] <= 12) for c in clusters)
+
+
+def test_frontier_representative_is_free_and_reports_gain():
+    free = np.zeros((20, 30), dtype=bool)
+    free[5:15, 3:14] = True
+    obstacle = np.zeros_like(free)
+    observed = np.zeros_like(free)
+    observed[:, :14] = True
+    grid = OccupancyGrid(1.0, np.zeros(2), free, obstacle,
+                         observed=observed)
+    clusters = sk.frontier_clusters(grid, min_size=3)
+    assert clusters
+    x, y = clusters[0]["cell"]
+    assert grid.free[y, x]
+    assert clusters[0]["information_gain"] > 0
+    assert clusters[0]["clearance_cells"] > 0
+
+
 if __name__ == "__main__":
     test_cross_junction()
     test_t_junction()
     test_two_rooms()
     test_frontier()
     test_frontier_does_not_wrap_edges()
+    test_observed_hole_is_not_frontier()
+    test_frontier_representative_is_free_and_reports_gain()
     print("ALL SKELETON TESTS PASSED")

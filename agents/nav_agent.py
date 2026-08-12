@@ -67,8 +67,6 @@ class NavAgent(MappingAgent):
         if self.semantic_backend == "semantic_memory":
             print("[NavAgent] semantic_memory 后端：NAV_MIN_SAM 阈值已弃用，"
                   "命中准入由 pointing 置信度与分级观测决定")
-        self.vlm_candidate_limit = int(
-            os.environ.get("NAV_VLM_CANDIDATE_LIMIT", "4"))
         self.vlm_verify_conf = float(
             os.environ.get("NAV_VLM_VERIFY_CONF", "0.50"))
         self.vlm = VLMDecisionClient.from_env()
@@ -144,8 +142,12 @@ class NavAgent(MappingAgent):
             os.environ.get("NAV_BELIEF_WEIGHT", "1.0"))
         self._frontier_empty_streak = 0
         self._last_frontier_count = None
+        self._last_reachable_frontier_count = None
         self._last_frontier_step = -10 ** 9
         self._recent_frontiers = []
+        self._frontier_failures = {}
+        self._active_frontier_key = None
+        self._frontier_exhausted_reported = False
         self._last_map_submaps = 0
         self._last_map_growth_step = 0
         self.frontier_cooldown_steps = int(os.environ.get(
@@ -186,6 +188,14 @@ class NavAgent(MappingAgent):
     def _explore_action(self, observation):
         """前沿引导探索；碰撞恢复最优先，构建失败回退随机游走。"""
         if self._last_motion_failed:
+            if self._active_frontier_key is not None:
+                key = self._active_frontier_key
+                self._frontier_failures[key] = \
+                    self._frontier_failures.get(key, 0) + 1
+                self._log_event(
+                    f"frontier navigation failed {key} "
+                    f"count={self._frontier_failures[key]}")
+                self._active_frontier_key = None
             self._explore_follower = None      # 碰撞后旧路径不可信
             return super()._explore_action(observation)
         if not self.explore_enabled:
@@ -196,6 +206,9 @@ class NavAgent(MappingAgent):
             return action
         if observation.step_count - self._last_explore_plan \
                 >= self.explore_replan_interval:
+            if self.decision_loop is not None:
+                return self._choose_high_level_target(
+                    observation, "world_state_updated")
             self._plan_exploration(observation)
             action = self._explore_follow(observation)
             if action is not None:
@@ -223,8 +236,14 @@ class NavAgent(MappingAgent):
         except Exception:
             pass
         action, arrived = fl.next_action()
+        if action is None and not arrived and self._active_frontier_key is not None:
+            key = self._active_frontier_key
+            self._frontier_failures[key] = self._frontier_failures.get(key, 0) + 1
+            self._log_event(
+                f"frontier path lost {key} count={self._frontier_failures[key]}")
         if arrived or action is None:
             self._explore_follower = None
+            self._active_frontier_key = None
             # 到达短 frontier 后保留正常重规划间隔，避免每一步重新选择
             # 同一个已经到达的边界。
             self._last_explore_plan = observation.step_count
@@ -232,8 +251,8 @@ class NavAgent(MappingAgent):
         fl.dead_reckon(int(action))
         return int(action)
 
-    def _plan_exploration(self, observation):
-        """重建自由空间栅格，选 frontier 目标并规划探索路径。"""
+    def _plan_exploration(self, observation, select=True):
+        """重建栅格并刷新可达 frontier；select=False 时只更新候选。"""
         self._last_explore_plan = observation.step_count
         try:
             poses, frame_ids = self.client.get_all_poses()
@@ -272,7 +291,7 @@ class NavAgent(MappingAgent):
                 (a.point[:2], a.score)
                 for a in self.ledger.belief_anchors(self.target_text)])
 
-        clusters = skel.frontier_clusters(grid, min_size=5)
+        raw_clusters = skel.frontier_clusters(grid, min_size=5)
         try:
             num_submaps = int(self.client.get_state().get("num_submaps", 0))
             if num_submaps > self._last_map_submaps:
@@ -280,53 +299,93 @@ class NavAgent(MappingAgent):
                 self._last_map_submaps = num_submaps
         except Exception:
             pass
-        self._last_frontier_count = len(clusters)
-        self._last_frontier_step = observation.step_count
-        self._last_frontier_clusters = list(clusters)
-        if clusters:
-            self._frontier_empty_streak = 0
-        else:
-            self._frontier_empty_streak += 1
         self._recent_frontiers = [
             item for item in self._recent_frontiers
             if observation.step_count - item[1] <= self.frontier_cooldown_steps
         ]
-        # 过滤太近（<1m，已看过）并打分：
-        # 大小/(1+距离m) × (1+信念权重×节点信念)
-        cands = []
-        for c in clusters:
+        # 全量候选先做距离/冷却/A* 可达性检查，再进入排序。对外暴露的
+        # frontier、结束判断和 VLM 状态都只使用这个最终有效集合。
+        reachable = []
+        valid = []
+        for c in raw_clusters:
             d_units = math.hypot(c["world"][0] - cur[0],
                                  c["world"][1] - cur[1])
             d_m = d_units * scale if scale else d_units
             if scale and d_m < 1.0:
                 continue
-            if scale and any(
+            on_cooldown = bool(scale and any(
                     math.hypot(c["world"][0] - old_xy[0],
                                c["world"][1] - old_xy[1]) * scale
                     < self.frontier_cooldown_m
-                    for old_xy, _old_step in self._recent_frontiers):
-                continue
-            belief = self.belief.belief_at(c["world"], graph)
-            score = c["size"] / (1.0 + d_m) * \
-                (1.0 + self.explore_belief_weight * belief)
-            cands.append((score, c))
-        cands.sort(key=lambda t: -t[0])
-
-        for _, c in cands[:5]:
+                    for old_xy, _old_step in self._recent_frontiers))
             path = grid.astar(cur[:2], c["world"])
             if path is None or len(path) < 2:
                 continue
-            path = grid.shortcut(path)
-            fl = nav.PathFollower(
-                scale=scale or 1.0, reach_m=self.reach_m)
-            fl.set_path(path)
-            self._explore_follower = fl
-            self._recent_frontiers.append((
-                np.asarray(c["world"], dtype=np.float64)[:2],
-                observation.step_count))
-            print(f"[NavAgent] step={observation.step_count} 探索目标 "
-                  f"frontier size={c['size']} 路径 {len(path)} 点")
+            path_cost_units = sum(float(np.linalg.norm(
+                np.asarray(path[i + 1]) - np.asarray(path[i])))
+                for i in range(len(path) - 1))
+            path_cost_m = path_cost_units * scale if scale else path_cost_units
+            belief = self.belief.belief_at(c["world"], graph)
+            key = self._frontier_key(c["world"], scale)
+            failures = self._frontier_failures.get(key, 0)
+            gain = max(float(c.get("information_gain", c["size"])), 1.0)
+            score = gain / (1.0 + path_cost_m) * \
+                (1.0 + self.explore_belief_weight * belief) / (1.0 + failures)
+            item = dict(c)
+            item.update({
+                "path": grid.shortcut(path),
+                "path_cost_m": float(path_cost_m),
+                "semantic_hint": float(belief),
+                "failure_count": int(failures),
+                "utility": float(score),
+                "key": key,
+                "on_cooldown": on_cooldown,
+            })
+            reachable.append(item)
+            if not on_cooldown:
+                valid.append(item)
+        valid.sort(key=lambda c: -c["utility"])
+
+        self._last_frontier_count = len(valid)
+        self._last_reachable_frontier_count = len(reachable)
+        self._last_frontier_step = observation.step_count
+        self._last_frontier_clusters = valid
+        if valid:
+            self._frontier_empty_streak = 0
+            self._frontier_exhausted_reported = False
+        elif not reachable:
+            self._frontier_empty_streak += 1
+            if not self._frontier_exhausted_reported:
+                self._log_event("frontier_exhausted: no reachable frontier")
+                self._frontier_exhausted_reported = True
             return
+        else:
+            # 仍有可达 frontier，只是处于短期冷却；不能计为探索耗尽。
+            self._frontier_empty_streak = 0
+            self._frontier_exhausted_reported = False
+            return
+
+        if not select:
+            return
+
+        c = valid[0]
+        fl = nav.PathFollower(scale=scale or 1.0, reach_m=self.reach_m)
+        fl.set_path(c["path"])
+        self._explore_follower = fl
+        self._active_frontier_key = c["key"]
+        self._recent_frontiers.append((
+            np.asarray(c["world"], dtype=np.float64)[:2],
+            observation.step_count))
+        print(f"[NavAgent] step={observation.step_count} 探索目标 "
+              f"frontier gain={c.get('information_gain', 0)} "
+              f"cost={c['path_cost_m']:.2f}m utility={c['utility']:.2f}")
+
+    def _frontier_key(self, world_xy, scale):
+        """稳定的米制空间桶，用于累计 frontier 导航失败惩罚。"""
+        bucket_m = max(self.frontier_cooldown_m, 0.25)
+        x_m = float(world_xy[0]) * (scale or 1.0)
+        y_m = float(world_xy[1]) * (scale or 1.0)
+        return (int(round(x_m / bucket_m)), int(round(y_m / bucket_m)))
 
     def act(self, observation):
         self._feed_frame(observation)
@@ -350,13 +409,8 @@ class NavAgent(MappingAgent):
             else:
                 self._clear_current_target()
                 self.mode = "explore"
-                action = None
-                if getattr(self, "decision_loop", None) is not None:
-                    # 事件驱动：新实例确认后由决策层定下一步
-                    action = self._decider_next(
-                        observation, "instance_confirmed")
-                if action is None:
-                    action = self._explore_action(observation)
+                action = self._choose_high_level_target(
+                    observation, "world_state_updated")
         elif self.mode == "done":
             action = self._explore_action(observation)
         elif self.mode == "nav":
@@ -382,9 +436,10 @@ class NavAgent(MappingAgent):
                     self.mode = "explore"
                     action = self._explore_action(observation)
         else:
-            action = self._explore_action(observation)
             self._periodic_anchor(observation)
-            self._maybe_query_target(observation)
+            action = self._maybe_query_target(observation)
+            if action is None:
+                action = self._explore_action(observation)
 
         self._record_and_update(observation, action)
         if self.follower is not None and self.follower.anchor_frame >= 0:
@@ -557,6 +612,7 @@ class NavAgent(MappingAgent):
                     self.target_point = self._raw_point(nd.point)
                     self.target_candidate_id = nd.candidate_id
                     self._explore_follower = None
+                    self._active_frontier_key = None
                     self._log_event(
                         f"decider -> GOTO_INSTANCE {nd.iid}")
                     if self._plan_to_target(observation):
@@ -568,17 +624,18 @@ class NavAgent(MappingAgent):
                 if f"f{i}" == str(result.target_id):
                     cluster = c
                     break
-            grid = self._explore_grid
-            cur = self._current_aligned_xy()
-            if cluster is None or grid is None or cur is None:
+            if cluster is None:
                 return
-            path = grid.astar(cur, cluster["world"])
+            path = cluster.get("path")
             if not path or len(path) < 2:
                 return
+            self._clear_current_target()
+            self.mode = "explore"
             scale = self.calibrator.current_scale() or 1.0
             fl = nav.PathFollower(scale=scale, reach_m=self.reach_m)
-            fl.set_path(grid.shortcut(path))
+            fl.set_path(path)
             self._explore_follower = fl
+            self._active_frontier_key = cluster.get("key")
             self._recent_frontiers.append((
                 np.asarray(cluster["world"], dtype=np.float64)[:2],
                 observation.step_count))
@@ -591,8 +648,6 @@ class NavAgent(MappingAgent):
         step = observation.step_count
         if self._reported_count <= 0:
             return False
-        if self.memory.unvisited(self.target_text):
-            return False                      # 还有已确认未访问实例
         if step - self._last_finish_decision_step < self.query_interval:
             return False
         late = step >= int(0.5 * observation.max_steps)
@@ -612,30 +667,62 @@ class NavAgent(MappingAgent):
         return False
 
     def _decider_next(self, observation, event):
-        """事件驱动咨询决策层下一步。返回 action 或 None（回退默认流程）。"""
+        """事件驱动咨询决策层。返回 (DecisionResult|None, action|None)。"""
         try:
             state, map_png = self._build_decider_input(observation)
             result = self.decision_loop.decide(event, state, map_png)
         except Exception as exc:
             print(f"[NavAgent] 决策层调用失败，回退规则: {exc}")
-            return None
+            return None, None
         if result is None:
-            return None
+            return None, None
         print(f"[NavAgent] 决策层 {event}: {result}")
         self._log_event(
             f"decider {event} -> {result.action} {result.target_id}")
         if result.action == "FINISH":
             # FINISH 硬条件已在 DecisionLoop 内强制（many 计数 / all 终止账本）
-            return int(Action.FINISH)
+            return result, int(Action.FINISH)
         if result.action in ("GOTO_INSTANCE", "GOTO_FRONTIER"):
             self._apply_decider_steering(observation, result)
             if self.mode == "nav":
                 action, arrived = self._nav_action(observation)
                 if action is not None:
-                    return action
+                    return result, action
                 self.mode = "explore"
-            return self._explore_action(observation)
-        return None                             # VERIFY 等：默认流程处理
+            action = self._explore_follow(observation)
+            return result, (action if action is not None else
+                            super()._explore_action(observation))
+        if result.action == "EXPLORE":
+            return result, super()._explore_action(observation)
+        return result, None                    # VERIFY：调用方继续采证
+
+    def _choose_high_level_target(self, observation, event="world_state_updated"):
+        """统一高层选择：同时向 VLM 暴露 confirmed instances/frontiers。
+
+        只有 VLM 不可用或输出非法时，才确定性回退到最近实例，再回退到
+        最高 utility frontier。该回退不参与正常 VLM 决策。
+        """
+        self._plan_exploration(observation, select=False)
+        if self.decision_loop is not None:
+            result, action = self._decider_next(observation, event)
+            if result is not None:
+                return (action if action is not None else
+                        super()._explore_action(observation))
+            # 只有模型不可用/非法才进入确定性保底。
+        if self._activate_memory_target(observation):
+            if self.mode == "nav":
+                action, _arrived = self._nav_action(observation)
+                if action is not None:
+                    return action
+        if self._last_frontier_clusters:
+            from decision import DecisionResult
+            self._apply_decider_steering(
+                observation, DecisionResult("GOTO_FRONTIER", "f0",
+                                            "deterministic fallback", 0.0))
+            action = self._explore_follow(observation)
+            if action is not None:
+                return action
+        return self._explore_action(observation)
 
     def _should_finish(self, observation):
         if self._target_mode == "many" and self._target_count is not None:
@@ -650,9 +737,11 @@ class NavAgent(MappingAgent):
             frontier_fresh = observation.step_count - self._last_frontier_step \
                 <= 2 * self.explore_replan_interval
             no_pending = not self.memory.unvisited(self.target_text)
-            geometric_ready = self._reported_count > 0 and late and no_pending and \
-                self._no_hit_queries >= self.finish_patience and \
-                frontier_fresh and self._last_frontier_count == 0 and \
+            geometric_ready = \
+                self._reported_count > 0 and late and no_pending and \
+                self._no_hit_queries >= self.finish_patience and frontier_fresh and \
+                getattr(self, "_last_reachable_frontier_count",
+                        self._last_frontier_count) == 0 and \
                 self._frontier_empty_streak >= self.finish_frontier_patience
             fallback_late = observation.step_count >= int(
                 0.95 * observation.max_steps)
@@ -828,51 +917,14 @@ class NavAgent(MappingAgent):
         return [selected] if selected is not None else []
 
     def _activate_memory_target(self, observation):
-        """选择持久实例，经统一决策入口审阅，并规划第一段。"""
+        """确定性回退：按现有规划器选择持久实例并规划第一段。"""
         nodes = self._ordered_memory_nodes()
         if not nodes:
             return False
-        considered = nodes[:self.vlm_candidate_limit]
-        selected = considered[0]
-        evidence_by_iid = {}
-        if self.decision_loop is not None:
-            state, map_png = self._build_decider_input(observation)
-            considered_ids = {str(nd.iid) for nd in considered}
-            state["instances"] = [
-                row for row in state.get("instances", [])
-                if str(row.get("id")) in considered_ids]
-            state["candidate_review"] = [
-                {"instance_id": nd.iid, "frame_id": nd.frame_id,
-                 "candidate_id": nd.candidate_id}
-                for nd in considered]
-            images = [("current_observation",
-                       self.vlm.encode_rgb(observation.rgb))]
-            for nd in considered:
-                if not nd.candidate_id:
-                    continue
-                try:
-                    meta, payload = self.client.get_candidate_evidence(
-                        nd.candidate_id)
-                    if meta.get("found") and payload:
-                        evidence_by_iid[str(nd.iid)] = payload
-                        images.append((f"candidate_instance_{nd.iid}",
-                                       payload))
-                except Exception as exc:
-                    print(f"[NavAgent] candidate evidence 失败: {exc}")
-            result = self.decision_loop.decide(
-                "candidate_review", state, map_png=map_png, images=images)
-            if result is None:
-                pass
-            elif result.action != "GOTO_INSTANCE":
-                return False
-            else:
-                selected = next((nd for nd in considered
-                                 if str(nd.iid) == result.target_id), None)
-                if selected is None:
-                    return False
+        selected = nodes[0]
         self.target_point = self._raw_point(selected.point)
         self.target_candidate_id = selected.candidate_id
-        self._selected_evidence = evidence_by_iid.get(str(selected.iid))
+        self._selected_evidence = None
         self._no_hit_queries = 0
         self._explore_follower = None
         print(f"[NavAgent] 从实例记忆选择 #{selected.iid} "
@@ -921,12 +973,15 @@ class NavAgent(MappingAgent):
                       f"观测升级 confirmed（conf={anchor.score:.2f}）")
             elif outcome == "belief":
                 n_belief += 1
-        if not self._activate_memory_target(observation):
-            if not any_confirmed:
-                self._no_hit_queries += 1
-            print(f"[NavAgent] step={step} '{self.target_text}' "
-                  f"新增 belief 锚点 {n_belief} 个"
-                  f"（confirmed={'有' if any_confirmed else '无'}），继续探索")
+        if not any_confirmed:
+            self._no_hit_queries += 1
+        print(f"[NavAgent] step={step} '{self.target_text}' "
+              f"新增 belief 锚点 {n_belief} 个"
+              f"（confirmed={'有' if any_confirmed else '无'}）")
+        if any_confirmed:
+            return self._choose_high_level_target(
+                observation, "world_state_updated")
+        return None
 
     def _hit_obs_xy(self, hit):
         """命中帧的拍照位姿（对齐地图坐标 xy），用于独立观测判定。"""
@@ -1012,7 +1067,7 @@ class NavAgent(MappingAgent):
         step = observation.step_count
         if step < self.warmup_steps or step - self._last_query_step < \
                 self.query_interval:
-            return
+            return None
         self._last_query_step = step
 
         # 已有目标点：不再重复查询，按间隔重试规划（地图在增长）；
@@ -1025,29 +1080,26 @@ class NavAgent(MappingAgent):
             elif step - self._last_plan_step >= self.replan_interval:
                 if self._plan_to_target(observation):
                     self.mode = "nav"
-            return
+            return None
 
         phrase = self._target_phrase(observation)
         self.target_text = phrase
         self._ensure_alignment()
         self._refresh_memory_candidates()
-        # 先完成已经看见但尚未访问的持久实例，再继续扩大搜索空间。
-        if self._activate_memory_target(observation):
-            return
         try:
             results = self.client.ground_object(
                 phrase, top_k=self.ground_top_k)
         except Exception as e:          # server 忙/异常不应杀死 episode
             print(f"[NavAgent] ground_object 失败: {e}")
-            return
+            return None
         hits = [r for r in results if r.get("found")]
         if not hits:
             self._no_hit_queries += 1
             print(f"[NavAgent] step={step} 未定位到 '{phrase}'")
-            return
+            return self._choose_high_level_target(
+                observation, "world_state_updated")
         if self.semantic_backend == "semantic_memory":
-            self._ingest_semantic_hits(observation, hits)
-            return
+            return self._ingest_semantic_hits(observation, hits)
         # 按 SAM 分数排序，跳过黑名单（扫描确认失败过）的目标点
         hits.sort(key=lambda r: r.get("sam_score", 0.0), reverse=True)
         eligible = []
@@ -1059,7 +1111,7 @@ class NavAgent(MappingAgent):
         if not eligible:
             self._no_hit_queries += 1
             print(f"[NavAgent] step={step} '{phrase}' 命中均被拉黑或分数不足")
-            return
+            return None
         # 所有当前命中先写入 confirmed memory；planner 随后对持久集合规划，
         # 而不是只对这一次查询的临时候选排序。
         for hit in eligible:
@@ -1068,9 +1120,8 @@ class NavAgent(MappingAgent):
                 hit.get("sam_score", 0.0), merge_dist=self._merge_dist(),
                 status="confirmed", frame_id=hit.get("frame_id"),
                 step=step, candidate_id=hit.get("candidate_id"))
-        if not self._activate_memory_target(observation):
-            self._no_hit_queries += 1
-            print(f"[NavAgent] step={step} VLM 建议继续探索")
+        return self._choose_high_level_target(
+            observation, "world_state_updated")
 
     # ------------------------------------------------------------------
     # 规划

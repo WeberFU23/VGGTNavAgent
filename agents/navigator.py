@@ -126,11 +126,15 @@ def _flood_component(mask, start):
 class OccupancyGrid:
     """2D 占据栅格（对齐坐标系），单位与输入点云一致（地图单位）。"""
 
-    def __init__(self, res, origin, free, obstacle):
+    def __init__(self, res, origin, free, obstacle, observed=None):
         self.res = res                  # 地图单位/格
         self.origin = np.asarray(origin, dtype=np.float64)  # 格子(0,0)的xy
-        self.free = free                # (H,W) bool 可行走
-        self.obstacle = obstacle        # (H,W) bool 膨胀后障碍
+        self.free = np.asarray(free, dtype=bool)       # (H,W) bool 可行走
+        self.obstacle = np.asarray(obstacle, dtype=bool)  # 膨胀后障碍
+        # 显式观测覆盖层。未提供时保持旧构造器语义，便于合成测试和调用方。
+        self.observed = np.asarray(
+            self.free | self.obstacle if observed is None else observed,
+            dtype=bool)
 
     @classmethod
     def from_trajectory(cls, cam_centers_aligned, stamp=3):
@@ -284,13 +288,16 @@ class OccupancyGrid:
 
         free = raster(is_floor, splat=1)
         obstacle = raster(is_obs, splat=0)
+        observed = raster(np.ones(len(xy), dtype=bool), splat=1)
         return cls._finalize(free, obstacle, res, qlo, cam_centers_aligned,
                              floor_z=floor_z, unit_per_m=u,
-                             robot_radius_m=robot_radius_m, res_m=res_m)
+                             robot_radius_m=robot_radius_m, res_m=res_m,
+                             observed=observed)
 
     @classmethod
     def _finalize(cls, free, obstacle, res, qlo, cam_centers_aligned,
-                  floor_z, unit_per_m, robot_radius_m=0.25, res_m=0.10):
+                  floor_z, unit_per_m, robot_radius_m=0.25, res_m=0.10,
+                  observed=None):
         """公共收尾：障碍膨胀 -> 走廊覆盖 -> 连通域约束 -> 建栅格。"""
         h, w = free.shape
         # 障碍物按机器人半径膨胀（3x3 最大滤波迭代）
@@ -345,7 +352,12 @@ class OccupancyGrid:
             # 不连通的区域一律剔除（探索时也不会把它当目标）。
             start = (int(cc[-1][0]), int(cc[-1][1]))
             free = _flood_component(free, start)
-        grid = cls(res, qlo, free, obstacle)
+        # free/obstacle 之外，被点云覆盖但因高度分类不确定的格子仍是
+        # "已观测"，不能作为 frontier。轨迹走廊也明确属于已观测区域。
+        if observed is None or observed.shape != free.shape:
+            observed = free | obstacle
+        observed = np.asarray(observed, dtype=bool) | free | obstacle
+        grid = cls(res, qlo, free, obstacle, observed=observed)
         grid.floor_z = floor_z
         grid.unit_per_m = unit_per_m  # 调试用：1 米对应的地图单位数
         return grid
@@ -414,7 +426,14 @@ class OccupancyGrid:
 
         gv = np.zeros((h, w), dtype=np.int32)
         ov = np.zeros((h, w), dtype=np.int32)
+        observed = np.zeros((h, w), dtype=bool)
         for xy2, ground, obs in per_frame:
+            # 任意有效 VGGT 3D 回投影均贡献观测覆盖；一格膨胀填补稀疏
+            # 点采样的小孔，但不会把视野外区域误标为已观测。
+            cell_all = np.floor((xy2 - qlo) / res).astype(np.int64)
+            ok_all = (cell_all[:, 0] >= 0) & (cell_all[:, 0] < w) & \
+                     (cell_all[:, 1] >= 0) & (cell_all[:, 1] < h)
+            observed[cell_all[ok_all, 1], cell_all[ok_all, 0]] = True
             for mask, acc in ((ground, gv), (obs, ov)):
                 sel = xy2[mask]
                 if not len(sel):
@@ -431,12 +450,27 @@ class OccupancyGrid:
             for dx in (-1, 0, 1):
                 grown |= np.roll(np.roll(free, dy, axis=0), dx, axis=1)
         free = grown
+        # 3x3 闭运算：填补稀疏采样小孔，同时基本保持真实观测外边界；
+        # 不能只做膨胀，否则 free 与 unknown 会被隔开而丢失 frontier。
+        padded = np.pad(observed, 1, constant_values=False)
+        dilated = observed.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                dilated |= padded[1 + dy:1 + dy + h,
+                                   1 + dx:1 + dx + w]
+        padded_d = np.pad(dilated, 1, constant_values=False)
+        covered = np.ones_like(observed)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                covered &= padded_d[1 + dy:1 + dy + h,
+                                    1 + dx:1 + dx + w]
         obstacle = ov >= obs_votes
         floor_z_med = float(np.median(
             [c[2] for c in cam_centers])) - ruler_med
         return cls._finalize(free, obstacle, res, qlo, cam_centers,
                              floor_z=floor_z_med, unit_per_m=u,
-                             robot_radius_m=robot_radius_m, res_m=res_m)
+                             robot_radius_m=robot_radius_m, res_m=res_m,
+                             observed=covered)
 
     # ------------------------------------------------------------------
     def world_to_cell(self, p):

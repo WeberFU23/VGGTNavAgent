@@ -40,7 +40,7 @@ def test_openai_compatible_unified_call():
         api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
         post_fn=fake)
     decision = client.agentic_chat(
-        "Event: candidate_review", [("candidate_instance_1", b"jpeg-one")])
+        "Event: world_state_updated", [("candidate_instance_1", b"jpeg-one")])
     assert decision["action"] == "EXPLORE"
 
     url, kwargs = fake.calls[-1]

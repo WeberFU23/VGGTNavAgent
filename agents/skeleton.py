@@ -170,12 +170,15 @@ def build_skeleton_graph(grid, min_spur_cells=8):
     return SkeletonGraph(nodes, edges)
 
 
-def frontier_clusters(grid, min_size=5):
+def frontier_clusters(grid, min_size=5, info_radius=5):
     """frontier = 自由格中与未知格 4 相邻者，8 连通聚类。
 
     返回 [{cell, world, size}]，按 size 降序。
     """
-    unknown = ~grid.free & ~grid.obstacle
+    # 只有真正未被传感器覆盖的区域才是 unknown；稀疏点云内部的分类
+    # 孔洞已经由 OccupancyGrid.observed 排除，不再制造假 frontier。
+    observed = getattr(grid, "observed", grid.free | grid.obstacle)
+    unknown = ~np.asarray(observed, dtype=bool)
     # 未知区域膨胀一格，与自由空间取交。显式 pad，避免 np.roll 把地图
     # 左右/上下边界首尾相连而制造假 frontier。
     padded = np.pad(unknown, 1, constant_values=False)
@@ -196,11 +199,32 @@ def frontier_clusters(grid, min_size=5):
         ys, xs = np.nonzero(labels == cid)
         if len(ys) < min_size:
             continue
-        cell = (float(xs.mean()), float(ys.mean()))
+        centroid = (float(xs.mean()), float(ys.mean()))
+        # 均值可能落在未知/障碍内。代表点必须取自簇内真实自由格，并
+        # 优先选择局部自由空间更宽、其次更接近几何中心的格子。
+        best_cell = None
+        best_key = None
+        for y, x in zip(ys, xs):
+            y0, y1 = max(0, y - 2), min(grid.free.shape[0], y + 3)
+            x0, x1 = max(0, x - 2), min(grid.free.shape[1], x + 3)
+            clearance = int(np.asarray(grid.free[y0:y1, x0:x1]).sum())
+            center_d2 = (x - centroid[0]) ** 2 + (y - centroid[1]) ** 2
+            key = (clearance, -center_d2)
+            if best_key is None or key > best_key:
+                best_key, best_cell = key, (int(x), int(y))
+        # 近邻未知面积作为预期信息增益，比边界长度更贴近探索价值。
+        y0 = max(0, int(ys.min()) - info_radius)
+        y1 = min(unknown.shape[0], int(ys.max()) + info_radius + 1)
+        x0 = max(0, int(xs.min()) - info_radius)
+        x1 = min(unknown.shape[1], int(xs.max()) + info_radius + 1)
+        information_gain = int(unknown[y0:y1, x0:x1].sum())
         clusters.append({
-            "cell": cell,
-            "world": grid.cell_to_world(cell),
+            "cell": best_cell,
+            "centroid_cell": centroid,
+            "world": grid.cell_to_world(best_cell),
             "size": int(len(ys)),
+            "information_gain": information_gain,
+            "clearance_cells": int(best_key[0]),
         })
     clusters.sort(key=lambda c: -c["size"])
     return clusters

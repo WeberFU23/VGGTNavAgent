@@ -38,9 +38,10 @@ def _state(mode="all", found=1, expected=None, unexplored=0.05,
         "recent_events": ["reported TARGET_FOUND 'basket' (total 1)"],
         "older_events_total": 0,
         "termination": {"unexplored_ratio": unexplored,
-                        "unresolved_anchor_count": unresolved,
-                        "frontier_count": 1,
-                        "recent_queries_without_new_candidate": 6},
+                         "unresolved_anchor_count": unresolved,
+                         "frontier_count": 1,
+                         "reachable_frontier_count": 0,
+                         "recent_queries_without_new_candidate": 6},
     }
 
 
@@ -187,6 +188,15 @@ def test_finish_downgraded_no_frontier():
     assert result.validation == "finish_downgraded_no_frontier"
 
 
+def test_finish_downgraded_with_reachable_frontier():
+    chat = _ScriptedChat([{"action": "FINISH", "confidence": 0.9}])
+    state = _state()
+    state["termination"]["reachable_frontier_count"] = 1
+    result = DecisionLoop(chat).decide("finish_check", state)
+    assert result.action == "GOTO_FRONTIER"
+    assert result.validation == "finish_downgraded"
+
+
 def test_many_counting_hint_in_prompt():
     chat = _ScriptedChat([{"action": "FINISH", "confidence": 0.9}])
     DecisionLoop(chat).decide(
@@ -271,6 +281,22 @@ def test_build_world_state_ids_and_precompute():
     assert state["termination"]["unexplored_ratio"] is not None
 
 
+def test_world_state_uses_filtered_frontier_metrics():
+    agent = _make_agent()
+    obs = SimpleNamespace(step_count=50, max_steps=500,
+                          goal_text="Find all baskets")
+    frontiers = [{"world": np.array([10.0, 2.0]), "size": 7,
+                  "information_gain": 42, "path_cost_m": 3.5,
+                  "semantic_hint": 0.4, "failure_count": 2,
+                  "utility": 1.7}]
+    state = build_world_state(agent, obs, grid=_grid(), frontiers=frontiers)
+    row = state["frontiers"][0]
+    assert row["information_gain"] == 42
+    assert row["path_cost_m"] == 3.5
+    assert row["failure_count"] == 2
+    assert row["utility"] == 1.7
+
+
 # ----------------------------------------------------------------------
 # NavAgent 接线：四模式 mock 决策
 # ----------------------------------------------------------------------
@@ -335,8 +361,8 @@ def test_navagent_decider_next_goto_instance():
                           goal_text="Find a basket",
                           rgb=np.zeros((48, 64, 3), dtype=np.uint8),
                           episode_id="ep", previous_action=None)
-    action = agent._decider_next(obs, "instance_confirmed")
-    assert action is not None
+    result, action = agent._decider_next(obs, "world_state_updated")
+    assert result.action == "GOTO_INSTANCE"
     # 目标点已被设置（规划因无 SLAM 位姿失败则保持 explore，均合法）
     assert agent.target_point is not None
     assert any("GOTO_INSTANCE" in e for e in agent._events)
@@ -350,7 +376,30 @@ def test_navagent_decider_none_falls_back_to_rules():
                           goal_text="Find a basket",
                           rgb=np.zeros((48, 64, 3), dtype=np.uint8),
                           episode_id="ep", previous_action=None)
-    assert agent._decider_next(obs, "instance_confirmed") is None
+    assert agent._decider_next(obs, "world_state_updated") == (None, None)
+
+
+def test_unified_choice_can_select_frontier_with_pending_instance():
+    agent = _make_agent()
+    agent._target_mode = "all"
+    agent.memory.add_or_merge("basket", [6, 6, 0], 0.9, merge_dist=0.75)
+    agent._plan_exploration = lambda obs, select=False: None
+    agent._last_frontier_clusters = [{
+        "world": np.array([4.0, 4.0]), "path": [(0, 0), (1, 1)],
+        "key": (4, 4), "size": 5}]
+    agent._build_decider_input = lambda obs: ({
+        "instances": [{"id": 1, "status": "confirmed"}],
+        "frontiers": [{"id": "f0"}], "task": {}, "termination": {}}, None)
+    _wire_decider(agent, [{"action": "GOTO_FRONTIER", "target_id": "f0",
+                           "confidence": 0.8}])
+    agent._explore_follow = lambda obs: int(Action.TURN_LEFT)
+    obs = SimpleNamespace(step_count=200, max_steps=500,
+                          goal_text="Find all baskets",
+                          rgb=np.zeros((48, 64, 3), dtype=np.uint8))
+    action = agent._choose_high_level_target(obs)
+    assert action == int(Action.TURN_LEFT)
+    assert agent.target_point is None
+    assert agent._active_frontier_key == (4, 4)
 
 
 def test_navagent_rules_mode_has_no_decider():

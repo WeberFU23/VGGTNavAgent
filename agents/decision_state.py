@@ -36,6 +36,8 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
             "status": nd.status,
             "confidence": round(nd.score, 3),
             "n_obs": nd.n_obs,
+            "frame_id": nd.frame_id,
+            "candidate_id": nd.candidate_id,
             "dist_m": round(dist_m, 2) if dist_m is not None else None,
             "path_cost_m": _path_cost_m(grid, start, nd.point, scale),
         })
@@ -66,8 +68,14 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
             "id": f"f{i}",
             "dist_m": round(dist_m, 2) if dist_m is not None else None,
             "size": int(c.get("size", 0)),
-            "semantic_hint": round(agent.belief.belief_at(c["world"], None),
-                                   3),
+            "information_gain": int(c.get("information_gain", 0)),
+            "path_cost_m": (round(float(c["path_cost_m"]), 2)
+                            if c.get("path_cost_m") is not None else None),
+            "semantic_hint": round(float(c.get(
+                "semantic_hint", agent.belief.belief_at(c["world"], None))), 3),
+            "failure_count": int(c.get("failure_count", 0)),
+            "utility": (round(float(c["utility"]), 3)
+                        if c.get("utility") is not None else None),
         })
 
     # 近期事件：最近 10 条原文 + 更早压缩统计
@@ -77,7 +85,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
     # 终止账本
     unexplored_ratio = None
     if grid is not None:
-        unknown = ~(np.asarray(grid.free) | np.asarray(grid.obstacle))
+        observed = getattr(grid, "observed",
+                           np.asarray(grid.free) | np.asarray(grid.obstacle))
+        unknown = ~np.asarray(observed, dtype=bool)
         unexplored_ratio = float(unknown.sum()) / float(unknown.size)
 
     return {
@@ -101,6 +111,10 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
             "unresolved_anchor_count":
                 agent.ledger.count_unresolved(agent.target_text),
             "frontier_count": len(frontiers or []),
+            "reachable_frontier_count": getattr(
+                agent, "_last_reachable_frontier_count", len(frontiers or [])),
+            "pending_instance_count": len(
+                agent.memory.unvisited(agent.target_text)),
             "recent_queries_without_new_candidate": agent._no_hit_queries,
         },
     }

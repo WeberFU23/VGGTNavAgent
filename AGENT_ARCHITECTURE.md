@@ -1,148 +1,331 @@
-# VGGT-Nav Agent 架构与弱点总结
+# VGGT-Nav Agent 当前架构
 
-> 更新于 2026-08-12。新增语义记忆架构（Phase 1–5 代码完成，待 AutoDL 远端
-> smoke 实测；旧 CLIP+SAM3 链路保留在 `NAV_SEMANTIC_BACKEND=clip_sam`（默认）
-> 后面，可一键回退）。
+本文档描述仓库当前代码，而不是最初设计或未来计划。系统面向多目标具身导航任务，例如“找到 5 个杯子”或“找到所有篮子”。核心理念是：为决策 VLM 提供可靠的视觉感知、语义记忆、空间记忆和确定性执行能力，让 VLM 负责高层选择，而不是直接控制每一步运动。
 
-## 〇、语义记忆架构（新链路，`NAV_SEMANTIC_BACKEND=semantic_memory`）
+## 1. 设计边界
 
+决策 VLM 负责：
+
+- 在已确认实例和可达 frontier 之间选择下一高层目标；
+- 请求补充验证或继续探索；
+- 到达目标附近后判断 `REPORT_FOUND / SCAN / REJECT`；
+- 在 `all` 模式下建议是否结束。
+
+确定性模块负责：
+
+- RGB 输入、VGGT-SLAM 建图和相对位姿；
+- 点云到占据栅格、frontier、A* 路径和路径跟随；
+- pointing 像素到 3D 点的几何恢复；
+- 实例去重、计数、belief/confirmed/visited/rejected 状态；
+- 决策 JSON、动作 ID、`REPORT_FOUND` 和 `FINISH` 的合法性约束；
+- VLM 不可用或输出非法时的保底行为。
+
+系统不允许 VLM估计坐标、路径长度或直接输出 benchmark 电机动作。
+
+## 2. 总体结构
+
+```mermaid
+flowchart TD
+    O["RGB + 自然语言任务"] --> MA["MappingAgent / NavAgent"]
+    MA --> MS["Mapping Server"]
+    MS --> VGGT["VGGT-SLAM：位姿与点云"]
+    MS --> CAP["CaptionStore：语义记忆"]
+    CAP --> RET["BGE-M3 文文检索"]
+    RET --> VQA["查询条件化 VQA 复核"]
+    VQA --> POINT["VLM pointing"]
+    POINT --> P3D["置信点云 patch → 3D 候选"]
+    P3D --> LEDGER["ObservationLedger"]
+    LEDGER --> MEM["InstanceMemory"]
+
+    VGGT --> GRID["Observed / Free / Obstacle 栅格"]
+    GRID --> FRONTIER["安全、可达 frontier"]
+    MEM --> STATE["统一 World State"]
+    LEDGER --> STATE
+    FRONTIER --> STATE
+    GRID --> MAP["标注俯视地图"]
+    MAP --> VLM["事件驱动 DecisionLoop"]
+    STATE --> VLM
+
+    VLM --> HIGH["实例 / Frontier / 验证 / 结束"]
+    HIGH --> PLAN["确定性 A* 与 PathFollower"]
+    PLAN --> ACT["离散运动动作"]
+    ACT --> O
 ```
-server 端（vggtslam, py3.11）
-  子图处理完成 -> CaptionWorker（异步最低优先级，GPU 忙让路）
-    -> Qwen2.5-VL-3B(4bit, vLLM) 生成查询无关详细 caption
-    -> BGE-M3 embedding -> CaptionStore（按 episode 落盘）
-  ground_object(短语) -> retrieve_captions 文文检索 top-K(默认10,召回优先)
-    -> PointingGrounder(Qwen2.5-VL-7B) verify_frame 逐条属性复核（滤假阳性）
-    -> point 输出目标像素（point 优先，bbox 交叉验证，多实例）
-    -> 11x11 patch 先按 VGGT confidence 过滤再取中位数 -> 3D 点
-agent 端（habitat, py3.9）
-  命中 -> ObservationLedger 分级置信度：单帧观测 -> belief 锚点
-    （frontier 打分先验）；>=2 帧不同位姿独立观测 -> confirmed 进 TSP
-  到达例程：0.8m 内 -> pointing+VQA 复核 -> 末端视觉伺服（不看坐标看
-    图像，目标近且居中才 TARGET_FOUND，超 8 步退回坐标判定）
-  决策层（NAV_DECIDER=vlm）：事件驱动 DecisionLoop，世界状态 JSON
-    （dist/path_cost 全预计算）+ 俯视标注地图 PNG -> 受约束 JSON 决策，
-    FINISH 硬条件状态机强制，非法回退确定性规则，全程 JSONL trace
-```
 
-关键设计：导航端不只用拍照位姿（保留 pointing 像素 -> 点云采深度 ->
-3D 点这一跳）；计数信几何不信文本；VLM 不记账不算几何；决策层不进
-控制回路；caption 召回优先、精度靠查询条件化复核。
+主要模块：
 
-### Flag 总表
-
-| Flag | 默认 | 含义 |
+| 模块 | 文件 | 职责 |
 |---|---|---|
-| `NAV_SEMANTIC_BACKEND` | `clip_sam` | `clip_sam`（旧）/ `semantic_memory`（新） |
-| `NAV_DECIDER` | `rules` | `rules` / `vlm`（LLM 决策层，需 API） |
-| `NAV_ORACLE_GEOMETRY` | `0` | GT 位姿消融钩（仅实验分支，打大红 warning） |
-| `NAV_VLLM_URL` / `NAV_VLLM_API_KEY` | `http://127.0.0.1:8000/v1` / `EMPTY` | vLLM OpenAI 兼容服务 |
-| `NAV_CAPTION_MODEL_PATH` | 空 | Qwen2.5-VL-3B 权重（空 = caption worker 不启动） |
-| `NAV_POINTING_MODEL_PATH` | 空 | Qwen2.5-VL-7B 权重（空 = pointing 不可用） |
-| `NAV_EMBED_MODEL_PATH` | 空 | BGE-M3 权重（空 = 检索不可用） |
-| `NAV_CAPTION_STORE_PATH` | `mapping_diag/caption_store` | caption 落盘目录 |
-| `NAV_RETRIEVE_TOP_K` | `10` | caption 检索 top-K（召回优先） |
-| `NAV_POINT_PATCH` | `11` | pointing 深度采样 patch 边长 |
-| `NAV_POINT_MIN_CONF` | `0.5` | pointing 置信准入/到达复核阈值 |
-| `NAV_CONFIRM_MIN_OBS` | `2` | 独立帧观测数升级 confirmed |
-| `NAV_MIN_TARGET_PIXELS` | `32` | 小/远目标像素边长下限（两段式兜底） |
-| `NAV_MAX_DEPTH_STD_M` | `0.5` | patch 深度方差上限（超出降级 belief） |
-| `NAV_SERVO_MAX_STEPS` / `NAV_SERVO_AREA_RATIO` / `NAV_SERVO_CENTER_TOL` | `8` / `0.04` / `0.25` | 末端视觉伺服 |
-| `NAV_DECIDER_LOG` | `mapping_debug/decision_trace.jsonl` | 决策 trace |
-| `NAV_DECIDER_MAX_TOOL_ROUNDS` | `3` | 决策层工具调用上限 |
-| `NAV_FINISH_UNEXPLORED_MAX` | `0.15` | FINISH 硬条件：未探索占比阈值 |
+| 主状态机 | `agents/nav_agent.py` | 探索、导航、到达、扫描、报告与结束 |
+| 决策状态 | `agents/decision_state.py` | 生成统一 JSON world state |
+| 实例记忆 | `agents/memory.py` | confirmed/visited/rejected、空间合并与计数 |
+| 观测账本 | `agents/evidence.py` | belief、多视角独立观测与 confirmed 升级 |
+| 空间信念 | `agents/belief.py` | Caption 检索与 belief 锚点对 frontier 的语义引导 |
+| 几何导航 | `agents/navigator.py` | 重力对齐、覆盖/占据栅格、A*、路径跟随 |
+| Frontier | `agents/skeleton.py` | frontier 提取、聚类、安全代表点和信息增益 |
+| 决策循环 | `decision/agent_loop.py` | Prompt、工具循环、schema/ID/结束校验 |
+| VLM 传输 | `decision/vlm.py` | OpenAI-compatible 请求与图像编码 |
+| 建图服务 | `mapping/server.py` | VGGT-SLAM、Caption、Pointing 与 3D 恢复 |
+| Caption 记忆 | `mapping/caption_store.py` | 异步 caption、持久化、BGE-M3 检索 |
+| Pointing | `mapping/pointing.py` | 属性复核、多实例像素定位、深度 patch 采样 |
+| VLM 网关 | `mapping/vllm_client.py` | pointing/caption 请求、缓存与优先级队列 |
 
-远端部署：权重统一 `/root/autodl-tmp/models/`（ModelScope 镜像下载），
-推理走一个 vLLM 服务（客户端优先级队列：决策 > pointing > caption，
-同帧结果缓存）；显存预算 VGGT 1B ~10GB + 3B(4bit) ~3GB + 7B(4bit)
-~8GB（24GB 单卡）；决策 LLM 走 API（key 走环境变量），不可达自动回退
-规则决策。smoke 矩阵：`scripts/run_smoke_matrix.sh`。
+## 3. 感知与语义记忆
 
-**待办（Phase 5 收尾）**：新链路四模式 smoke 不劣于旧链路后，删除
-`mapping/semantic.py`（CLIP/SAM3）与 `_ground_object_clip_sam` 旧链路。
+### 3.1 建图
 
----
+Agent 持续把 RGB 帧发送到 Mapping Server。服务端进行关键帧筛选、VGGT 子图推理和因子图优化，向 Agent 提供：
 
-> 以下为 2026-08-02 版旧架构（clip_sam 链路）记录与弱点分析。
+- 所有关键帧位姿；
+- 全局点云；
+- 带图像行号和位姿的逐帧点云；
+- 相机内参和关键帧图像。
 
+所有几何均来自 Agent 可用的 RGB 推断结果，不读取 benchmark 真值深度、GPS、Compass 或语义 ID。
 
-## 一、整体架构
+### 3.2 Semantic-memory 主链路
 
-```
-┌───────────────────────────── agent 端 (habitat env, python3.9) ─────────────────────────────┐
-│ 每步 act()                                                                                   │
-│   ├─ feed_frame(rgb) ──────────────► VGGT-SLAM server（子图/关键帧/稠密点云/位姿）           │
-│   ├─ explore 模式：随机游走 + frontier 探索（骨架拓扑 + 自由空间栅格 + A*）                    │
-│   ├─ 每 NAV_QUERY_INTERVAL 步 ground_object(目标短语)                                        │
-│   └─ nav 模式：沿 A* 路径跟随 → 到达后 360° 扫描确认 → TARGET_FOUND                          │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
-                    │  socket 协议 (mapping/protocol.py, 端口 5555)
-┌───────────────────────────── server 端 (vggtslam env, python3.11) ─────────────────────────┐
-│  feed_frame → 光流关键帧筛选 → 攒满子图 → 后台线程 VGGT 前向 + 因子图优化（含回环）          │
-│  CLIP（常驻，openai/clip-vit-base-patch32）：关键帧向量随子图处理顺带计算                    │
-│  SAM3（查询时懒加载实例化）：ground_object 时对 CLIP top-K 帧按需分割                        │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
+当前语义记忆链路为：
+
+```text
+关键帧 RGB
+→ 异步生成查询无关 caption
+→ BGE-M3 编码并按 episode 持久化
+→ 使用完整目标文本检索 top-K caption
+→ 对候选帧逐条进行属性/关系 VQA 复核
+→ VLM pointing 输出一个或多个像素与 bbox
+→ 在 VGGT 高置信点云 patch 中采样中位 3D 点
+→ 注册可随图优化重新解析的 candidate_id
 ```
 
-### 关键机制
+Caption worker 是低优先级异步任务，不应阻塞建图。Pointing 和 VQA失败时返回空结果，由 Agent 继续探索。
 
-1. **VGGT-SLAM 建图定位（一切空间信息的来源）**
-   - agent 不读仿真器 GPS/深度/姿态（RGB-only track），所有位姿、点云、栅格、导航都来自 server。
-   - 每步喂帧 → 关键帧（视差筛选）→ 每 ~16 帧一个子图 → VGGT 1B 前向 + 图优化（回环可用时）。
-   - `get_all_poses`（位姿）、`get_frame_points`/`get_map_points`（稠密点云）驱动：重力对齐、栅格 A*、骨架拓扑、frontier 探索、实例记忆坐标刷新。
+### 3.3 当前兼容分支
 
-2. **查询时实例化的语义层**
-   - **CLIP 常驻**：server 启动即加载；关键帧 CLIP 向量在子图处理时顺带算好（不是查询时才编码）。
-   - **SAM3 按需实例化**：`Sam3Grounder` 只建空实例，首次 `ground_object`/`ground_frame` 才 `build_sam3_image_model()` 加载，之后常驻。
-   - `ground_object(短语)` 流程：CLIP 检索 top-K 关键帧（默认 `NAV_GROUND_TOP_K=5`，分数平坦时多捞几帧）→ 对 top-K 帧跑 SAM3（多 prompt 变体取最高分）→ mask 投影到 VGGT 点云得 3D 目标点。
+`mapping/server.py` 仍保留 CLIP 检索与 SAM3 分割实现，并通过 `NAV_SEMANTIC_BACKEND` 分流。这是当前代码中的兼容/消融分支，不是主架构。
 
-3. **多目标状态机**
-   - instance memory（confirmed/visited/黑名单，合并半径 0.75m）+ belief（CLIP 先验空间锚点）+ 骨架挂载 + 开放路径 TSP 排序（planner.plan_multi）。
-   - 支持 any / many / all；`_should_finish` 纯规则判定（无 confirmed 未访问实例 + frontier 空 + 地图不增长 + 接近最大步数）。
+需要特别注意：
 
-4. **VLM 战略层（当前禁用）**
-   - 远端无真实 API（`NAV_VLM_ENABLED=0`），全部走 deterministic fallback：候选取最高 SAM、目标短语正则剥词、FINISH 用规则条件。
-   - VLM 的 parse_instruction / choose_candidate / verify_arrival / decide_finish 只通过了本地 mock 单测，从未端到端验证。
+- `NavAgent` 当前默认值是 `semantic_memory`；
+- `MappingServer` 当前默认值仍是 `clip_sam`；
+- 部署时必须显式设置 `NAV_SEMANTIC_BACKEND=semantic_memory`，并保证 Agent 与 Server 环境一致。
 
-### 实测成绩（NAV_VLM_ENABLED=0）
+## 4. 空间记忆与置信度
 
-| Episode | 结果 |
+### 4.1 ObservationLedger
+
+Pointing 命中先进入空间观测账本：
+
+- 单帧命中保存为 belief anchor；
+- 相近 3D 位置会合并为同一锚点；
+- 只有拍摄位姿间隔满足要求的观测才算独立观测；
+- 独立观测数达到 `NAV_CONFIRM_MIN_OBS` 后升级为 confirmed；
+- 小目标或深度方差大的目标强制留在 belief，等待靠近后复核。
+
+当前代码仍会丢弃低于 `NAV_POINT_MIN_CONF` 的 pointing 命中，而不是将其写入低置信 belief。这是尚未解决的实现缺口。
+
+### 4.2 InstanceMemory
+
+实例状态为：
+
+```text
+belief anchor → confirmed → visited
+                         ↘ rejected
+```
+
+- `confirmed`：可作为导航目标，但尚未报告；
+- `visited`：已发出 `TARGET_FOUND`；
+- `rejected`：到达复核失败，作为持久黑名单；
+- 同类别且距离小于合并阈值的实例进行空间去重；
+- candidate ID 用于图优化后重新计算实例位置。
+
+## 5. Frontier 探索
+
+占据栅格同时保存：
+
+- `free`：可通行区域；
+- `obstacle`：机器人半径膨胀后的障碍；
+- `observed`：已被 VGGT 点云覆盖的区域。
+
+未知区域定义为 `~observed`，因此已观测但未被分成 free/obstacle 的稀疏点云孔洞不会生成假 frontier。
+
+Frontier 流程：
+
+1. 找出 free 与真正 unknown 的边界；
+2. 8 连通聚类并过滤过小簇；
+3. 从簇内真实自由格选择局部净空较大的代表点；
+4. 计算周边未知面积作为 information gain；
+5. 对所有候选执行 A*，删除不可达项；
+6. 区分可达、冷却中和当前可选三种状态；
+7. 按以下 utility 排序：
+
+```text
+information_gain / (1 + path_cost_m)
+× (1 + semantic_weight × semantic_hint)
+÷ (1 + failure_count)
+```
+
+碰撞或路径丢失会累计 frontier 失败惩罚。VLM 和结束判断只能看到过滤后的有效 frontier；冷却中的可达 frontier 不会被误判为探索耗尽。
+
+## 6. 统一决策接口
+
+### 6.1 输入
+
+所有高层决策统一通过：
+
+```python
+DecisionLoop.decide(event, world_state, map_png=None, images=None)
+```
+
+`world_state` 包括：
+
+- `task`：完整 goal、模式、已报告数量、要求数量；
+- `instances`：ID、类别、状态、置信度、独立观测数、frame/candidate ID、欧氏距离、A* 路径代价；
+- `belief_anchors`：ID、类别、置信度、观测数和距离；
+- `frontiers`：ID、距离、大小、information gain、路径代价、语义提示、失败次数和 utility；
+- `recent_events`：近期状态变化；
+- `termination`：未探索比例、未解决 belief、可达 frontier 数、pending instance 数和连续无新候选次数。
+
+可选视觉输入包括标注俯视地图、到达事件的当前 RGB/历史候选证据，以及工具返回的关键帧。`world_state_updated` 默认附带俯视地图；VLM 可依据实例的 `frame_id` 调用 `look_at` 获取视觉证据。图像均带显式标签。
+
+只读工具：
+
+- `query_memory(text)`：返回 top-K caption；
+- `look_at(frame_id)`：返回指定关键帧图像。
+
+### 6.2 输出
+
+统一 JSON 协议：
+
+```json
+{
+  "action": "GOTO_INSTANCE | GOTO_FRONTIER | VERIFY | REPORT_FOUND | SCAN | REJECT | EXPLORE | FINISH",
+  "target_id": "状态表中的ID或null",
+  "reason": "简短理由",
+  "confidence": 0.0
+}
+```
+
+DecisionLoop 会校验动作、事件允许集合、实例状态和 target ID。非法输出重试一次，仍失败则返回 `None`，由确定性策略接管。
+
+### 6.3 事件
+
+| 事件 | 允许动作 | 当前接线状态 |
+|---|---|---|
+| `world_state_updated` | GOTO_INSTANCE、GOTO_FRONTIER、VERIFY、EXPLORE | 已接入实例发现和 frontier 周期刷新 |
+| `arrival` | REPORT_FOUND、SCAN、REJECT | 已接入 |
+| `scan_complete` | REPORT_FOUND、REJECT、EXPLORE | 协议已定义，尚未从扫描状态机独立触发 |
+| `finish_check` | GOTO_INSTANCE、GOTO_FRONTIER、EXPLORE、FINISH | 已接入 `all` 模式 |
+
+正常 VLM 路径不存在“实例优先”规则。实例和 frontier 同时出现在 `world_state_updated` 输入中，由 VLM全局选择。只有模型不可用或输出非法时，才确定性回退到规划器选出的实例，再回退到最高 utility frontier。
+
+## 7. 执行与到达
+
+### 7.1 导航执行
+
+`GOTO_INSTANCE` 会解析实例当前 3D 坐标，重建占据栅格并执行 A*。`GOTO_FRONTIER` 直接复用 frontier 筛选阶段已经验证的路径。PathFollower 使用最新关键帧位姿作为锚点，并在关键帧之间进行动作航位推算。
+
+碰撞恢复、路径重规划、转向和前进始终是确定性的。
+
+### 7.2 到达与报告
+
+当前到达流程：
+
+```text
+几何距离进入 NAV_REACH_M
+→ 当前帧 pointing + 属性 VQA
+→ 决策 VLM arrival 判断
+→ REPORT_FOUND / SCAN / REJECT
+→ REPORT_FOUND 前执行 bbox 视觉伺服
+→ TARGET_FOUND
+```
+
+若当前帧证据不足，Agent 进行最多 12 个 30° 转向步骤完成 360° 扫描；扫描期间逐帧重复到达判断。扫描失败后拒绝当前目标并返回探索。
+
+当前视觉伺服根据 bbox 面积和中心偏移决定转向/前进。超时或视觉服务异常时会退回几何到达判定并报告，这是当前较激进的 fallback，需要通过完整 episode 评测验证。
+
+## 8. 结束条件
+
+`many` 模式达到要求数量后由状态机直接结束。
+
+`all` 模式允许 VLM建议 `FINISH`，但 DecisionLoop 强制检查：
+
+- 未探索比例低于阈值；
+- 未解决 belief anchor 数为 0；
+- 可达 frontier 数为 0；
+- pending confirmed instance 数为 0。
+
+条件不满足时，`FINISH` 会降级为继续探索。VLM 不可用时还有更保守的步数、地图稳定性、连续无候选和 frontier 耗尽规则。
+
+## 9. 关键配置
+
+推荐部署至少显式设置：
+
+```bash
+export NAV_SEMANTIC_BACKEND=semantic_memory
+export NAV_DECIDER=vlm
+
+export NAV_VLM_ENABLED=true
+export NAV_VLM_API_URL=http://127.0.0.1:8000/v1
+export NAV_VLM_MODEL=<decision-vlm>
+
+export NAV_VLLM_URL=http://127.0.0.1:8000/v1
+export NAV_CAPTION_MODEL_PATH=<caption-model>
+export NAV_POINTING_MODEL_PATH=<pointing-model>
+export NAV_EMBED_MODEL_PATH=<bge-m3-path>
+```
+
+主要调节项：
+
+| 配置 | 含义 |
 |---|---|
-| ep0000004 (any basket) | F1=1.0，reached=[133]（起点旁 2m 即目标，天时地利） |
-| sink (all) | step 48 检出 SAM=0.828，Precision=1.0，不再误 FINISH |
-| ep0000005 (many basket, 层 B) | 多次重跑均 0 命中（见弱点 #1/#2） |
+| `NAV_QUERY_INTERVAL` | 语义查询间隔 |
+| `NAV_REACH_M` | 几何到达半径 |
+| `NAV_INSTANCE_MERGE_M` | 实例合并/去重距离 |
+| `NAV_POINT_MIN_CONF` | 当前 pointing 最低准入置信度 |
+| `NAV_CONFIRM_MIN_OBS` | confirmed 所需独立观测数 |
+| `NAV_RETRIEVE_TOP_K` | Caption 检索召回数量 |
+| `NAV_FRONTIER_COOLDOWN_STEPS` | Frontier 冷却步数 |
+| `NAV_FRONTIER_COOLDOWN_M` | Frontier 空间冷却半径 |
+| `NAV_BELIEF_WEIGHT` | 语义信念对 frontier utility 的权重 |
+| `NAV_FINISH_UNEXPLORED_MAX` | VLM FINISH 的未探索比例上限 |
+| `NAV_SERVO_MAX_STEPS` | 到达后视觉伺服上限 |
+| `NAV_DECIDER_MAX_TOOL_ROUNDS` | 单次决策最多工具轮数 |
 
-## 二、主要弱点（按影响排序）
+`NAV_ORACLE_GEOMETRY` 仅用于消融实验，不属于正常方法链路。
 
-### 1. CLIP 语义检索弱（感知层核心瓶颈）
-- 所有 `ground_object` 的 top-K 分数压在 **0.21–0.25 平坦区间**；含目标帧（basket 133）也只有 0.216–0.22；无关帧（fid 150）以 0.262 假阳性霸榜。
-- 后果：目标在视野里也常召回失败；即使召回也可能是假阳性帧 → SAM 出边缘 mask → 假阳性导航（ep5 step 93 sam=0.500）。
-- 类别敏感：sink 类能 0.898，basket 类 0.2x。
+## 10. 失败回退与日志
 
-### 2. 探索方向随机、无语义引导
-- frontier 只按 面积/(距离) × (1+CLIP 信念) 打分，无"目标可能在哪个区域"的先验。
-- 实测 agent 起点距目标仅 3.2m 却一路西行、从不去目标区（东侧），500 步覆盖失败；随机环视信息有限（已回滚）。
-- 后果：大量零命中的真相是"没走到"而非"没识别"。
+- 决策 API 不可用：回退确定性实例/frontier 选择；
+- Caption/Pointing 不可用：返回无命中并继续探索；
+- 建图或 frontier 构建失败：回退 MappingAgent 的基础探索；
+- A* 失败：不暴露该 frontier，实例路径失败时等待地图增长后重试；
+- 决策日志：`decision_trace.jsonl` 记录事件、输入摘要、输出、校验结果和工具次数；
+- Mapping 诊断目录保存语义检索记录和关键帧图像。
 
-### 3. VLM 决策层缺位
-- 属性理解缺失：`exactly two` / `gray` / `fabric` 无法区分 → many/all 退化。
-- 候选仲裁缺失：假阳性候选直接采信（无证据推理）。
-- FINISH 保守：many/all 常跑满 500 步。
+## 11. 当前已知缺口
 
-### 4. SAM3 措辞敏感 + 单一阈值
-- 同一帧 `basket`→0.648，`laundry basket`/`hamper`→NO MASK。
-- `NAV_MIN_SAM=0.5` 一刀切：假阳性恰好卡在阈值边缘，无按类别/尺度的校准。
+以下项目是当前代码事实，不应在实验报告中写成已完成：
 
-### 5. SLAM 尺度/几何误差（空间决策的地基误差）
-- Sim(3) 对齐 RMS 0.33–1.0m；"目标进视野"几何判定与目视矛盾；在线尺度标定 ~4.35 m/unit。
-- 后果：3D 目标点、0.75m 实例合并、0.8m 到达判定都压在误差边缘；`resolve_candidate` 不稳会"SAM 命中却拿不到导航点"。
+1. Server 仍保留并默认使用 `clip_sam`，与 Agent 默认值不一致；
+2. 低于 pointing 阈值的命中仍被丢弃，没有进入低置信 belief；
+3. `scan_complete` 协议存在，但扫描结束没有独立触发该事件；
+4. 到达时先检查单帧，失败后才启动 360° 扫描；
+5. 视觉伺服超时/异常会直接退回几何报告，存在误报风险；
+6. Agent 侧决策 VLM 尚未接入 Mapping Server 的统一 VLLM 优先级网关；
+7. 尚缺完整的 caption recall、pointing 精度、多模式 episode 和消融评测结果。
 
-### 6. 单点成绩的假鲁棒
-- ep0000004 的 F1=1.0 是"起点即目标 + any 模式"的偶然，同场景 many 即零命中。
+## 12. 测试
 
-## 三、下一步候选方向
+主要测试文件：
 
-1. **CLIP 检索质量**：开放词汇检测器第二通道（OWL-ViT / Grounding-DINO），或检索分数校准。
-2. **探索方向先验**：区域优先级 / 覆盖驱动的 frontier 打分，减少"没走到"。
-3. **启用 VLM**：配 API 后验证 parse/choose/verify 闭环；在此之前先做假阳性抑制（按 SAM 分数分级 + 到达后扫描拉黑）。
-4. **SAM 校准**：类别级阈值 / 多尺度验证。
+- `tests/test_caption_store.py`：CaptionStore、持久化与 worker；
+- `tests/test_pointing.py`：VQA、pointing JSON 和深度 patch；
+- `tests/test_semantic_ground.py`：semantic-memory 服务链路；
+- `tests/test_arrival.py`：观测账本、到达和视觉伺服；
+- `tests/test_skeleton.py`：骨架、observed 覆盖和 frontier；
+- `tests/test_decider.py`：统一决策、工具、结束门控和 world state；
+- `tests/test_navigator.py`：栅格、A*、路径跟随和实例回退；
+- `tests/test_vlm_decision.py`：OpenAI-compatible 传输。
+
+完整验收仍需在具有 `benchmark_api`、VGGT-SLAM 依赖和实际模型服务的运行环境中完成。

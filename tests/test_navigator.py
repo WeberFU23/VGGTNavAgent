@@ -16,7 +16,7 @@ from agents import navigator as nav
 from agents.memory import InstanceMemory
 from agents.nav_agent import NavAgent
 from benchmark_api import Action
-from decision import DecisionLoop, VLMDecisionClient
+from decision import VLMDecisionClient
 
 
 def _rot(axis, deg):
@@ -164,7 +164,7 @@ def test_instruction_only_target_phrase():
     assert agent._target_phrase(obs) == "television near the sofa"
 
 
-def test_unified_candidate_decision_integration():
+def test_deterministic_candidate_fallback():
     class _Client:
         @staticmethod
         def get_candidate_evidence(candidate_id):
@@ -180,7 +180,6 @@ def test_unified_candidate_decision_integration():
             return 1.0
 
     agent = NavAgent()
-    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current")
     agent.client = _Client()
     agent.calibrator = _Calibrator()
     agent.target_text = "tv"
@@ -191,20 +190,13 @@ def test_unified_candidate_decision_integration():
     n2, _ = agent.memory.add_or_merge(
         "tv", [2, 0, 0], 0.9, 0.5, candidate_id="c2", frame_id=2)
     agent._ordered_memory_nodes = lambda: [n1, n2]
-    agent._build_decider_input = lambda obs: ({
-        "instances": [{"id": n1.iid, "status": "confirmed"},
-                      {"id": n2.iid, "status": "confirmed"}],
-        "frontiers": [], "task": {}, "termination": {}}, None)
-    agent.decision_loop = DecisionLoop(lambda prompt, images: {
-        "action": "GOTO_INSTANCE", "target_id": str(n2.iid),
-        "confidence": 0.9})
     agent._plan_to_target = lambda obs: False
     obs = SimpleNamespace(
         goal_text="Find the TV.", rgb=np.zeros((16, 16, 3), dtype=np.uint8),
         step_count=40, max_steps=100)
     assert agent._activate_memory_target(obs)
-    assert agent.target_candidate_id == "c2"
-    assert agent._selected_evidence == b"jpeg-c2"
+    assert agent.target_candidate_id == "c1"
+    assert agent._selected_evidence is None
 
 
 def test_runtime_memory_route_uses_persistent_instances():
@@ -416,7 +408,7 @@ if __name__ == "__main__":
     test_dead_reckon_undo()
     test_multi_target_finish_policy()
     test_instruction_only_target_phrase()
-    test_unified_candidate_decision_integration()
+    test_deterministic_candidate_fallback()
     test_runtime_memory_route_uses_persistent_instances()
     test_grid_and_astar()
     test_path_follower()

@@ -160,10 +160,26 @@ class MappingClient:
         return resp.get("intrinsics", [])
 
     def query_text(self, text, top_k=5):
-        """CLIP 检索 top-K 关键帧。返回 [{frame_id, score, pose, ...}]。"""
+        """检索 top-K 关键帧。返回 [{frame_id, score, pose, ...}]。
+        clip_sam 后端为 CLIP 图文检索；semantic_memory 后端为 caption
+        文文检索（server 内部分流，客户端无感）。"""
         resp, _ = self._request({"cmd": "query_text", "text": text,
                                  "top_k": top_k})
         return resp.get("results", [])
+
+    def retrieve_captions(self, text, top_k=10):
+        """caption 语义记忆检索。返回 [{frame_id, caption, score, pose}]。
+        仅 semantic_memory 后端可用（旧后端返回空列表）。"""
+        resp, _ = self._request({"cmd": "retrieve_captions", "text": text,
+                                 "top_k": top_k})
+        return resp.get("results", [])
+
+    def get_frame_image(self, frame_id):
+        """返回指定关键帧的 JPEG（决策层 look_at 工具）。
+        返回 (meta, payload)；失败时 meta["found"]=False。"""
+        resp, payload = self._request(
+            {"cmd": "get_frame_image", "frame_id": int(frame_id)})
+        return resp, payload
 
     def ground_object(self, text, top_k=3):
         """SAM3 实例定位。返回 [{found, point, sam_score, frame_id, ...}]。"""

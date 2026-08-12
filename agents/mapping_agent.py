@@ -42,6 +42,17 @@ class MappingAgent:
         self._server_busy = False
         self.calibrator = ScaleCalibrator(
             window=int(os.environ.get("MAPPING_SCALE_WINDOW", "20")))
+        # NAV_ORACLE_GEOMETRY=1：离线消融钩——用 GT 位移（米）替换
+        # "前进=0.25m" 假设做尺度标定。仅限实验分支的消融，严禁进入
+        # RGB-only 主评测路径。
+        self.oracle_geometry = os.environ.get(
+            "NAV_ORACLE_GEOMETRY", "0") == "1"
+        self._oracle_gt = []         # 每步的 GT 位置（米），无 gps 时为 None
+        if self.oracle_geometry:
+            print("=" * 70)
+            print("[MappingAgent] !!! NAV_ORACLE_GEOMETRY=1 —— 正在使用仿真器 "
+                  "GT 位姿做尺度标定（oracle 消融），结果不可用于主评测 !!!")
+            print("=" * 70)
         atexit.register(self._finalize)
 
     def reset(self):
@@ -53,6 +64,7 @@ class MappingAgent:
         self.stuck_steps = 0
         self._server_busy = False
         self.calibrator.reset()
+        self._oracle_gt = []
 
     def act(self, observation):
         self._feed_frame(observation)
@@ -158,12 +170,56 @@ class MappingAgent:
     def _record_and_update(self, observation, action):
         """记录动作 + 定期更新在线尺度估计（滑动窗口，带 pacing 时位姿基本最新）。"""
         self.calibrator.record_action(action)
+        if self.oracle_geometry:
+            gps = getattr(observation, "gps", None)
+            self._oracle_gt.append(
+                None if gps is None else np.asarray(gps, dtype=np.float64))
         if observation.step_count % 10 == 0 and observation.step_count > 0:
             poses, frame_ids = self.client.get_all_poses()
-            scale = self.calibrator.update(poses, frame_ids)
-            if scale is not None:
-                print(f"[MappingAgent] step={observation.step_count} "
-                      f"在线尺度估计={scale:.4f} m/unit")
+            if self.oracle_geometry:
+                scale = self._oracle_scale_update(poses, frame_ids)
+                if scale is not None:
+                    print(f"[MappingAgent] step={observation.step_count} "
+                          f"ORACLE 尺度={scale:.4f} m/unit（消融专用）")
+            else:
+                scale = self.calibrator.update(poses, frame_ids)
+                if scale is not None:
+                    print(f"[MappingAgent] step={observation.step_count} "
+                          f"在线尺度估计={scale:.4f} m/unit")
+
+    def _oracle_scale_update(self, poses, frame_ids):
+        """oracle 消融尺度：分子用 GT 位移（米）替换动作步长假设。
+
+        结构与 ScaleCalibrator.update 相同（相邻关键帧 SLAM 位移做
+        分母、滑动窗口中位数），但位移真值来自 observation.gps 轨迹，
+        不受撞墙/打滑影响。只写入 calibrator.scale_history，下游
+        current_scale() 消费方式不变。
+        """
+        if poses is None or len(poses) < 2:
+            return self.calibrator.current_scale()
+        order = np.argsort(frame_ids)
+        frame_ids = np.asarray(frame_ids)[order]
+        positions = np.asarray(poses)[order][:, 0:3, 3]
+        ratios = []
+        for i in range(1, len(positions)):
+            f_a, f_b = int(frame_ids[i - 1]), int(frame_ids[i])
+            lo, hi = f_a - 1, f_b - 1
+            if lo < 0 or hi > len(self._oracle_gt) or hi <= lo:
+                continue
+            seg = self._oracle_gt[lo:hi]
+            if not seg or any(g is None for g in seg):
+                continue
+            gt_dist = float(np.linalg.norm(seg[-1] - seg[0]))
+            slam_dist = float(np.linalg.norm(positions[i] - positions[i - 1]))
+            if gt_dist < 1e-4 or slam_dist < 1e-6:
+                continue
+            ratios.append(gt_dist / slam_dist)
+        if len(ratios) < self.calibrator.min_samples:
+            return self.calibrator.current_scale()
+        med = float(np.median(np.asarray(ratios[-self.calibrator.window:])))
+        self.calibrator.scale_history.append((len(self.calibrator.actions),
+                                              med))
+        return med
 
     # ------------------------------------------------------------------
     def _finalize(self):

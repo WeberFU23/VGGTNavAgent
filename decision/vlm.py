@@ -87,6 +87,16 @@ class VLMDecisionClient:
             images)
         return self._strategic(data, {"finish", "explore"})
 
+    def agentic_chat(self, user_prompt, images=None):
+        """决策层 agentic 循环低层接口：自由 prompt + 原始 JPEG 字节图像
+        列表，返回解析后的 JSON dict；API 不可达自动回退 None（调用方
+        走确定性规则），并打 warning。复用同一 HTTP/JSON 解析通路。"""
+        parts = []
+        for i, raw in enumerate(images or []):
+            if raw:
+                parts.append((f"attached_image_{i}", raw, "image/jpeg"))
+        return self._request(str(user_prompt), parts)
+
     @staticmethod
     def _target_dict(target_spec):
         return {

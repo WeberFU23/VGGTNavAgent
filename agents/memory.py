@@ -14,7 +14,7 @@ import numpy as np
 
 class InstanceNode:
     __slots__ = ("iid", "category", "point", "score", "status",
-                 "frame_id", "step", "candidate_id", "attach_node")
+                 "frame_id", "step", "candidate_id", "attach_node", "n_obs")
 
     def __init__(self, iid, category, point, score, status,
                  frame_id=None, step=0, candidate_id=None):
@@ -27,6 +27,7 @@ class InstanceNode:
         self.step = int(step)
         self.candidate_id = candidate_id
         self.attach_node = None           # 骨架节点 id（attach_to_skeleton）
+        self.n_obs = 1                    # 独立观测帧数（分级置信度）
 
     def __repr__(self):
         return (f"InstanceNode(#{self.iid} {self.category} "

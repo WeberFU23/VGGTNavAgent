@@ -99,19 +99,37 @@ class MappingServer:
         self.model = model.to(torch.bfloat16).to("cuda")
         print("[server] 模型加载完成")
 
-        # 语义层：CLIP 关键帧记忆（随子图处理顺带算向量）+
-        # SAM3 实例定位（查询时懒加载，不常驻显存）
-        self.clip = None
-        if not args.no_semantic:
-            from mapping.semantic import HFClipAdapter, Sam3Grounder
-            print("[server] 加载 CLIP (openai/clip-vit-base-patch32)...")
-            self.clip = HFClipAdapter()
-            self.grounder = Sam3Grounder()
-            print("[server] CLIP 加载完成")
-
         self.solver_lock = threading.Lock()  # 保证同时只有一个子图在处理
         self.data_lock = threading.Lock()    # 保护 solver 内部状态
-        self.gpu_lock = threading.Lock()     # VGGT/CLIP/SAM3 不并发抢显存
+        self.gpu_lock = threading.Lock()     # VGGT/语义模型不并发抢显存
+
+        # 语义层后端：clip_sam（旧链路：CLIP 常驻检索 + SAM3 懒加载分割）
+        # 或 semantic_memory（caption 语义记忆 + VLM pointing，见
+        # mapping/caption_store.py 与 mapping/pointing.py）。
+        self.semantic_backend = os.environ.get(
+            "NAV_SEMANTIC_BACKEND", "clip_sam")
+        self.retrieve_top_k = int(os.environ.get("NAV_RETRIEVE_TOP_K", "10"))
+        self.point_patch = int(os.environ.get("NAV_POINT_PATCH", "11"))
+        self.clip = None
+        self.grounder = None
+        self.vllm = None
+        self.embedder = None
+        self.caption_store = None
+        self.caption_worker = None
+        self.pointer = None
+        if not args.no_semantic:
+            if self.semantic_backend == "semantic_memory":
+                self._init_semantic_memory()
+            else:
+                if self.semantic_backend != "clip_sam":
+                    print(f"[server] WARNING: 未知 NAV_SEMANTIC_BACKEND="
+                          f"{self.semantic_backend}，回退 clip_sam", flush=True)
+                    self.semantic_backend = "clip_sam"
+                from mapping.semantic import HFClipAdapter, Sam3Grounder
+                print("[server] 加载 CLIP (openai/clip-vit-base-patch32)...")
+                self.clip = HFClipAdapter()
+                self.grounder = Sam3Grounder()
+                print("[server] CLIP 加载完成")
 
         self.keyframe_paths = []
         self.target_size = args.submap_size + args.overlapping_window_size
@@ -131,6 +149,59 @@ class MappingServer:
         self._diag_fp = None
         self._diag_frame_dir = None
         os.makedirs(self.diag_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 语义记忆后端（NAV_SEMANTIC_BACKEND=semantic_memory）
+    # ------------------------------------------------------------------
+    def _semantic_enabled(self):
+        if self.semantic_backend == "semantic_memory":
+            return self.embedder is not None
+        return self.clip is not None
+
+    def _init_semantic_memory(self):
+        """caption 语义记忆 + VLM pointing 链路。
+
+        模型路径全部走环境变量（远端 /root/autodl-tmp/models/ 下，经
+        ModelScope/HF 镜像下载）；任一组件缺失只降级对应能力并打
+        warning，不让 server 崩溃。
+        """
+        from mapping.caption_store import (BGEM3Embedder, CaptionStore,
+                                           CaptionWorker)
+        from mapping.pointing import PointingGrounder
+        from mapping.vllm_client import VLLMGateway
+
+        self.vllm = VLLMGateway(
+            url=os.environ.get("NAV_VLLM_URL", "http://127.0.0.1:8000/v1"),
+            api_key=os.environ.get("NAV_VLLM_API_KEY", "EMPTY"))
+        store_path = os.environ.get(
+            "NAV_CAPTION_STORE_PATH",
+            os.path.join(self.args.diag_dir, "caption_store"))
+        self.caption_store = CaptionStore(persist_dir=store_path)
+        try:
+            self.embedder = BGEM3Embedder(
+                os.environ.get("NAV_EMBED_MODEL_PATH", ""))
+        except RuntimeError as exc:
+            print(f"[server] WARNING: {exc}；caption 检索不可用", flush=True)
+            self.embedder = None
+        caption_model = os.environ.get("NAV_CAPTION_MODEL_PATH", "")
+        if self.embedder is not None and caption_model:
+            self.caption_worker = CaptionWorker(
+                self.vllm, self.embedder, self.caption_store,
+                model=caption_model,
+                busy_fn=lambda: self.gpu_lock.locked()
+                or self.solver_lock.locked())
+            print("[server] caption worker 已启动 "
+                  f"(model={caption_model})", flush=True)
+        else:
+            print("[server] WARNING: caption worker 未启动（缺 embedder 或 "
+                  "NAV_CAPTION_MODEL_PATH）", flush=True)
+        try:
+            self.pointer = PointingGrounder(
+                self.vllm, model=os.environ.get("NAV_POINTING_MODEL_PATH", ""))
+            print("[server] pointing grounder 就绪", flush=True)
+        except RuntimeError as exc:
+            print(f"[server] WARNING: {exc}；pointing 不可用", flush=True)
+            self.pointer = None
 
     # ------------------------------------------------------------------
     # 帧输入与子图处理
@@ -206,6 +277,7 @@ class MappingServer:
             with self.data_lock:
                 self.solver.add_points(predictions)
                 self.solver.graph.optimize()
+            self._enqueue_captions()
             del predictions
             torch.cuda.empty_cache()
             print(f"[server] 子图完成, 耗时 {time.time() - t_start:.1f}s, 显存占用 "
@@ -219,6 +291,37 @@ class MappingServer:
             lock_state = "锁已释放" if release_solver_lock else "同步处理完成"
             print(f"[server] {time.strftime('%H:%M:%S')} 子图线程退出, "
                   f"{lock_state}", flush=True)
+
+    def _enqueue_captions(self):
+        """子图处理挂点：为新子图关键帧排队生成 caption（异步、最低优先级）。
+
+        重叠窗口帧已在上一子图入队过，CaptionWorker/Store 按 frame_id
+        去重，不会重复生成。
+        """
+        if self.caption_worker is None:
+            return
+        try:
+            from torchvision.transforms.functional import to_pil_image
+            with self.data_lock:
+                submap = self.solver.map.get_latest_submap()
+                if submap is None:
+                    return
+                frame_ids = submap.get_frame_ids()
+                try:
+                    poses = submap.get_all_poses_world(self.solver.graph)
+                except Exception:
+                    poses = None
+                items = []
+                for idx in range(len(frame_ids)):
+                    pose = (poses[idx] if poses is not None
+                            and idx < len(poses) else None)
+                    items.append((int(frame_ids[idx]),
+                                  to_pil_image(submap.get_frame_at_index(idx)),
+                                  pose))
+            for fid, pil, pose in items:
+                self.caption_worker.enqueue(fid, pil, pose)
+        except Exception as exc:
+            print(f"[server] caption 入队失败（不影响建图）: {exc}", flush=True)
 
     def flush_map(self):
         """同步提交 episode 尾部不足一个完整子图的关键帧。"""
@@ -249,6 +352,11 @@ class MappingServer:
                 self.num_submaps_launched = 0
                 self._candidate_seq = 0
                 self._ground_candidates = {}
+        if self.caption_worker is not None:
+            self.caption_worker.clear()
+        if self.caption_store is not None:
+            self.caption_store.save()
+            self.caption_store.clear()
         if os.path.isdir(self.args.keyframe_dir):
             shutil.rmtree(self.args.keyframe_dir)
         os.makedirs(self.args.keyframe_dir, exist_ok=True)
@@ -376,6 +484,10 @@ class MappingServer:
         episode_id = str(episode_id or "unknown").strip()
         if episode_id == self._current_episode:
             return
+        if self.caption_worker is not None:
+            self.caption_worker.clear()
+        if self.caption_store is not None:
+            self.caption_store.set_episode(episode_id)
         with self.diag_lock:
             if self._diag_fp is not None:
                 try:
@@ -456,8 +568,49 @@ class MappingServer:
         cands = sorted(best_by_frame.values(), key=lambda c: -c[0])
         return cands[:top_k]
 
+    def retrieve_captions(self, text, top_k):
+        """文文检索：goal_text -> top-K 关键帧 caption（semantic_memory 后端）。
+
+        返回 [{frame_id, caption, score, pose}]；位姿按当前图优化结果
+        实时刷新（存储位姿是入库时刻的，回环后可能过时）。
+        """
+        if self.semantic_backend != "semantic_memory" or \
+                self.embedder is None or self.caption_store is None:
+            return {"results": [], "error": "semantic memory disabled"}
+        with self.gpu_lock:
+            query_emb = self.embedder.encode([text])[0]
+        results = self.caption_store.retrieve(query_emb, k=top_k)
+        with self.data_lock:
+            frame_ids, poses = self._collect_poses()
+        pose_by_fid = {}
+        if poses is not None:
+            for fid, pose in zip(frame_ids, poses):
+                pose_by_fid[int(fid)] = np.asarray(pose).tolist()
+        for r in results:
+            r["pose"] = pose_by_fid.get(int(r["frame_id"]), r.get("pose"))
+        self._diag_write({
+            "cmd": "retrieve_captions", "text": text, "top_k": top_k,
+            "topk": [{"frame_id": r["frame_id"],
+                      "score": round(r["score"], 4),
+                      "caption": r["caption"][:120]} for r in results],
+        })
+        return {"results": results}
+
+    def _locate_frame(self, frame_id):
+        """frame_id -> (submap_id, frame_index)；找不到返回 None。"""
+        with self.data_lock:
+            for submap in self.solver.map.ordered_submaps_by_key():
+                if submap.get_lc_status():
+                    continue
+                for idx, fid in enumerate(submap.get_frame_ids()):
+                    if int(fid) == int(frame_id):
+                        return submap.get_id(), idx
+        return None
+
     def query_text(self, text, top_k):
         """文本 -> top-K 关键帧 (frame_id, score, 位姿)。"""
+        if self.semantic_backend == "semantic_memory":
+            return self.retrieve_captions(text, top_k)
         if self.clip is None:
             return {"results": [], "error": "semantic disabled"}
         topk = self._semantic_topk(text, top_k)
@@ -482,6 +635,157 @@ class MappingServer:
         return {"results": results}
 
     def ground_object(self, text, top_k):
+        """文本 -> 3D 目标点。按 NAV_SEMANTIC_BACKEND 分流：
+        semantic_memory 走 caption 检索 + VLM pointing（无 SAM3），
+        clip_sam 走 CLIP + SAM3 旧链路。"""
+        if self.semantic_backend == "semantic_memory":
+            return self._ground_object_semantic(text, top_k)
+        return self._ground_object_clip_sam(text, top_k)
+
+    def _ground_object_semantic(self, text, top_k):
+        """caption 检索 -> 查询条件化复核 -> pointing -> patch 深度采样。
+
+        召回优先：检索 K 取 max(top_k, NAV_RETRIEVE_TOP_K)；精度靠
+        verify_frame 逐条属性复核保证（caption 查询无关会漏细粒度属性）。
+        输出与旧链路同构：found/point/frame_id/candidate_id/...，
+        下游实例记忆零改动。
+        """
+        if self.pointer is None or self.embedder is None:
+            return {"results": [], "error": "semantic memory disabled"}
+        from torchvision.transforms.functional import to_pil_image
+
+        top_k = max(int(top_k), self.retrieve_top_k)
+        results = []
+        diag_frames = []
+        for item in self.retrieve_captions(text, top_k)["results"]:
+            fid = int(item["frame_id"])
+            located = self._locate_frame(fid)
+            if located is None:
+                continue
+            sid, idx = located
+            with self.data_lock:
+                submap = self.solver.map.get_submap(sid)
+                frame = submap.get_frame_at_index(idx)
+            pil = to_pil_image(frame)
+            dump_name = self._diag_dump_frame(frame, fid, "topk")
+            ver = self.pointer.verify_frame(pil, text,
+                                            frame_key=f"frame_{fid}")
+            entry = {"frame_id": fid, "score": item["score"],
+                     "caption": item["caption"], "pose": item["pose"],
+                     "verify": ver}
+            frame_diag = {"frame_id": fid, "retrieve_score": item["score"],
+                          "verify_match": ver["match"],
+                          "verify_conf": ver["confidence"],
+                          "dump": dump_name, "points": []}
+            if not ver["match"]:
+                entry["found"] = False
+                results.append(entry)
+                diag_frames.append(frame_diag)
+                continue
+            pts = self.pointer.point(pil, text, frame_key=f"frame_{fid}")
+            if not pts:
+                entry["found"] = False
+                results.append(entry)
+                diag_frames.append(frame_diag)
+                continue
+            for pt in pts:
+                resolved = self._resolve_point(sid, idx, fid, pt)
+                instance = dict(entry)
+                instance.update(resolved)
+                results.append(instance)
+                frame_diag["points"].append({
+                    "pixel": list(pt["pixel"]),
+                    "point_score": pt["confidence"],
+                    "found": resolved.get("found", False),
+                    "depth_std": resolved.get("depth_std"),
+                })
+            diag_frames.append(frame_diag)
+        self._diag_write({
+            "cmd": "ground_object", "backend": "semantic_memory",
+            "text": text, "top_k": top_k, "frames": diag_frames,
+        })
+        return {"results": results}
+
+    def _resolve_point(self, sid, idx, frame_id, point_info, register=True):
+        """pointing 像素 -> patch 深度采样 -> 当前图优化坐标系 3D 点。
+
+        保留"图像定位 -> 点云采深度 -> 3D 点"这一跳：VLM 可能隔几米
+        认出目标，导航端不能只用拍照位姿。
+        """
+        from mapping.pointing import sample_point_depth
+
+        pixel = point_info["pixel"]
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            pts_local = np.asarray(submap.pointclouds[idx], dtype=np.float64)
+            conf = np.asarray(submap.conf_masks[idx]) \
+                > submap.get_conf_threshold()
+            hom = self.solver.graph.get_homography(idx + submap.get_id())
+        h, w = pts_local.shape[:2]
+        flat = np.hstack([pts_local.reshape(-1, 3),
+                          np.ones((h * w, 1))])
+        world = (hom @ flat.T).T
+        pts_world = (world[:, :3] / world[:, 3:]).reshape(h, w, 3)
+        cam_origin = (hom @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
+        sampled = sample_point_depth(
+            pts_world, conf, pixel, patch=self.point_patch,
+            cam_origin=cam_origin)
+        if not sampled["found"]:
+            return {"found": False, "pixel": [float(pixel[0]), float(pixel[1])],
+                    "point_score": float(point_info["confidence"]),
+                    "num_points": int(sampled["num_points"])}
+        out = {
+            "found": True,
+            "point": [float(v) for v in sampled["point"]],
+            "num_points": int(sampled["num_points"]),
+            "depth_std": sampled["depth_std"],
+            "spread": sampled["spread"],
+            "pixel": [float(pixel[0]), float(pixel[1])],
+            "point_score": float(point_info["confidence"]),
+        }
+        if register:
+            out.update(self._register_point_candidate(
+                sid, idx, frame_id, pixel, point_info.get("bbox"),
+                point_info["confidence"]))
+        return out
+
+    def _register_point_candidate(self, sid, idx, frame_id, pixel, bbox,
+                                  score):
+        """point 候选注册：存像素 + patch，供 resolve_candidate 在最新
+        图优化坐标系下重采样；同时合成小圆盘 mask 供 evidence 复用。"""
+        self._candidate_seq += 1
+        candidate_id = f"c{self._candidate_seq}"
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            h, w = submap.pointclouds[idx].shape[:2]
+        if bbox is not None:
+            x0, y0, x1, y1 = [float(v) for v in bbox]
+        else:
+            r = max(self.point_patch, 8)
+            x0, y0 = pixel[0] - r, pixel[1] - r
+            x1, y1 = pixel[0] + r, pixel[1] + r
+        yy, xx = np.mgrid[0:h, 0:w]
+        disk = (xx - pixel[0]) ** 2 + (yy - pixel[1]) ** 2 \
+            <= (max(self.point_patch, 8) / 2.0) ** 2
+        self._ground_candidates[candidate_id] = {
+            "kind": "point",
+            "submap_id": sid,
+            "frame_index": int(idx),
+            "frame_id": int(frame_id),
+            "pixel": (float(pixel[0]), float(pixel[1])),
+            "mask": disk,
+            "bbox": np.asarray([x0, y0, x1, y1], dtype=np.float32),
+            "sam_score": float(score),
+            "prompt": None,
+        }
+        while len(self._ground_candidates) > 128:
+            self._ground_candidates.pop(next(iter(self._ground_candidates)))
+        return {"candidate_id": candidate_id,
+                "sam_score": float(score),   # 兼容旧字段名：= pointing 置信
+                "bbox": [x0, y0, x1, y1],
+                "matched_prompt": None}
+
+    def _ground_object_clip_sam(self, text, top_k):
         """文本 -> top-K 关键帧 SAM3 分割 -> 3D 目标点（查询时按需调用）。"""
         if self.clip is None:
             return {"results": [], "error": "semantic disabled"}
@@ -556,10 +860,23 @@ class MappingServer:
         }
 
     def resolve_candidate(self, candidate_id):
-        """在当前图优化结果下重投影缓存的像素 mask。"""
+        """在当前图优化结果下重投影缓存的像素 mask / point。"""
         cand = self._ground_candidates.get(str(candidate_id))
         if cand is None:
             return {"found": False, "error": "unknown candidate"}
+        if cand.get("kind") == "point":
+            # pointing 候选：像素 patch 重新采样深度（坐标随图优化刷新），
+            # 不重复注册候选。
+            resolved = self._resolve_point(
+                cand["submap_id"], cand["frame_index"], cand["frame_id"],
+                {"pixel": cand["pixel"], "confidence": cand["sam_score"],
+                 "bbox": None}, register=False)
+            if not resolved.get("found"):
+                return {"found": False,
+                        "num_points": resolved.get("num_points", 0)}
+            return {"found": True, "point": resolved["point"],
+                    "num_points": resolved["num_points"],
+                    "depth_std": resolved.get("depth_std")}
         with self.data_lock:
             submap = self.solver.map.get_submap(cand["submap_id"])
             mask = cand["mask"].copy()
@@ -642,10 +959,15 @@ class MappingServer:
         return np.concatenate([context, separator, crop], axis=1)
 
     def ground_frame(self, rgb, text):
-        """对单张实时 RGB 做 SAM3 分割（到达前的视觉确认，不查记忆）。
+        """对单张实时 RGB 做目标确认（到达前的视觉确认，不查记忆）。
 
-        返回 {found, score, bbox, mask_ratio}。grounder 只在 serve 主循环
-        中使用，无需加锁。"""
+        clip_sam 后端：SAM3 分割，返回 {found, score, bbox, mask_ratio}。
+        semantic_memory 后端：verify_frame 属性复核 + pointing，返回
+        {found, score, points, bbox, target_pixels, verify}（旧字段保留
+        兼容，新增字段供分级置信度与小/远目标判定）。
+        grounder 只在 serve 主循环中使用，无需加锁。"""
+        if self.semantic_backend == "semantic_memory":
+            return self._ground_frame_semantic(rgb, text)
         if self.clip is None:
             return {"found": False, "error": "semantic disabled"}
         from PIL import Image
@@ -662,6 +984,48 @@ class MappingServer:
             "bbox": np.asarray(boxes[best]).tolist(),
             "mask_ratio": float(masks[best].sum() / (h * w)),
         }
+
+    def _ground_frame_semantic(self, rgb, text):
+        """当前帧 pointing + 逐条属性 VQA 复核（替代 SAM3 确认帧）。"""
+        if self.pointer is None:
+            return {"found": False, "error": "semantic memory disabled"}
+        from PIL import Image
+        pil = Image.fromarray(np.asarray(rgb[..., :3], dtype=np.uint8))
+        ver = self.pointer.verify_frame(pil, text)
+        pts = self.pointer.point(pil, text) if ver["match"] else []
+        best = max(pts, key=lambda p: p["confidence"]) if pts else None
+        target_pixels = None
+        if best is not None and best.get("bbox") is not None:
+            x0, y0, x1, y1 = best["bbox"]
+            target_pixels = float(max(x1 - x0, y1 - y0))
+        return {
+            "found": bool(ver["match"] and best is not None),
+            "score": float(best["confidence"]) if best else 0.0,
+            "verify": ver,
+            "points": [{"pixel": [float(p["pixel"][0]), float(p["pixel"][1])],
+                        "confidence": float(p["confidence"]),
+                        "bbox": p.get("bbox")} for p in pts],
+            "bbox": best.get("bbox") if best else None,
+            "target_pixels": target_pixels,
+        }
+
+    def get_frame_image(self, frame_id):
+        """返回指定关键帧的 JPEG（决策层 look_at 工具用）。"""
+        located = self._locate_frame(int(frame_id))
+        if located is None:
+            return {"found": False, "error": "unknown frame"}, b""
+        sid, idx = located
+        from torchvision.transforms.functional import to_pil_image
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            rgb = np.asarray(to_pil_image(submap.get_frame_at_index(idx)))
+        ok, encoded = cv2.imencode(
+            ".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return {"found": False, "error": "jpeg encode failed"}, b""
+        return {"found": True, "mime_type": "image/jpeg",
+                "frame_id": int(frame_id)}, encoded.tobytes()
 
     # ------------------------------------------------------------------
     # socket 主循环
@@ -696,6 +1060,12 @@ class MappingServer:
         if cmd == "query_text":
             return {"ok": True, **self.query_text(
                 header["text"], int(header.get("top_k", 5)))}, b""
+        if cmd == "retrieve_captions":
+            return {"ok": True, **self.retrieve_captions(
+                header["text"], int(header.get("top_k", 10)))}, b""
+        if cmd == "get_frame_image":
+            resp, image = self.get_frame_image(header["frame_id"])
+            return {"ok": True, **resp}, image
         if cmd == "ground_object":
             return {"ok": True, **self.ground_object(
                 header["text"], int(header.get("top_k", 3)))}, b""

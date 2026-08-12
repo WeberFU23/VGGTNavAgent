@@ -1,6 +1,70 @@
 # VGGT-Nav Agent 架构与弱点总结
 
-> 更新于 2026-08-02。基于 AutoDL 远端实测（TEEsavR23oF 场景，RGB-only 多目标导航）。
+> 更新于 2026-08-12。新增语义记忆架构（Phase 1–5 代码完成，待 AutoDL 远端
+> smoke 实测；旧 CLIP+SAM3 链路保留在 `NAV_SEMANTIC_BACKEND=clip_sam`（默认）
+> 后面，可一键回退）。
+
+## 〇、语义记忆架构（新链路，`NAV_SEMANTIC_BACKEND=semantic_memory`）
+
+```
+server 端（vggtslam, py3.11）
+  子图处理完成 -> CaptionWorker（异步最低优先级，GPU 忙让路）
+    -> Qwen2.5-VL-3B(4bit, vLLM) 生成查询无关详细 caption
+    -> BGE-M3 embedding -> CaptionStore（按 episode 落盘）
+  ground_object(短语) -> retrieve_captions 文文检索 top-K(默认10,召回优先)
+    -> PointingGrounder(Qwen2.5-VL-7B) verify_frame 逐条属性复核（滤假阳性）
+    -> point 输出目标像素（point 优先，bbox 交叉验证，多实例）
+    -> 11x11 patch 先按 VGGT confidence 过滤再取中位数 -> 3D 点
+agent 端（habitat, py3.9）
+  命中 -> ObservationLedger 分级置信度：单帧观测 -> belief 锚点
+    （frontier 打分先验）；>=2 帧不同位姿独立观测 -> confirmed 进 TSP
+  到达例程：0.8m 内 -> pointing+VQA 复核 -> 末端视觉伺服（不看坐标看
+    图像，目标近且居中才 TARGET_FOUND，超 8 步退回坐标判定）
+  决策层（NAV_DECIDER=vlm）：事件驱动 DecisionLoop，世界状态 JSON
+    （dist/path_cost 全预计算）+ 俯视标注地图 PNG -> 受约束 JSON 决策，
+    FINISH 硬条件状态机强制，非法回退确定性规则，全程 JSONL trace
+```
+
+关键设计：导航端不只用拍照位姿（保留 pointing 像素 -> 点云采深度 ->
+3D 点这一跳）；计数信几何不信文本；VLM 不记账不算几何；决策层不进
+控制回路；caption 召回优先、精度靠查询条件化复核。
+
+### Flag 总表
+
+| Flag | 默认 | 含义 |
+|---|---|---|
+| `NAV_SEMANTIC_BACKEND` | `clip_sam` | `clip_sam`（旧）/ `semantic_memory`（新） |
+| `NAV_DECIDER` | `rules` | `rules` / `vlm`（LLM 决策层，需 API） |
+| `NAV_ORACLE_GEOMETRY` | `0` | GT 位姿消融钩（仅实验分支，打大红 warning） |
+| `NAV_VLLM_URL` / `NAV_VLLM_API_KEY` | `http://127.0.0.1:8000/v1` / `EMPTY` | vLLM OpenAI 兼容服务 |
+| `NAV_CAPTION_MODEL_PATH` | 空 | Qwen2.5-VL-3B 权重（空 = caption worker 不启动） |
+| `NAV_POINTING_MODEL_PATH` | 空 | Qwen2.5-VL-7B 权重（空 = pointing 不可用） |
+| `NAV_EMBED_MODEL_PATH` | 空 | BGE-M3 权重（空 = 检索不可用） |
+| `NAV_CAPTION_STORE_PATH` | `mapping_diag/caption_store` | caption 落盘目录 |
+| `NAV_RETRIEVE_TOP_K` | `10` | caption 检索 top-K（召回优先） |
+| `NAV_POINT_PATCH` | `11` | pointing 深度采样 patch 边长 |
+| `NAV_POINT_MIN_CONF` | `0.5` | pointing 置信准入/到达复核阈值 |
+| `NAV_CONFIRM_MIN_OBS` | `2` | 独立帧观测数升级 confirmed |
+| `NAV_MIN_TARGET_PIXELS` | `32` | 小/远目标像素边长下限（两段式兜底） |
+| `NAV_MAX_DEPTH_STD_M` | `0.5` | patch 深度方差上限（超出降级 belief） |
+| `NAV_SERVO_MAX_STEPS` / `NAV_SERVO_AREA_RATIO` / `NAV_SERVO_CENTER_TOL` | `8` / `0.04` / `0.25` | 末端视觉伺服 |
+| `NAV_DECIDER_LOG` | `mapping_debug/decision_trace.jsonl` | 决策 trace |
+| `NAV_DECIDER_MAX_TOOL_ROUNDS` | `3` | 决策层工具调用上限 |
+| `NAV_FINISH_UNEXPLORED_MAX` | `0.15` | FINISH 硬条件：未探索占比阈值 |
+
+远端部署：权重统一 `/root/autodl-tmp/models/`（ModelScope 镜像下载），
+推理走一个 vLLM 服务（客户端优先级队列：决策 > pointing > caption，
+同帧结果缓存）；显存预算 VGGT 1B ~10GB + 3B(4bit) ~3GB + 7B(4bit)
+~8GB（24GB 单卡）；决策 LLM 走 API（key 走环境变量），不可达自动回退
+规则决策。smoke 矩阵：`scripts/run_smoke_matrix.sh`。
+
+**待办（Phase 5 收尾）**：新链路四模式 smoke 不劣于旧链路后，删除
+`mapping/semantic.py`（CLIP/SAM3）与 `_ground_object_clip_sam` 旧链路。
+
+---
+
+> 以下为 2026-08-02 版旧架构（clip_sam 链路）记录与弱点分析。
+
 
 ## 一、整体架构
 

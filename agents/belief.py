@@ -20,10 +20,20 @@ class BeliefMap:
         # 都会重新编号，不能作为跨重建的持久键。
         self.anchors = {}
         self._last_query_step = -10 ** 9
+        # 外部锚点（ObservationLedger 的 belief 观测，semantic_memory
+        # 后端的分级置信度先验）；每次规划前由调用方整体刷新。
+        self._external = []
 
     def reset(self):
         self.anchors = {}
         self._last_query_step = -10 ** 9
+        self._external = []
+
+    def set_external_anchors(self, anchors):
+        """整体替换外部锚点。anchors: [(world_xy, score), ...]。"""
+        self._external = [
+            (np.asarray(xy, dtype=np.float64)[:2], float(s))
+            for xy, s in (anchors or [])]
 
     def update(self, client, graph, target_text, align_R, step):
         """按间隔从 server 拉 CLIP 检索结果并更新空间信念。"""
@@ -58,10 +68,11 @@ class BeliefMap:
 
     def belief_at(self, world_xy, graph):
         """返回某 world xy（如 frontier 质心）的距离衰减信念。"""
-        if not self.anchors:
+        if not self.anchors and not self._external:
             return 0.0
         xy = np.asarray(world_xy, dtype=np.float64)[:2]
         # 空间锚定并随距离衰减，避免旧 keyframe 给整张新骨架同一 node id
         # 的位置错误继承高分。
+        sources = list(self.anchors.values()) + self._external
         return max(float(score) / (1.0 + np.linalg.norm(pos - xy))
-                   for pos, score in self.anchors.values())
+                   for pos, score in sources)

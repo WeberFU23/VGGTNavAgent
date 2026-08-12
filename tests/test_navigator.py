@@ -16,7 +16,7 @@ from agents import navigator as nav
 from agents.memory import InstanceMemory
 from agents.nav_agent import NavAgent
 from benchmark_api import Action
-from decision import StrategicDecision, TargetSpec, VLMDecisionClient
+from decision import DecisionLoop, VLMDecisionClient
 
 
 def _rot(axis, deg):
@@ -146,43 +146,25 @@ def test_multi_target_finish_policy():
 
 def test_instruction_only_target_phrase():
     agent = object.__new__(NavAgent)
-    agent.vlm = VLMDecisionClient(enabled=False)
-    agent.target_spec = None
-    agent._target_spec_source = None
     agent._target_mode = "any"
     agent._target_count = None
     obs = SimpleNamespace(goal_text="Find any bag.")
     assert agent._target_phrase(obs) == "bag"
-    agent.target_spec = None
     agent._target_mode = "many"
     agent._target_count = 2
     obs.goal_text = "Find exactly two baskets."
     assert agent._target_phrase(obs) == "baskets"
-    agent.target_spec = None
     agent._target_mode = "all"
     agent._target_count = None
     obs.goal_text = "Go to all sink objects."
     assert agent._target_phrase(obs) == "sink objects"
-    agent.target_spec = None
     obs.goal_text = "Navigate to the red fabric chair with wooden legs."
     assert agent._target_phrase(obs) == "red fabric chair with wooden legs"
-
-    class _ParsingVLM:
-        enabled = True
-
-        @staticmethod
-        def parse_instruction(instruction, target_mode, target_count):
-            assert instruction == "Find the television near the sofa."
-            return TargetSpec("television", "television near the sofa", 0.9)
-
-    agent.vlm = _ParsingVLM()
-    agent.target_spec = None
     obs.goal_text = "Find the television near the sofa."
-    assert agent._target_phrase(obs) == "television"
-    assert agent.target_spec.target_description == "television near the sofa"
+    assert agent._target_phrase(obs) == "television near the sofa"
 
 
-def test_vlm_candidate_integration():
+def test_unified_candidate_decision_integration():
     class _Client:
         @staticmethod
         def get_candidate_evidence(candidate_id):
@@ -197,42 +179,32 @@ def test_vlm_candidate_integration():
         def current_scale():
             return 1.0
 
-    class _VLM:
-        enabled = True
-
-        @staticmethod
-        def choose_candidate(*args, **kwargs):
-            return StrategicDecision(
-                decision="navigate", candidate_id="c2",
-                rejected_candidate_ids=["c1"], confidence=0.9,
-                reason="c2 matches")
-
-    agent = object.__new__(NavAgent)
-    agent.vlm = _VLM()
+    agent = NavAgent()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current")
     agent.client = _Client()
     agent.calibrator = _Calibrator()
-    agent.target_spec = TargetSpec("tv", "flat television", 0.9)
-    agent._target_spec_source = "Find the TV."
+    agent.target_text = "tv"
+    agent.align_R = np.eye(3)
     agent._target_mode = "any"
-    agent._target_count = None
-    agent._reported_count = 0
-    agent._no_hit_queries = 0
-    agent.memory = InstanceMemory()
-    agent._explore_hint = "none"
-    agent._explore_hint_steps = 0
-    agent.vlm_candidate_conf = 0.35
+    n1, _ = agent.memory.add_or_merge(
+        "tv", [0, 0, 0], 0.8, 0.5, candidate_id="c1", frame_id=1)
+    n2, _ = agent.memory.add_or_merge(
+        "tv", [2, 0, 0], 0.9, 0.5, candidate_id="c2", frame_id=2)
+    agent._ordered_memory_nodes = lambda: [n1, n2]
+    agent._build_decider_input = lambda obs: ({
+        "instances": [{"id": n1.iid, "status": "confirmed"},
+                      {"id": n2.iid, "status": "confirmed"}],
+        "frontiers": [], "task": {}, "termination": {}}, None)
+    agent.decision_loop = DecisionLoop(lambda prompt, images: {
+        "action": "GOTO_INSTANCE", "target_id": str(n2.iid),
+        "confidence": 0.9})
+    agent._plan_to_target = lambda obs: False
     obs = SimpleNamespace(
         goal_text="Find the TV.", rgb=np.zeros((16, 16, 3), dtype=np.uint8),
         step_count=40, max_steps=100)
-    candidates = [
-        {"candidate_id": "c1", "point": [0, 0, 0]},
-        {"candidate_id": "c2", "point": [2, 0, 0]},
-    ]
-    selected, evidence = agent._vlm_candidate_decision(obs, candidates)
-    assert selected["candidate_id"] == "c2"
-    assert evidence == b"jpeg-c2"
-    assert sum(1 for n in agent.memory.nodes
-               if n.status == "rejected") == 1
+    assert agent._activate_memory_target(obs)
+    assert agent.target_candidate_id == "c2"
+    assert agent._selected_evidence == b"jpeg-c2"
 
 
 def test_runtime_memory_route_uses_persistent_instances():
@@ -444,7 +416,7 @@ if __name__ == "__main__":
     test_dead_reckon_undo()
     test_multi_target_finish_policy()
     test_instruction_only_target_phrase()
-    test_vlm_candidate_integration()
+    test_unified_candidate_decision_integration()
     test_runtime_memory_route_uses_persistent_instances()
     test_grid_and_astar()
     test_path_follower()

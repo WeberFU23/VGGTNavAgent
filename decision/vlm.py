@@ -1,4 +1,4 @@
-"""OpenAI-compatible, event-driven VLM client with safe fallback."""
+"""OpenAI-compatible transport for the unified event-driven decision loop."""
 
 import base64
 import io
@@ -9,10 +9,6 @@ import re
 import numpy as np
 from PIL import Image
 
-from decision import prompts
-from decision.types import StrategicDecision, TargetSpec
-
-
 def _env_bool(name, default=False):
     value = os.environ.get(name)
     if value is None:
@@ -21,7 +17,7 @@ def _env_bool(name, default=False):
 
 
 class VLMDecisionClient:
-    """Small strategic client; it never chooses benchmark motor actions."""
+    """Transport only; prompts, schemas and validation live in DecisionLoop."""
 
     def __init__(self, api_url=None, api_key=None, model=None, timeout=45.0,
                  enabled=None, post_fn=None):
@@ -47,90 +43,19 @@ class VLMDecisionClient:
             timeout=float(os.environ.get("NAV_VLM_TIMEOUT", "45")),
             enabled=_env_bool("NAV_VLM_ENABLED", configured))
 
-    def parse_instruction(self, instruction, target_mode, target_count):
-        data = self._request(
-            prompts.parse_instruction_prompt(instruction, target_mode, target_count), [])
-        if not data:
-            return None
-        query = str(data.get("grounding_query") or "").strip()
-        description = str(data.get("target_description") or "").strip()
-        if not query or not description:
-            return None
-        return TargetSpec(query, description, self._confidence(data))
-
-    def choose_candidate(self, instruction, target_spec, state, current_rgb,
-                         candidates, evidence_by_id):
-        target_dict = self._target_dict(target_spec)
-        images = [("current_observation", self._rgb_jpeg(current_rgb), "image/jpeg")]
-        for i, candidate in enumerate(candidates):
-            evidence = evidence_by_id.get(candidate.get("candidate_id"))
-            if evidence:
-                images.append((f"candidate_{i}", evidence, "image/jpeg"))
-        data = self._request(
-            prompts.candidate_prompt(instruction, target_dict, state, candidates), images)
-        return self._strategic(data, {"navigate", "explore"})
-
-    def verify_arrival(self, instruction, target_spec, state, current_rgb,
-                       selected_evidence=None):
-        images = [("current_observation", self._rgb_jpeg(current_rgb), "image/jpeg")]
-        if selected_evidence:
-            images.append(("selected_candidate", selected_evidence, "image/jpeg"))
-        data = self._request(
-            prompts.arrival_prompt(instruction, self._target_dict(target_spec), state),
-            images)
-        return self._strategic(data, {"report_found", "scan", "reject"})
-
-    def decide_finish(self, instruction, target_spec, state, current_rgb):
-        images = [("current_observation", self._rgb_jpeg(current_rgb), "image/jpeg")]
-        data = self._request(
-            prompts.finish_prompt(instruction, self._target_dict(target_spec), state),
-            images)
-        return self._strategic(data, {"finish", "explore"})
-
     def agentic_chat(self, user_prompt, images=None):
         """决策层 agentic 循环低层接口：自由 prompt + 原始 JPEG 字节图像
         列表，返回解析后的 JSON dict；API 不可达自动回退 None（调用方
         走确定性规则），并打 warning。复用同一 HTTP/JSON 解析通路。"""
         parts = []
-        for i, raw in enumerate(images or []):
+        for i, item in enumerate(images or []):
+            if isinstance(item, tuple) and len(item) == 2:
+                name, raw = item
+            else:
+                name, raw = f"attached_image_{i}", item
             if raw:
-                parts.append((f"attached_image_{i}", raw, "image/jpeg"))
+                parts.append((str(name), raw, "image/jpeg"))
         return self._request(str(user_prompt), parts)
-
-    @staticmethod
-    def _target_dict(target_spec):
-        return {
-            "grounding_query": target_spec.grounding_query,
-            "target_description": target_spec.target_description,
-        }
-
-    def _strategic(self, data, allowed):
-        if not data:
-            return None
-        decision = str(data.get("decision") or "").strip().lower()
-        if decision not in allowed:
-            return None
-        rejected = data.get("rejected_candidate_ids") or []
-        if not isinstance(rejected, list):
-            rejected = []
-        hint = str(data.get("exploration_hint") or "none").lower()
-        if hint not in {"none", "forward", "turn_left", "turn_right", "scan"}:
-            hint = "none"
-        candidate_id = data.get("candidate_id")
-        return StrategicDecision(
-            decision=decision,
-            candidate_id=str(candidate_id) if candidate_id is not None else None,
-            rejected_candidate_ids=[str(x) for x in rejected],
-            exploration_hint=hint,
-            confidence=self._confidence(data),
-            reason=str(data.get("reason") or "")[:300])
-
-    @staticmethod
-    def _confidence(data):
-        try:
-            return min(1.0, max(0.0, float(data.get("confidence", 0.0))))
-        except (TypeError, ValueError):
-            return 0.0
 
     def _request(self, user_prompt, images):
         if not self.enabled:
@@ -148,7 +73,11 @@ class VLMDecisionClient:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": prompts.SYSTEM_PROMPT},
+                {"role": "system", "content": (
+                    "You are the strategic visual reasoning module of an "
+                    "embodied navigation agent. Use only supplied state and "
+                    "images. Never invent geometry or simulator state. Return "
+                    "one strict JSON object with no markdown or extra text.")},
                 {"role": "user", "content": content},
             ],
             "temperature": 0,
@@ -200,7 +129,7 @@ class VLMDecisionClient:
             return None
 
     @staticmethod
-    def _rgb_jpeg(rgb):
+    def encode_rgb(rgb):
         array = np.asarray(rgb)
         if array.ndim != 3 or array.shape[-1] < 3:
             return b""

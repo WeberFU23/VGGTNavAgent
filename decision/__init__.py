@@ -2,8 +2,7 @@
 
 from decision.agent_loop import (DecisionLoop, DecisionResult,
                                  DecisionTraceLogger)
-from decision.types import StrategicDecision, TargetSpec
 from decision.vlm import VLMDecisionClient
 
-__all__ = ["StrategicDecision", "TargetSpec", "VLMDecisionClient",
-           "DecisionLoop", "DecisionResult", "DecisionTraceLogger"]
+__all__ = ["VLMDecisionClient", "DecisionLoop", "DecisionResult",
+           "DecisionTraceLogger"]

@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents.evidence import ObservationLedger
 from agents.nav_agent import NavAgent
 from benchmark_api import Action
-from decision import StrategicDecision
+from decision import DecisionResult
 
 
 # ----------------------------------------------------------------------
@@ -139,12 +139,10 @@ def test_arrival_reject_branch_vlm():
     agent = _make_agent()
     agent.client = _MockClient({"found": True, "score": 0.9,
                                 "bbox": _big_centered_bbox()})
-    agent.vlm = SimpleNamespace(
-        enabled=True,
-        parse_instruction=lambda *a, **k: None,
-        verify_arrival=lambda *a, **k: StrategicDecision(
-            decision="reject", confidence=0.9, reason="wrong color"))
-    agent._target_phrase(_obs())
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
+    agent.decision_loop = SimpleNamespace(
+        decide=lambda *a, **k: DecisionResult(
+            "REJECT", confidence=0.9, reason="wrong color"))
     assert agent._arrival_decision(_obs()) == "reject"
 
 

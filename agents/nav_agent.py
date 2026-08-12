@@ -30,8 +30,7 @@ from agents.belief import BeliefMap
 from agents.evidence import ObservationLedger
 from agents.mapping_agent import MappingAgent
 from agents.memory import InstanceMemory
-from decision import (DecisionLoop, DecisionTraceLogger, TargetSpec,
-                      VLMDecisionClient)
+from decision import DecisionLoop, DecisionTraceLogger, VLMDecisionClient
 
 
 class NavAgent(MappingAgent):
@@ -53,7 +52,7 @@ class NavAgent(MappingAgent):
         self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "5"))
         # semantic_memory 后端（Phase 3）：pointing + 分级置信度 + 视觉伺服
         self.semantic_backend = os.environ.get(
-            "NAV_SEMANTIC_BACKEND", "clip_sam")
+            "NAV_SEMANTIC_BACKEND", "semantic_memory")
         self.point_min_conf = float(os.environ.get("NAV_POINT_MIN_CONF", "0.5"))
         self.confirm_min_obs = int(os.environ.get("NAV_CONFIRM_MIN_OBS", "2"))
         self.min_target_pixels = float(os.environ.get(
@@ -70,12 +69,8 @@ class NavAgent(MappingAgent):
                   "命中准入由 pointing 置信度与分级观测决定")
         self.vlm_candidate_limit = int(
             os.environ.get("NAV_VLM_CANDIDATE_LIMIT", "4"))
-        self.vlm_candidate_conf = float(
-            os.environ.get("NAV_VLM_CANDIDATE_CONF", "0.35"))
         self.vlm_verify_conf = float(
             os.environ.get("NAV_VLM_VERIFY_CONF", "0.50"))
-        self.vlm_finish_conf = float(
-            os.environ.get("NAV_VLM_FINISH_CONF", "0.60"))
         self.vlm = VLMDecisionClient.from_env()
         print(f"[NavAgent] VLM 战略层: "
               f"{'enabled (' + self.vlm.model + ')' if self.vlm.enabled else 'disabled'}")
@@ -123,12 +118,7 @@ class NavAgent(MappingAgent):
         self._no_hit_queries = 0
         self._target_mode = "any"
         self._target_count = None
-        self.target_spec = None
-        self._target_spec_source = None
         self._selected_evidence = None
-        self._explore_hint = "none"
-        self._explore_hint_steps = 0
-        self._last_finish_vlm_step = -10 ** 9
         # 分级置信度账本（semantic_memory 后端）：单帧观测->belief 锚点，
         # 独立多帧观测->confirmed；clip_sam 后端不用。
         self.ledger = ObservationLedger(min_obs=self.confirm_min_obs)
@@ -171,19 +161,10 @@ class NavAgent(MappingAgent):
     def _target_phrase(self, observation):
         override = os.environ.get("NAV_TARGET")
         if override:
-            source = str(observation.goal_text or "").strip()
-            if self.target_spec is None or self._target_spec_source != source:
-                self.target_spec = TargetSpec(
-                    grounding_query=override,
-                    target_description=source or override,
-                    confidence=1.0)
-                self._target_spec_source = source
             return override
         source = str(observation.goal_text or "").strip()
-        if self.target_spec is not None and self._target_spec_source == source:
-            return self.target_spec.grounding_query
-        # 只从自然语言本身提取 grounding phrase，不读取 query_program。
-        # 保留颜色/材质等描述属性，仅去掉导航命令和冠词。
+        # 只从公开 instruction 确定性去掉命令和数量；完整原文仍进入统一
+        # world_state.task.goal，供 caption/pointing/VLM 做属性与关系判断。
         text = source
         text = re.sub(
             r"^(?:please\s+)?(?:find|locate|look\s+for|navigate\s+to|go\s+to)\s+",
@@ -200,38 +181,13 @@ class NavAgent(MappingAgent):
         text = re.sub(r"^(?:all|every)\s+(?:the\s+)?", "", text,
                       flags=re.IGNORECASE)
         fallback = text.strip().rstrip(".!?") or source
-        spec = None
-        if self.vlm.enabled:
-            spec = self.vlm.parse_instruction(
-                source, self._target_mode, self._target_count)
-        self.target_spec = spec or TargetSpec(
-            grounding_query=fallback,
-            target_description=source or fallback,
-            confidence=0.0)
-        self._target_spec_source = source
-        if spec is not None:
-            print(f"[NavAgent] VLM 解析目标: '{source}' -> "
-                  f"'{spec.grounding_query}' ({spec.confidence:.2f})")
-        return self.target_spec.grounding_query
+        return fallback
 
     def _explore_action(self, observation):
-        """前沿引导探索：活跃探索路径优先，其次 VLM 短宏提示，
-        碰撞恢复最优先，构建失败回退随机游走。"""
+        """前沿引导探索；碰撞恢复最优先，构建失败回退随机游走。"""
         if self._last_motion_failed:
-            self._explore_hint_steps = 0
             self._explore_follower = None      # 碰撞后旧路径不可信
             return super()._explore_action(observation)
-        if self._explore_hint_steps > 0:
-            action_by_hint = {
-                "forward": Action.MOVE_FORWARD,
-                "turn_left": Action.TURN_LEFT,
-                "turn_right": Action.TURN_RIGHT,
-                "scan": Action.TURN_LEFT,
-            }
-            action = action_by_hint.get(self._explore_hint)
-            if action is not None:
-                self._explore_hint_steps -= 1
-                return int(action)
         if not self.explore_enabled:
             return super()._explore_action(observation)
         # 活跃探索路径：跟随；走完后立即尝试选新目标
@@ -371,12 +327,6 @@ class NavAgent(MappingAgent):
             print(f"[NavAgent] step={observation.step_count} 探索目标 "
                   f"frontier size={c['size']} 路径 {len(path)} 点")
             return
-
-    def _set_explore_hint(self, hint):
-        self._explore_hint = str(hint or "none")
-        self._explore_hint_steps = {
-            "forward": 3, "turn_left": 1, "turn_right": 1, "scan": 3,
-        }.get(self._explore_hint, 0)
 
     def act(self, observation):
         self._feed_frame(observation)
@@ -530,31 +480,6 @@ class NavAgent(MappingAgent):
         self._clear_current_target()
         self.mode = "explore"
         return self._explore_action(observation)
-
-    def _decision_state(self, observation):
-        mapping_state = {}
-        try:
-            raw = self.client.get_state()
-            mapping_state = {
-                "num_submaps": raw.get("num_submaps", 0),
-                "queued_keyframes": raw.get("queued_keyframes", 0),
-                "mapping_busy": bool(raw.get("busy")),
-            }
-        except Exception:
-            pass
-        return {
-            "step": int(observation.step_count),
-            "max_steps": int(observation.max_steps),
-            "target_mode": self._target_mode,
-            "required_count": self._target_count,
-            "reported_instance_count": self._reported_count,
-            "recent_queries_without_new_candidate": self._no_hit_queries,
-            "rejected_or_duplicate_location_count": sum(
-                1 for n in self.memory.nodes if n.status == "rejected"),
-            "has_agent_estimated_metric_scale":
-                self.calibrator.current_scale() is not None,
-            **mapping_state,
-        }
 
     # ------------------------------------------------------------------
     # Phase 4：VLM 决策层（NAV_DECIDER=vlm，事件驱动，不进控制回路）
@@ -734,25 +659,7 @@ class NavAgent(MappingAgent):
             map_stable = observation.step_count - self._last_map_growth_step \
                 >= self.finish_map_stable_steps
             fallback_ready = geometric_ready and fallback_late and map_stable
-            if not self.vlm.enabled:
-                return fallback_ready
-            if not geometric_ready:
-                return False
-            if observation.step_count - self._last_finish_vlm_step < \
-                    self.query_interval:
-                return False
-            self._last_finish_vlm_step = observation.step_count
-            self._target_phrase(observation)
-            decision = self.vlm.decide_finish(
-                observation.goal_text, self.target_spec,
-                self._decision_state(observation), observation.rgb)
-            if decision is None:
-                return fallback_ready
-            self._set_explore_hint(decision.exploration_hint)
-            print(f"[NavAgent] VLM FINISH 判断: {decision.decision} "
-                  f"conf={decision.confidence:.2f} reason={decision.reason}")
-            return decision.decision == "finish" and \
-                decision.confidence >= self.vlm_finish_conf
+            return fallback_ready
         return False
 
     # ------------------------------------------------------------------
@@ -790,21 +697,30 @@ class NavAgent(MappingAgent):
               f"score={r.get('score', 0.0):.3f} -> {'通过' if found else '未过'}")
         if not found:
             return "scan"
-        if not self.vlm.enabled:
+        if self.decision_loop is None:
             return "report_found"
-        self._target_phrase(observation)
-        decision = self.vlm.verify_arrival(
-            observation.goal_text, self.target_spec,
-            self._decision_state(observation), observation.rgb,
-            self._selected_evidence)
-        if decision is None:
+        state, map_png = self._build_decider_input(observation)
+        state["arrival"] = {
+            "target_candidate_id": self.target_candidate_id,
+            "grounding_found": found,
+            "grounding_score": round(float(r.get("score", 0.0)), 3),
+            "scan_step": self._scan_steps if self._scanning else 0,
+        }
+        images = [("current_observation",
+                   self.vlm.encode_rgb(observation.rgb))]
+        if self._selected_evidence:
+            images.append(("selected_candidate", self._selected_evidence))
+        result = self.decision_loop.decide(
+            "arrival", state, map_png=map_png, images=images)
+        if result is None:
             return "report_found"
-        print(f"[NavAgent] VLM 到达复核: {decision.decision} "
-              f"conf={decision.confidence:.2f} reason={decision.reason}")
-        if decision.decision == "report_found" and \
-                decision.confidence < self.vlm_verify_conf:
+        print(f"[NavAgent] VLM 到达复核: {result.action} "
+              f"conf={result.confidence:.2f} reason={result.reason}")
+        if result.action == "REPORT_FOUND" and \
+                result.confidence < self.vlm_verify_conf:
             return "scan"
-        return decision.decision
+        return {"REPORT_FOUND": "report_found", "REJECT": "reject",
+                "SCAN": "scan"}.get(result.action, "scan")
 
     def _handle_scan(self, observation):
         """360° 原地扫描：每步先确认当前帧，未过继续转；
@@ -912,27 +828,55 @@ class NavAgent(MappingAgent):
         return [selected] if selected is not None else []
 
     def _activate_memory_target(self, observation):
-        """选择持久实例、经 VLM/fallback 审阅，并规划第一段。"""
+        """选择持久实例，经统一决策入口审阅，并规划第一段。"""
         nodes = self._ordered_memory_nodes()
         if not nodes:
             return False
-        candidates = [{
-            "candidate_id": nd.candidate_id,
-            "point": self._raw_point(nd.point).tolist(),
-            "sam_score": nd.score,
-            "frame_id": nd.frame_id,
-            "memory_iid": nd.iid,
-        } for nd in nodes[:self.vlm_candidate_limit]]
-        best, evidence = self._vlm_candidate_decision(observation, candidates)
-        if best is None:
-            return False
-        self.target_point = np.asarray(best["point"], dtype=np.float64)
-        self.target_candidate_id = best.get("candidate_id")
-        self._selected_evidence = evidence
+        considered = nodes[:self.vlm_candidate_limit]
+        selected = considered[0]
+        evidence_by_iid = {}
+        if self.decision_loop is not None:
+            state, map_png = self._build_decider_input(observation)
+            considered_ids = {str(nd.iid) for nd in considered}
+            state["instances"] = [
+                row for row in state.get("instances", [])
+                if str(row.get("id")) in considered_ids]
+            state["candidate_review"] = [
+                {"instance_id": nd.iid, "frame_id": nd.frame_id,
+                 "candidate_id": nd.candidate_id}
+                for nd in considered]
+            images = [("current_observation",
+                       self.vlm.encode_rgb(observation.rgb))]
+            for nd in considered:
+                if not nd.candidate_id:
+                    continue
+                try:
+                    meta, payload = self.client.get_candidate_evidence(
+                        nd.candidate_id)
+                    if meta.get("found") and payload:
+                        evidence_by_iid[str(nd.iid)] = payload
+                        images.append((f"candidate_instance_{nd.iid}",
+                                       payload))
+                except Exception as exc:
+                    print(f"[NavAgent] candidate evidence 失败: {exc}")
+            result = self.decision_loop.decide(
+                "candidate_review", state, map_png=map_png, images=images)
+            if result is None:
+                pass
+            elif result.action != "GOTO_INSTANCE":
+                return False
+            else:
+                selected = next((nd for nd in considered
+                                 if str(nd.iid) == result.target_id), None)
+                if selected is None:
+                    return False
+        self.target_point = self._raw_point(selected.point)
+        self.target_candidate_id = selected.candidate_id
+        self._selected_evidence = evidence_by_iid.get(str(selected.iid))
         self._no_hit_queries = 0
         self._explore_follower = None
-        print(f"[NavAgent] 从实例记忆选择 #{best.get('memory_iid')} "
-              f"sam={best.get('sam_score', 0.0):.3f}")
+        print(f"[NavAgent] 从实例记忆选择 #{selected.iid} "
+              f"confidence={selected.score:.3f}")
         if self._plan_to_target(observation):
             self.mode = "nav"
         return True
@@ -1099,7 +1043,6 @@ class NavAgent(MappingAgent):
         hits = [r for r in results if r.get("found")]
         if not hits:
             self._no_hit_queries += 1
-            self._vlm_candidate_decision(observation, [])
             print(f"[NavAgent] step={step} 未定位到 '{phrase}'")
             return
         if self.semantic_backend == "semantic_memory":
@@ -1115,7 +1058,6 @@ class NavAgent(MappingAgent):
                 eligible.append(h)
         if not eligible:
             self._no_hit_queries += 1
-            self._vlm_candidate_decision(observation, [])
             print(f"[NavAgent] step={step} '{phrase}' 命中均被拉黑或分数不足")
             return
         # 所有当前命中先写入 confirmed memory；planner 随后对持久集合规划，
@@ -1129,53 +1071,6 @@ class NavAgent(MappingAgent):
         if not self._activate_memory_target(observation):
             self._no_hit_queries += 1
             print(f"[NavAgent] step={step} VLM 建议继续探索")
-
-    def _vlm_candidate_decision(self, observation, candidates):
-        """返回 (selected candidate, evidence bytes)；无 VLM 时取最高 SAM。"""
-        if not self.vlm.enabled:
-            return (candidates[0], None) if candidates else (None, None)
-        # This helper is also used on no-hit/VLM-only paths, so do not rely on
-        # _maybe_query_target having initialized the memory category first.
-        self.target_text = self._target_phrase(observation)
-        evidence_by_id = {}
-        for candidate in candidates:
-            candidate_id = candidate.get("candidate_id")
-            if not candidate_id:
-                continue
-            try:
-                meta, payload = self.client.get_candidate_evidence(candidate_id)
-                if meta.get("found") and payload:
-                    evidence_by_id[candidate_id] = payload
-            except Exception as exc:
-                print(f"[NavAgent] candidate evidence 失败: {exc}")
-        decision = self.vlm.choose_candidate(
-            observation.goal_text, self.target_spec,
-            self._decision_state(observation), observation.rgb,
-            candidates, evidence_by_id)
-        if decision is None:
-            return (candidates[0], evidence_by_id.get(
-                candidates[0].get("candidate_id"))) if candidates else (None, None)
-        self._set_explore_hint(decision.exploration_hint)
-        by_id = {c.get("candidate_id"): c for c in candidates}
-        for candidate_id in decision.rejected_candidate_ids:
-            rejected = by_id.get(candidate_id)
-            if rejected is not None:
-                node, is_new = self.memory.add_or_merge(
-                    self.target_text,
-                    self._aligned_point(rejected["point"]),
-                    0.0, merge_dist=self._merge_dist(), status="rejected")
-                if not is_new:
-                    self.memory.mark_rejected(node)
-        print(f"[NavAgent] VLM 候选判断: {decision.decision} "
-              f"candidate={decision.candidate_id} conf={decision.confidence:.2f} "
-              f"reason={decision.reason}")
-        if decision.decision != "navigate" or \
-                decision.confidence < self.vlm_candidate_conf or \
-                decision.candidate_id not in by_id or \
-                decision.candidate_id in decision.rejected_candidate_ids:
-            return None, None
-        selected = by_id[decision.candidate_id]
-        return selected, evidence_by_id.get(decision.candidate_id)
 
     # ------------------------------------------------------------------
     # 规划

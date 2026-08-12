@@ -70,6 +70,23 @@ def test_valid_goto_instance():
     assert result.validation == "ok"
 
 
+def test_arrival_uses_unified_schema_and_event_actions():
+    chat = _ScriptedChat([{"action": "REPORT_FOUND", "confidence": 0.9}])
+    result = DecisionLoop(chat).decide("arrival", _state(), images=[b"rgb"])
+    assert result.action == "REPORT_FOUND"
+    assert chat.calls[0][1] == [b"rgb"]
+
+
+def test_arrival_rejects_navigation_action():
+    chat = _ScriptedChat([
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
+        {"action": "SCAN", "confidence": 0.5},
+    ])
+    result = DecisionLoop(chat).decide("arrival", _state())
+    assert result.action == "SCAN"
+    assert "invalid for event" in chat.calls[1][0]
+
+
 def test_visited_instance_rejected_then_retry():
     chat = _ScriptedChat([
         {"action": "GOTO_INSTANCE", "target_id": "1"},      # visited -> 拒绝
@@ -125,7 +142,8 @@ def test_tool_loop_look_at_image():
     result = loop.decide("finish_check", _state())
     assert result.action == "FINISH"
     # 第二轮带上了工具返回的图像
-    assert any(img == b"\xff\xd8jpeg-bytes" for img in chat.calls[1][1])
+    assert any(img == ("tool_keyframe", b"\xff\xd8jpeg-bytes")
+               for img in chat.calls[1][1])
 
 
 def test_tool_rounds_exhausted():

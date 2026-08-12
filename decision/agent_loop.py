@@ -15,7 +15,15 @@ import os
 import threading
 import time
 
-ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "VERIFY", "FINISH")
+ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "VERIFY", "REPORT_FOUND",
+           "SCAN", "REJECT", "EXPLORE", "FINISH")
+
+EVENT_ACTIONS = {
+    "candidate_review": {"GOTO_INSTANCE", "EXPLORE", "VERIFY"},
+    "arrival": {"REPORT_FOUND", "SCAN", "REJECT"},
+    "scan_complete": {"REPORT_FOUND", "REJECT", "EXPLORE"},
+    "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE", "FINISH"},
+}
 
 DECIDER_PROMPT = """You are the high-level planner of an embodied multi-object
 navigation agent. You receive a JSON world state (all distances and path
@@ -28,7 +36,11 @@ Decide the next high-level action:
 - GOTO_INSTANCE: navigate to a confirmed, unvisited instance (target_id =
   instance id from the instances table).
 - GOTO_FRONTIER: explore a frontier (target_id = frontier id).
-- VERIFY: re-verify the current arrival target visually.
+- VERIFY: request more visual evidence before choosing a destination.
+- REPORT_FOUND: report the currently visible, verified target.
+- SCAN: rotate to collect more arrival evidence.
+- REJECT: reject the current arrival target as a false positive.
+- EXPLORE: continue deterministic exploration without selecting a listed target.
 - FINISH: end the episode (only when every required target is found and
   exploration is sufficiently complete).
 
@@ -38,7 +50,7 @@ You may first call read-only tools, one per reply, at most {max_rounds} times:
   {{"tool_call": {{"name": "look_at", "frame_id": <id>}}}}
   -> returns the keyframe image.
 After tools (or immediately), reply with exactly one JSON object:
-  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|VERIFY|FINISH",
+  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|VERIFY|REPORT_FOUND|SCAN|REJECT|EXPLORE|FINISH",
     "target_id": "<id from the state tables, or null>",
     "reason": "short reason (log only)",
     "confidence": 0.0}}
@@ -98,11 +110,13 @@ class DecisionLoop:
         self.finish_unexplored_max = float(finish_unexplored_max)
 
     # ------------------------------------------------------------------
-    def decide(self, event, world_state, map_png=None):
+    def decide(self, event, world_state, map_png=None, images=None):
         """一次事件驱动决策。返回 DecisionResult；最终非法/模型不可用
         返回 None（调用方回退确定性规则）。"""
         prompt = self._build_prompt(event, world_state)
-        images = [map_png] if map_png else []
+        images = list(images or [])
+        if map_png:
+            images.append(("topdown_map", map_png))
         tool_calls = 0
         for _round in range(self.max_tool_rounds + 2):
             data = self._chat(prompt, images)
@@ -118,10 +132,9 @@ class DecisionLoop:
                            + "\nNow decide. Reply with the decision JSON "
                              "or another tool_call.")
                 if tool_img:
-                    images = [map_png] if map_png else []
-                    images.append(tool_img)
+                    images.append(("tool_keyframe", tool_img))
                 continue
-            result, err = self._validate(data, world_state, tool_calls)
+            result, err = self._validate(data, world_state, tool_calls, event)
             if result is not None:
                 result = self._enforce_finish(result, world_state)
                 self._log(event, world_state, result.as_dict(),
@@ -131,7 +144,7 @@ class DecisionLoop:
             prompt += ("\n\nYour previous output was rejected: " + err
                        + "\nReturn exactly one valid decision JSON object.")
             data2 = self._chat(prompt, images)
-            result2, err2 = self._validate(data2, world_state, tool_calls) \
+            result2, err2 = self._validate(data2, world_state, tool_calls, event) \
                 if data2 is not None else (None, "model_unavailable")
             if result2 is not None:
                 result2 = self._enforce_finish(result2, world_state)
@@ -151,6 +164,25 @@ class DecisionLoop:
                  "\nEvent: " + str(event),
                  "\nWorld state:\n"
                  + json.dumps(world_state, ensure_ascii=False)]
+        event_guidance = {
+            "candidate_review": (
+                "\nChoose among the confirmed candidate instances shown in "
+                "the state/images. Use GOTO_INSTANCE only for a plausible "
+                "full semantic match; otherwise EXPLORE or VERIFY."),
+            "arrival": (
+                "\nThe first extra image is current RGB; later images are "
+                "historical evidence. Use REPORT_FOUND only when the visible "
+                "object satisfies the full task, SCAN for insufficient "
+                "evidence, or REJECT for a clear false positive."),
+            "scan_complete": (
+                "\nThe arrival scan is complete. Choose REPORT_FOUND, REJECT, "
+                "or EXPLORE based on the accumulated visual evidence."),
+            "finish_check": (
+                "\nFINISH is irreversible and will be independently checked "
+                "against deterministic count and coverage conditions."),
+        }
+        if str(event) in event_guidance:
+            parts.append(event_guidance[str(event)])
         task = world_state.get("task", {})
         # 4e: many 模式计数校验——簇数不足时提示在已确认实例周边补探索
         if task.get("mode") == "many" and task.get("expected") is not None \
@@ -190,13 +222,16 @@ class DecisionLoop:
             return json.dumps({"error": str(exc)[:200]}), None
 
     # ------------------------------------------------------------------
-    def _validate(self, data, world_state, tool_calls):
+    def _validate(self, data, world_state, tool_calls, event=None):
         """schema + id 存在性校验。返回 (DecisionResult|None, error)。"""
         if not isinstance(data, dict):
             return None, "not a JSON object"
         action = str(data.get("action") or "").strip().upper()
         if action not in ACTIONS:
             return None, f"unknown action: {action!r}"
+        allowed = EVENT_ACTIONS.get(str(event))
+        if allowed is not None and action not in allowed:
+            return None, f"action {action!r} is invalid for event {event!r}"
         target_id = data.get("target_id")
         if target_id is not None:
             target_id = str(target_id)

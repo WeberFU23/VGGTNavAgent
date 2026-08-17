@@ -4,7 +4,7 @@
 规划器用同款目标直接优化被测量的东西：
 - 小规模（<=max_exact）精确 DP；大规模贪心最近邻兜底；
 - 距离函数由调用方注入（栅格测地优先，欧氏兜底）；
-- 每次只执行序列第一段，有新信息（新实例/确认失败/地图更新）重规划，
+- 每次只执行序列第一段，有新信息（新实例/地图更新）重规划，
   避免两个候选间来回折返（BFM）。
 """
 
@@ -72,21 +72,18 @@ def route_order(start_xy, goals, dist_fn, max_exact=8):
     return order
 
 
-def select_goal_any(start_xy, instances, dist_fn, score_weight=1.0):
-    """any 模式：score / (1 + 距离) 最高的已确认实例。"""
-    best, best_v = None, -1.0
-    for nd in instances:
-        d = dist_fn(start_xy, tuple(nd.point[:2]))
-        v = nd.score * score_weight / (1.0 + d)
-        if v > best_v:
-            best, best_v = nd, v
-    return best
+def select_goal_any(start_xy, instances, dist_fn):
+    """VLM 不可用时的最小回退：选择最近的未报告实例。"""
+    if not instances:
+        return None
+    return min(instances,
+               key=lambda nd: dist_fn(start_xy, tuple(nd.point[:2])))
 
 
 def plan_multi(start_xy, instances, dist_fn, need):
     """many/all 模式：返回 (有序访问列表, 缺口)。
 
-    instances: 已确认未访问实例；need: 还需访问的数量。
+    instances: 未报告实例；need: 还需访问的数量。
     列表长度 <= need（不够的部分由探索补足，即缺口 > 0）。
     """
     if not instances or need <= 0:

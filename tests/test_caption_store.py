@@ -181,5 +181,45 @@ def test_worker_survives_gateway_error(tmp_path):
     worker.close()
 
 
+def test_worker_tracks_pending_and_completed_frames(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    gw = _MockGateway()
+    busy = {"flag": True}
+    worker = CaptionWorker(gw, _MockEmbedder(), store, model="qwen-3b",
+                           busy_fn=lambda: busy["flag"])
+    from PIL import Image
+    img = Image.new("RGB", (8, 8))
+    worker.enqueue(7, img)
+    worker.enqueue(8, img)
+    time.sleep(0.2)
+    # 在途处理（等 GPU 空闲）也算 pending，与队列 qsize 语义不同
+    assert worker.pending() == 2
+    assert worker.pending_frame_ids() == [7, 8]
+    busy["flag"] = False
+    assert _wait_for(lambda: worker.pending() == 0)
+    assert worker.last_completed_frame_id == 8
+    worker.enqueue(9, img)
+    assert _wait_for(lambda: worker.pending() == 0)
+    assert worker.last_completed_frame_id == 9
+    worker.close()
+
+
+def test_worker_failure_clears_pending(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+
+    class _BadGateway:
+        def chat(self, *a, **k):
+            raise RuntimeError("vllm down")
+
+    worker = CaptionWorker(_BadGateway(), _MockEmbedder(), store,
+                           model="qwen-3b", busy_fn=lambda: False)
+    from PIL import Image
+    worker.enqueue(3, Image.new("RGB", (8, 8)))
+    assert _wait_for(lambda: worker.errors >= 1)
+    assert _wait_for(lambda: worker.pending() == 0)
+    assert worker.last_completed_frame_id is None
+    worker.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

@@ -35,7 +35,7 @@ class _FakePost:
 
 
 def test_openai_compatible_unified_call():
-    fake = _FakePost([{"action": "EXPLORE", "confidence": 0.85}])
+    fake = _FakePost([{"action": "EXPLORE", "reason": "keep mapping"}])
     client = VLMDecisionClient(
         api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
         post_fn=fake)
@@ -62,10 +62,33 @@ def test_disabled_client_is_network_free():
         api_url="http://unused", model="unused", enabled=False,
         post_fn=fail_if_called)
     assert client.agentic_chat("event", []) is None
+    assert client.chat_text("describe") is None
     assert called == []
+
+
+def test_chat_text_returns_plain_text_without_json_mode():
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return _Response({"choices": [{"message": {
+            "content": "a red ceramic cup beside the sink"}}]})
+
+    client = VLMDecisionClient(
+        api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
+        post_fn=post)
+    text = client.chat_text("describe the marked object",
+                            [("pointing_overlay", b"jpeg")])
+    assert text == "a red ceramic cup beside the sink"
+    payload = calls[0]["json"]
+    assert "response_format" not in payload      # 自由文本不开 JSON mode
+    labels = [x.get("text") for x in payload["messages"][1]["content"]
+              if x.get("type") == "text"]
+    assert "Image label: pointing_overlay" in labels
 
 
 if __name__ == "__main__":
     test_openai_compatible_unified_call()
     test_disabled_client_is_network_free()
+    test_chat_text_returns_plain_text_without_json_mode()
     print("VLM decision tests passed")

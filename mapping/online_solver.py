@@ -4,10 +4,10 @@
 （Submap.add_all_frames(images)，images 在 cuda 上）。在 8GB 级
 GPU 上，子图累积 + Habitat 渲染 + SALAD/VGGT 常驻会很快 OOM。
 
-本子类复制上游 run_predictions 逻辑，仅做两处改动：
+本子类复制上游 run_predictions 逻辑，仅做显存相关改动：
 
 1. 子图帧张量保存到 CPU（回环需要时再临时搬回 GPU）。
-2. 语义与上游完全一致，输出格式不变。
+2. 语义记忆由独立 caption worker 处理，不在 SLAM 前向中计算图像向量。
 """
 
 import time
@@ -19,13 +19,12 @@ from termcolor import colored
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-from vggt_slam.slam_utils import compute_image_embeddings
 from vggt_slam.solver import Solver
 from vggt_slam.submap import Submap
 
 
 class OnlineSolver(Solver):
-    def run_predictions(self, image_names, model, max_loops, clip_model, clip_preprocess):
+    def run_predictions(self, image_names, model, max_loops):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         t1 = time.time()
         with self.vggt_timer:
@@ -51,11 +50,6 @@ class OnlineSolver(Solver):
         new_submap.set_last_non_loop_frame_index(images.shape[0] - 1)
         new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
         new_submap.set_img_names(image_names)
-
-        with self.clip_timer:
-            if clip_model is not None and clip_preprocess is not None:
-                image_embs = compute_image_embeddings(clip_model, clip_preprocess, image_names)
-                new_submap.set_all_semantic_vectors(image_embs)
 
         self.current_working_submap = new_submap
         print(f"Created new submap in {time.time() - t1:.2f} seconds")

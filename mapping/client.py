@@ -105,6 +105,17 @@ class MappingClient:
             time.sleep(poll)
         return False
 
+    def wait_captions(self, timeout=30.0, poll=0.5):
+        """等待 caption worker 消化完已入队关键帧（语义记忆追上 SLAM）。
+        返回 True 表示队列清空；超时返回 False（调用方继续，检索可能漏新帧）。"""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if int(self.get_state().get("caption_pending") or 0) <= 0:
+                return True
+            time.sleep(poll)
+        return False
+
     def get_latest_pose(self):
         """返回最新关键帧的 cam2world 4x4 位姿，尚无可位姿时返回 None。"""
         resp, _ = self._request({"cmd": "get_latest_pose"})
@@ -160,16 +171,14 @@ class MappingClient:
         return resp.get("intrinsics", [])
 
     def query_text(self, text, top_k=5):
-        """检索 top-K 关键帧。返回 [{frame_id, score, pose, ...}]。
-        clip_sam 后端为 CLIP 图文检索；semantic_memory 后端为 caption
-        文文检索（server 内部分流，客户端无感）。"""
+        """按 caption 检索 top-K 关键帧。
+        返回 [{frame_id, caption, score, pose, ...}]。"""
         resp, _ = self._request({"cmd": "query_text", "text": text,
                                  "top_k": top_k})
         return resp.get("results", [])
 
     def retrieve_captions(self, text, top_k=10):
-        """caption 语义记忆检索。返回 [{frame_id, caption, score, pose}]。
-        仅 semantic_memory 后端可用（旧后端返回空列表）。"""
+        """caption 语义记忆检索。返回 [{frame_id, caption, score, pose}]。"""
         resp, _ = self._request({"cmd": "retrieve_captions", "text": text,
                                  "top_k": top_k})
         return resp.get("results", [])
@@ -182,7 +191,8 @@ class MappingClient:
         return resp, payload
 
     def ground_object(self, text, top_k=3):
-        """SAM3 实例定位。返回 [{found, point, sam_score, frame_id, ...}]。"""
+        """caption 召回和 pointing 定位（不在探索阶段确认类别）。
+        返回 [{found, point, point_score, frame_id, ...}]。"""
         resp, _ = self._request({"cmd": "ground_object", "text": text,
                                  "top_k": top_k})
         return resp.get("results", [])
@@ -200,8 +210,7 @@ class MappingClient:
         return resp, payload
 
     def ground_frame(self, rgb, text):
-        """对当前实时帧做 SAM3 分割（到达前视觉确认）。
-        返回 {found, score, bbox, mask_ratio}。"""
+        """对当前实时帧做 VQA + pointing 到达确认。"""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         resp, _ = self._request(
             {"cmd": "ground_frame", "text": text,

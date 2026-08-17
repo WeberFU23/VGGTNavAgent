@@ -1,13 +1,13 @@
 """语义记忆：关键帧 caption 生成与文文检索（server 端，vggtslam 环境）。
 
-架构（替代 CLIP 图文检索）：
+架构：
 1. CaptionWorker：挂在子图处理完成后的挂点上，异步为每个关键帧生成
    查询无关的详细 caption（场景类型/房间 + 可见物体清单含颜色材质 +
    物体间空间关系）。经 VLLMGateway 调 Qwen2.5-VL-3B，优先级最低，
    GPU 忙（子图处理/pointing 在途）时让路。
 2. CaptionStore：{frame_id, 位姿, caption, embedding(BGE-M3)} 记忆库，
-   落盘持久化，支持按 episode 清空。检索 = 余弦相似度 top-K（文文匹配，
-   不用 CLIP text encoder——77 token 截断对长 caption 检索质量差）。
+   落盘持久化，支持按 episode 清空。检索使用 BGE-M3 文本向量和余弦
+   相似度 top-K，以支持较长 caption 和完整任务描述。
 
 CaptionStore 只用 numpy，可脱离 GPU/网络单测；Embedder/Gateway 均可
 mock 替换（权重缺失时 BGEM3Embedder 构造抛清晰错误，由上层降级）。
@@ -206,6 +206,10 @@ class CaptionWorker:
         self._queue = queue.Queue()
         self._closed = False
         self.errors = 0
+        # 语义记忆进度：已入队但尚未生成 caption 的关键帧（含在途处理）。
+        # agent 端据此判断检索是否会漏掉最新关键帧。
+        self._pending_ids = set()
+        self.last_completed_frame_id = None
         self._thread = threading.Thread(
             target=self._consume, name="caption-worker", daemon=True)
         self._thread.start()
@@ -216,6 +220,7 @@ class CaptionWorker:
             return
         if self.store.has(frame_id):
             return
+        self._pending_ids.add(int(frame_id))
         self._queue.put((int(frame_id), pil_img, pose))
 
     def clear(self):
@@ -225,9 +230,14 @@ class CaptionWorker:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
+        self._pending_ids.clear()
 
     def pending(self):
-        return self._queue.qsize()
+        """已入队但尚未完成 caption 的关键帧数。"""
+        return len(self._pending_ids)
+
+    def pending_frame_ids(self):
+        return sorted(self._pending_ids)
 
     def close(self):
         self._closed = True
@@ -262,7 +272,12 @@ class CaptionWorker:
                     raise VLLMError("caption 为空")
                 emb = self.embedder.encode([caption])[0]
                 self.store.add(frame_id, pose, caption, emb)
+                if self.last_completed_frame_id is None or \
+                        frame_id > self.last_completed_frame_id:
+                    self.last_completed_frame_id = frame_id
             except Exception as exc:  # noqa: BLE001 - 单帧失败不拖垮线程
                 self.errors += 1
                 print(f"[CaptionWorker] frame {frame_id} caption 失败: {exc}",
                       flush=True)
+            finally:
+                self._pending_ids.discard(frame_id)

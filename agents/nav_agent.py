@@ -1,13 +1,12 @@
-"""导航 agent：随机探索 -> FOUND-IT 式实例定位 -> 栅格规划 -> 路径跟随。
+"""多目标导航 agent：语义记忆 -> 实例定位 -> 栅格规划 -> 路径跟随。
 
 流程（多目标状态机）：
-1. EXPLORE：沿用 MappingAgent 的随机探索 + 喂图建图；每 NAV_QUERY_INTERVAL
-   步向 server 发 ground_object(目标短语)，命中（SAM 分数达标）则取出
-   3D 目标点。
+1. EXPLORE：持续建图并周期查询 caption 语义记忆；VLM pointing 命中后，
+   从 VGGT 点云 patch 恢复 3D 目标点并直接写入实例记忆。
 2. 拿到目标点后用点云构建 2D 占据栅格（agents/navigator.py），A* 规划，
    进入 NAV 模式沿路径输出离散动作。位姿锚定最新关键帧 + 航位推算，
    定期重建栅格并重规划（地图随探索增长，回环也会改写历史位姿）。
-3. 距目标点 < NAV_REACH_M 米时返回 TARGET_FOUND（评测阈值 1.0m，留裕量）。
+3. 距目标点足够近后执行当前帧 VQA、pointing 和视觉伺服，再报告目标。
 
 目标短语只来自公开 instruction（或显式 NAV_TARGET 调试覆盖），不读取
 query_program、GPS、深度或仿真器姿态。
@@ -16,21 +15,35 @@ query_program、GPS、深度或仿真器姿态。
     --agent agents.nav_agent:NavAgent
 """
 
+import io
 import math
 import os
 import re
 
 import numpy as np
+from PIL import Image
 
 from benchmark_api import Action
 from agents import navigator as nav
 from agents import planner
 from agents import skeleton as skel
-from agents.belief import BeliefMap
-from agents.evidence import ObservationLedger
 from agents.mapping_agent import MappingAgent
 from agents.memory import InstanceMemory
 from decision import DecisionLoop, DecisionTraceLogger, VLMDecisionClient
+
+# 实例入库时的实例级初始文本：pointing overlay + bbox 局部图 + 任务上下文。
+# 关键帧 caption 描述整张图像，不足以区分图中哪个物体被 pointing 命中。
+INSTANCE_TEXT_PROMPT = """You are labeling one object instance in the memory of
+an embodied navigation agent. Task instruction: "{task}".
+
+The first attached image is a pointing overlay: the marked point/patch is the
+detected object.{crop_line}
+Full-frame caption for context: "{caption}"
+
+Write a concise instance-level description (at most 2 sentences) of the marked
+object only: likely category, visual attributes (color, material, shape), its
+immediate surroundings, and any uncertainty about the detection. Do not
+describe the whole scene. Reply with plain text only."""
 
 
 class NavAgent(MappingAgent):
@@ -39,36 +52,20 @@ class NavAgent(MappingAgent):
         self.query_interval = int(os.environ.get("NAV_QUERY_INTERVAL", "20"))
         self.replan_interval = int(os.environ.get("NAV_REPLAN_INTERVAL", "20"))
         self.warmup_steps = int(os.environ.get("NAV_WARMUP_STEPS", "40"))
-        self.min_sam = float(os.environ.get("NAV_MIN_SAM", "0.5"))
-        self.verify_min = float(os.environ.get("NAV_VERIFY_MIN", "0.25"))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
         self.finish_patience = int(os.environ.get("NAV_FINISH_PATIENCE", "5"))
         self.finish_frontier_patience = int(os.environ.get(
             "NAV_FINISH_FRONTIER_PATIENCE", "3"))
         self.finish_map_stable_steps = int(os.environ.get(
             "NAV_FINISH_MAP_STABLE_STEPS", "100"))
-        self.instance_merge_m = float(os.environ.get(
-            "NAV_INSTANCE_MERGE_M", "0.75"))
         self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "5"))
-        # semantic_memory 后端（Phase 3）：pointing + 分级置信度 + 视觉伺服
-        self.semantic_backend = os.environ.get(
-            "NAV_SEMANTIC_BACKEND", "semantic_memory")
+        # 唯一语义链路：caption 检索 + pointing + 3D instance memory
         self.point_min_conf = float(os.environ.get("NAV_POINT_MIN_CONF", "0.5"))
-        self.confirm_min_obs = int(os.environ.get("NAV_CONFIRM_MIN_OBS", "2"))
-        self.min_target_pixels = float(os.environ.get(
-            "NAV_MIN_TARGET_PIXELS", "32"))
-        self.max_depth_std_m = float(os.environ.get(
-            "NAV_MAX_DEPTH_STD_M", "0.5"))
         self.servo_max_steps = int(os.environ.get("NAV_SERVO_MAX_STEPS", "8"))
         self.servo_area_ratio = float(os.environ.get(
             "NAV_SERVO_AREA_RATIO", "0.04"))
         self.servo_center_tol = float(os.environ.get(
             "NAV_SERVO_CENTER_TOL", "0.25"))
-        if self.semantic_backend == "semantic_memory":
-            print("[NavAgent] semantic_memory 后端：NAV_MIN_SAM 阈值已弃用，"
-                  "命中准入由 pointing 置信度与分级观测决定")
-        self.vlm_verify_conf = float(
-            os.environ.get("NAV_VLM_VERIFY_CONF", "0.50"))
         self.vlm = VLMDecisionClient.from_env()
         print(f"[NavAgent] VLM 战略层: "
               f"{'enabled (' + self.vlm.model + ')' if self.vlm.enabled else 'disabled'}")
@@ -80,16 +77,19 @@ class NavAgent(MappingAgent):
             if self.vlm.enabled:
                 self.decision_loop = DecisionLoop(
                     chat_fn=self.vlm.agentic_chat,
-                    tools={"query_memory": self._tool_query_memory,
-                           "look_at": self._tool_look_at},
+                    tools={"search_captions": self._tool_search_captions,
+                           "search_instances": self._tool_search_instances,
+                           "look_instance": self._tool_look_instance,
+                           "inspect_instance": self._tool_inspect_instance,
+                           "update_instance": self._tool_update_instance,
+                           "merge_instances": self._tool_merge_instances,
+                           "undo_merge": self._tool_undo_merge},
                     logger=DecisionTraceLogger(os.environ.get(
                         "NAV_DECIDER_LOG",
                         os.path.join(self.output_dir,
                                      "decision_trace.jsonl"))),
                     max_tool_rounds=int(os.environ.get(
-                        "NAV_DECIDER_MAX_TOOL_ROUNDS", "3")),
-                    finish_unexplored_max=float(os.environ.get(
-                        "NAV_FINISH_UNEXPLORED_MAX", "0.15")))
+                        "NAV_DECIDER_MAX_TOOL_ROUNDS", "3")))
             else:
                 print("[NavAgent] WARNING: NAV_DECIDER=vlm 但 VLM API 未配置，"
                       "回退规则决策")
@@ -101,6 +101,7 @@ class NavAgent(MappingAgent):
         self.target_text = None
         self.target_point = None        # 地图坐标（未缩放单位），(3,)
         self.target_candidate_id = None
+        self.target_instance_id = None
         self.follower = None
         self.grid = None
         self.align_R = None
@@ -108,18 +109,15 @@ class NavAgent(MappingAgent):
         self._last_plan_step = -10 ** 9
         self._last_anchor_step = -10 ** 9
         self._plan_failures = 0
-        self._verify_failures = 0
         self._scanning = False          # 到达后原地 360° 扫描确认中
         self._scan_steps = 0
-        self.memory = InstanceMemory()  # 多目标实例记忆（确认/访问/拉黑）
+        self._scan_images = []
+        self.memory = InstanceMemory()
         self._reported_count = 0
         self._no_hit_queries = 0
         self._target_mode = "any"
         self._target_count = None
         self._selected_evidence = None
-        # 分级置信度账本（semantic_memory 后端）：单帧观测->belief 锚点，
-        # 独立多帧观测->confirmed；clip_sam 后端不用。
-        self.ledger = ObservationLedger(min_obs=self.confirm_min_obs)
         # 末端视觉伺服状态
         self._servo_active = False
         self._servo_steps = 0
@@ -136,10 +134,6 @@ class NavAgent(MappingAgent):
             os.environ.get("NAV_EXPL_REPLAN_INTERVAL", "25"))
         self.explore_enabled = os.environ.get(
             "NAV_FRONTIER_EXPLORE", "1") == "1"
-        # 节点信念（CLIP 先验）引导探索排序
-        self.belief = BeliefMap()
-        self.explore_belief_weight = float(
-            os.environ.get("NAV_BELIEF_WEIGHT", "1.0"))
         self._frontier_empty_streak = 0
         self._last_frontier_count = None
         self._last_reachable_frontier_count = None
@@ -173,9 +167,8 @@ class NavAgent(MappingAgent):
             "", text, flags=re.IGNORECASE)
         text = re.sub(r"^(?:any|a|an|the)\s+", "", text,
                       flags=re.IGNORECASE)
-        # Quantifiers describe benchmark completion semantics, not the visual
-        # category passed to CLIP/SAM.  This matters when VLM parsing is not
-        # configured (for example, "exactly two baskets" -> "baskets").
+        # 数量词描述完成条件，不属于视觉目标短语，例如
+        # "exactly two baskets" -> "baskets"。
         text = re.sub(
             r"^(?:(?:exactly|at\s+least|at\s+most)\s+)?"
             r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+",
@@ -279,17 +272,10 @@ class NavAgent(MappingAgent):
         # 尺度：栅格尺规（相机离地 1.5m）比在线标定更直接
         scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
 
-        # 骨架拓扑：实例记忆挂载 + 节点信念更新
+        # 骨架拓扑只用于给实例附着可通行节点；语义判断交给 VLM。
         graph = skel.build_skeleton_graph(grid)
         if graph is not None:
             self.memory.attach_to_skeleton(graph)
-            self.belief.update(self.client, graph, self.target_text,
-                               self.align_R, observation.step_count)
-        if self.semantic_backend == "semantic_memory":
-            # 分级置信度 belief 锚点作为探索先验（打分骨架不动）
-            self.belief.set_external_anchors([
-                (a.point[:2], a.score)
-                for a in self.ledger.belief_anchors(self.target_text)])
 
         raw_clusters = skel.frontier_clusters(grid, min_size=5)
         try:
@@ -325,17 +311,14 @@ class NavAgent(MappingAgent):
                 np.asarray(path[i + 1]) - np.asarray(path[i])))
                 for i in range(len(path) - 1))
             path_cost_m = path_cost_units * scale if scale else path_cost_units
-            belief = self.belief.belief_at(c["world"], graph)
             key = self._frontier_key(c["world"], scale)
             failures = self._frontier_failures.get(key, 0)
             gain = max(float(c.get("information_gain", c["size"])), 1.0)
-            score = gain / (1.0 + path_cost_m) * \
-                (1.0 + self.explore_belief_weight * belief) / (1.0 + failures)
+            score = gain / (1.0 + path_cost_m) / (1.0 + failures)
             item = dict(c)
             item.update({
                 "path": grid.shortcut(path),
                 "path_cost_m": float(path_cost_m),
-                "semantic_hint": float(belief),
                 "failure_count": int(failures),
                 "utility": float(score),
                 "key": key,
@@ -425,12 +408,15 @@ class NavAgent(MappingAgent):
                               f"到达目标点附近且视觉确认通过，TARGET_FOUND "
                               f"(目标='{self.target_text}')")
                         action = self._confirm_and_report(observation)
-                    elif arrival == "reject":
-                        action = self._reject_current_target(observation)
+                    elif arrival == "explore":
+                        self._clear_current_target()
+                        self.mode = "explore"
+                        action = self._explore_action(observation)
                     else:
                         # 距离到了但当前朝向看不到目标：原地 360° 扫描确认
                         self._scanning = True
                         self._scan_steps = 0
+                        self._scan_images = []
                         action = int(Action.TURN_LEFT)
                 elif action is None:    # 路径走丢，退回探索
                     self.mode = "explore"
@@ -449,20 +435,18 @@ class NavAgent(MappingAgent):
     def _clear_current_target(self):
         self.target_point = None
         self.target_candidate_id = None
+        self.target_instance_id = None
         self.follower = None
         self.grid = None
         self._explore_follower = None
         self._plan_failures = 0
         self._scanning = False
+        self._scan_steps = 0
+        self._scan_images = []
         self._selected_evidence = None
         self._servo_active = False
         self._servo_steps = 0
         self._servo_last_bbox = None
-
-    def _merge_dist(self):
-        """实例合并/黑名单距离（统一对齐地图单位）。"""
-        scale = self.calibrator.current_scale() or 1.0
-        return getattr(self, "instance_merge_m", 0.75) / scale
 
     def _ensure_alignment(self):
         """每个 episode 固定一套重力对齐坐标，供地图、记忆、TSP 共用。"""
@@ -505,36 +489,22 @@ class NavAgent(MappingAgent):
                 pass
 
     def _report_found(self):
-        if self.target_point is not None:
-            node, _ = self.memory.add_or_merge(
-                self.target_text, self._aligned_point(self.target_point), 1.0,
-                merge_dist=self._merge_dist(), status="confirmed",
+        node = self.memory.get(self.target_instance_id)
+        if node is None and self.target_point is not None:
+            node, _ = self.memory.remember(
+                self._aligned_point(self.target_point),
+                text=f"Reported as satisfying task: {self.target_text}",
                 step=getattr(self, "_last_report_step", 0),
                 candidate_id=self.target_candidate_id)
-            self.memory.mark_visited(node)
-        self._reported_count += 1
+            self.target_instance_id = node.iid
+        if self.memory.mark_reported(node):
+            self._reported_count += 1
         self._no_hit_queries = 0
         self._log_event(f"reported TARGET_FOUND '{self.target_text}' "
                         f"(total {self._reported_count})")
         self.mode = "reported"
         self._scanning = False
         return int(Action.TARGET_FOUND)
-
-    def _reject_current_target(self, observation):
-        if self.target_point is not None:
-            node, is_new = self.memory.add_or_merge(
-                self.target_text, self._aligned_point(self.target_point), 0.0,
-                merge_dist=self._merge_dist(), status="rejected")
-            if not is_new:
-                self.memory.mark_rejected(node)
-            self.ledger.discard_near(
-                self.target_text, self._aligned_point(self.target_point),
-                self._merge_dist())
-        self._log_event(f"rejected candidate '{self.target_text}'")
-        print(f"[NavAgent] step={observation.step_count} VLM 拒绝当前候选")
-        self._clear_current_target()
-        self.mode = "explore"
-        return self._explore_action(observation)
 
     # ------------------------------------------------------------------
     # Phase 4：VLM 决策层（NAV_DECIDER=vlm，事件驱动，不进控制回路）
@@ -544,7 +514,7 @@ class NavAgent(MappingAgent):
         if len(self._events) > 50:
             self._events = self._events[-50:]
 
-    def _tool_query_memory(self, text):
+    def _tool_search_captions(self, text):
         """决策层只读工具：caption 语义记忆检索。"""
         try:
             results = self.client.retrieve_captions(text, top_k=5)
@@ -555,13 +525,139 @@ class NavAgent(MappingAgent):
                  "caption": str(r.get("caption", ""))[:300]}
                 for r in results]
 
-    def _tool_look_at(self, frame_id):
-        """决策层只读工具：取关键帧图像（JPEG bytes）。"""
+    def _tool_search_instances(self, keywords, reported=None, top_k=10):
+        """按VLM给出的关键词直接检索实例text；OR匹配，命中数排序。"""
+        if isinstance(keywords, str):
+            raw = keywords.replace(",", " ").split()
+        elif isinstance(keywords, (list, tuple)):
+            raw = keywords
+        else:
+            return {"error": "keywords must be a non-empty string array"}
+        terms = []
+        for value in raw:
+            term = str(value or "").strip().lower()
+            if term and term not in terms:
+                terms.append(term)
+        if not terms:
+            return {"error": "keywords must not be empty"}
+        if reported is not None and not isinstance(reported, bool):
+            return {"error": "reported must be true, false, or null"}
         try:
-            meta, payload = self.client.get_frame_image(frame_id)
-        except Exception:
+            limit = min(20, max(1, int(top_k)))
+        except (TypeError, ValueError):
+            return {"error": "top_k must be an integer"}
+        rows = []
+        for node in self.memory.nodes:
+            if reported is not None and node.reported != reported:
+                continue
+            haystack = node.text.lower()
+            matched = [term for term in terms if term in haystack]
+            if not matched:
+                continue
+            rows.append({
+                "id": node.iid,
+                "text": node.text,
+                "reported": node.reported,
+                "matched_keywords": matched,
+                "evidence_count": len(node.evidence),
+                "frame_ids": [item.get("frame_id")
+                              for item in node.evidence
+                              if item.get("frame_id") is not None],
+            })
+        rows.sort(key=lambda row: (-len(row["matched_keywords"]), row["id"]))
+        return rows[:limit]
+
+    def _tool_look_instance(self, instance_id):
+        """返回实例最相关的证据图；优先pointing overlay，回退关键帧。"""
+        node = self.memory.get(instance_id)
+        if node is None:
             return None
-        return payload if meta.get("found") else None
+        candidate_ids = [node.candidate_id] + [
+            item.get("candidate_id") for item in reversed(node.evidence)]
+        seen = set()
+        for candidate_id in candidate_ids:
+            if not candidate_id or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            try:
+                meta, payload = self.client.get_candidate_evidence(candidate_id)
+                if meta.get("found") and payload:
+                    return payload
+            except Exception:
+                pass
+        frame_ids = [node.frame_id] + [
+            item.get("frame_id") for item in reversed(node.evidence)]
+        seen.clear()
+        for frame_id in frame_ids:
+            if frame_id is None or frame_id in seen:
+                continue
+            seen.add(frame_id)
+            try:
+                meta, payload = self.client.get_frame_image(frame_id)
+                if meta.get("found") and payload:
+                    return payload
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _instance_tool_view(node):
+        if node is None:
+            return None
+        return {
+            "id": node.iid,
+            "point": [round(float(value), 3) for value in node.point],
+            "text": node.text,
+            "reported": node.reported,
+            "frame_id": node.frame_id,
+            "candidate_id": node.candidate_id,
+            "evidence": list(node.evidence),
+        }
+
+    def _tool_inspect_instance(self, instance_id):
+        node = self.memory.get(instance_id)
+        if node is None:
+            return {"error": f"instance {instance_id!r} not found"}
+        return self._instance_tool_view(node)
+
+    def _tool_update_instance(self, instance_id, text):
+        node = self.memory.update_text(instance_id, text)
+        if node is None:
+            return {"error": f"instance {instance_id!r} not found"}
+        self._log_event(f"VLM updated instance {node.iid}: {node.text[:120]}")
+        return self._instance_tool_view(node)
+
+    def _tool_merge_instances(self, instance_ids, text=""):
+        old_target = self.memory.get(self.target_instance_id)
+        merged = self.memory.merge(instance_ids, text=text)
+        if merged is None:
+            return {"error": "merge requires at least two existing instances"}
+        requested = {str(value) for value in (instance_ids or [])}
+        if old_target is not None and str(old_target.iid) in requested:
+            self.target_instance_id = merged.iid
+            self.target_point = self._raw_point(merged.point)
+            self.target_candidate_id = merged.candidate_id
+        self._log_event(f"VLM merged instances {sorted(requested)} -> {merged.iid}")
+        return self._instance_tool_view(merged)
+
+    def _tool_undo_merge(self):
+        """撤销最近一次 merge：恢复被合并实例的原始记录。"""
+        outcome = self.memory.undo_merge()
+        if outcome is None:
+            return {"error": "no merge to undo"}
+        keep = self.memory.get(outcome["keep_id"])
+        if keep is not None and self.target_instance_id == keep.iid:
+            # 当前导航目标是 keeper：坐标/候选随撤销一并回滚
+            self.target_point = self._raw_point(keep.point)
+            self.target_candidate_id = keep.candidate_id
+        self._log_event(
+            f"VLM undid merge -> kept {outcome['keep_id']}, "
+            f"restored {outcome['restored_ids']}")
+        return {
+            "kept": self._instance_tool_view(keep),
+            "restored": [self._instance_tool_view(self.memory.get(iid))
+                         for iid in outcome["restored_ids"]],
+        }
 
     def _build_decider_input(self, observation):
         """组装决策输入：世界状态 JSON + 俯视标注地图 PNG（编号一致）。"""
@@ -589,13 +685,8 @@ class NavAgent(MappingAgent):
                 map_png = render_topdown(
                     grid, trajectory=trajectory, pose=pose,
                     instances=[{"id": nd.iid, "xy": tuple(nd.point[:2]),
-                                "visited": nd.status == "visited"}
-                               for nd in self.memory.nodes
-                               if nd.status != "rejected"],
-                    anchors=[{"id": f"b{i}", "xy": tuple(a.point[:2])}
-                             for i, a in enumerate(
-                                 self.ledger.belief_anchors(
-                                     self.target_text))],
+                                "reported": nd.reported}
+                               for nd in self.memory.nodes],
                     frontiers=[{"id": f"f{i}", "xy": tuple(c["world"][:2])}
                                for i, c in enumerate(frontiers)])
             except Exception as exc:
@@ -607,17 +698,26 @@ class NavAgent(MappingAgent):
         """把决策结果映射到现有状态机动作（GOTO_INSTANCE/GOTO_FRONTIER）。
         底层跟随/避障/重规划仍由确定性模块执行。"""
         if result.action == "GOTO_INSTANCE" and result.target_id is not None:
-            for nd in self.memory.unvisited(self.target_text):
-                if str(nd.iid) == str(result.target_id):
-                    self.target_point = self._raw_point(nd.point)
-                    self.target_candidate_id = nd.candidate_id
-                    self._explore_follower = None
-                    self._active_frontier_key = None
-                    self._log_event(
-                        f"decider -> GOTO_INSTANCE {nd.iid}")
-                    if self._plan_to_target(observation):
-                        self.mode = "nav"
-                    return
+            nd = self.memory.get(result.target_id)
+            if nd is not None and not nd.reported:
+                self.target_instance_id = nd.iid
+                self.target_point = self._raw_point(nd.point)
+                self.target_candidate_id = nd.candidate_id
+                self._selected_evidence = None
+                if nd.candidate_id:
+                    try:
+                        meta, payload = self.client.get_candidate_evidence(
+                            nd.candidate_id)
+                        if meta.get("found"):
+                            self._selected_evidence = payload
+                    except Exception:
+                        pass
+                self._explore_follower = None
+                self._active_frontier_key = None
+                self._log_event(f"decider -> GOTO_INSTANCE {nd.iid}")
+                if self._plan_to_target(observation):
+                    self.mode = "nav"
+                return
         if result.action == "GOTO_FRONTIER" and result.target_id is not None:
             cluster = None
             for i, c in enumerate(self._last_frontier_clusters):
@@ -657,7 +757,9 @@ class NavAgent(MappingAgent):
             return False
         self._last_finish_decision_step = step
         state, map_png = self._build_decider_input(observation)
-        result = self.decision_loop.decide("finish_check", state, map_png)
+        result = self.decision_loop.decide(
+            "finish_check", state, map_png,
+            state_fn=lambda: self._build_decider_input(observation)[0])
         if result is None:
             return None                       # 回退规则
         print(f"[NavAgent] 决策层 finish_check: {result}")
@@ -666,11 +768,13 @@ class NavAgent(MappingAgent):
         self._apply_decider_steering(observation, result)
         return False
 
-    def _decider_next(self, observation, event):
+    def _decider_next(self, observation, event, images=None):
         """事件驱动咨询决策层。返回 (DecisionResult|None, action|None)。"""
         try:
             state, map_png = self._build_decider_input(observation)
-            result = self.decision_loop.decide(event, state, map_png)
+            result = self.decision_loop.decide(
+                event, state, map_png, images=images,
+                state_fn=lambda: self._build_decider_input(observation)[0])
         except Exception as exc:
             print(f"[NavAgent] 决策层调用失败，回退规则: {exc}")
             return None, None
@@ -694,17 +798,19 @@ class NavAgent(MappingAgent):
                             super()._explore_action(observation))
         if result.action == "EXPLORE":
             return result, super()._explore_action(observation)
-        return result, None                    # VERIFY：调用方继续采证
+        return result, None
 
-    def _choose_high_level_target(self, observation, event="world_state_updated"):
-        """统一高层选择：同时向 VLM 暴露 confirmed instances/frontiers。
+    def _choose_high_level_target(self, observation,
+                                  event="world_state_updated", images=None):
+        """统一高层选择：同时向 VLM 暴露 instances/frontiers。
 
         只有 VLM 不可用或输出非法时，才确定性回退到最近实例，再回退到
         最高 utility frontier。该回退不参与正常 VLM 决策。
         """
         self._plan_exploration(observation, select=False)
         if self.decision_loop is not None:
-            result, action = self._decider_next(observation, event)
+            result, action = self._decider_next(
+                observation, event, images=images)
             if result is not None:
                 return (action if action is not None else
                         super()._explore_action(observation))
@@ -718,7 +824,7 @@ class NavAgent(MappingAgent):
             from decision import DecisionResult
             self._apply_decider_steering(
                 observation, DecisionResult("GOTO_FRONTIER", "f0",
-                                            "deterministic fallback", 0.0))
+                                            "deterministic fallback"))
             action = self._explore_follow(observation)
             if action is not None:
                 return action
@@ -736,7 +842,7 @@ class NavAgent(MappingAgent):
             late = observation.step_count >= int(0.8 * observation.max_steps)
             frontier_fresh = observation.step_count - self._last_frontier_step \
                 <= 2 * self.explore_replan_interval
-            no_pending = not self.memory.unvisited(self.target_text)
+            no_pending = not self.memory.available()
             geometric_ready = \
                 self._reported_count > 0 and late and no_pending and \
                 self._no_hit_queries >= self.finish_patience and frontier_fresh and \
@@ -771,85 +877,111 @@ class NavAgent(MappingAgent):
             pass
 
     def _arrival_decision(self, observation):
-        """当前帧视觉确认（clip_sam: SAM3；semantic_memory: pointing+VQA
-        复核）后，再由 VLM 战略层核对完整语义属性。"""
+        """到达实例后取得当前视觉证据，再由决策 VLM 判断下一步。"""
         try:
             r = self.client.ground_frame(observation.rgb, self.target_text)
         except Exception as e:
             print(f"[NavAgent] ground_frame 失败: {e}")
             return "scan"
-        min_conf = self.point_min_conf \
-            if self.semantic_backend == "semantic_memory" else self.verify_min
         found = bool(r.get("found")) and \
-            r.get("score", 0.0) >= min_conf
+            r.get("score", 0.0) >= self.point_min_conf
         print(f"[NavAgent] 视觉确认: found={r.get('found')} "
               f"score={r.get('score', 0.0):.3f} -> {'通过' if found else '未过'}")
         if not found:
             return "scan"
+        node = self.memory.get(self.target_instance_id)
+        if node is not None:
+            self.memory.add_evidence(node.iid, {
+                "frame_id": r.get("frame_id"),
+                "source": "arrival_grounding",
+                "point_score": round(float(r.get("score", 0.0)), 3),
+                "bbox": r.get("bbox"),
+            })
         if self.decision_loop is None:
             return "report_found"
         state, map_png = self._build_decider_input(observation)
-        state["arrival"] = {
+        arrival_info = {
             "target_candidate_id": self.target_candidate_id,
             "grounding_found": found,
             "grounding_score": round(float(r.get("score", 0.0)), 3),
             "scan_step": self._scan_steps if self._scanning else 0,
         }
+        state["arrival"] = arrival_info
+
+        def refresh_state():
+            new_state, _ = self._build_decider_input(observation)
+            new_state["arrival"] = dict(arrival_info)
+            return new_state
+
         images = [("current_observation",
                    self.vlm.encode_rgb(observation.rgb))]
         if self._selected_evidence:
             images.append(("selected_candidate", self._selected_evidence))
         result = self.decision_loop.decide(
-            "arrival", state, map_png=map_png, images=images)
+            "arrival", state, map_png=map_png, images=images,
+            state_fn=refresh_state)
         if result is None:
-            return "report_found"
-        print(f"[NavAgent] VLM 到达复核: {result.action} "
-              f"conf={result.confidence:.2f} reason={result.reason}")
-        if result.action == "REPORT_FOUND" and \
-                result.confidence < self.vlm_verify_conf:
             return "scan"
-        return {"REPORT_FOUND": "report_found", "REJECT": "reject",
-                "SCAN": "scan"}.get(result.action, "scan")
+        print(f"[NavAgent] VLM 到达复核: {result.action} "
+              f"reason={result.reason}")
+        return {"REPORT_FOUND": "report_found", "SCAN": "scan",
+                "EXPLORE": "explore"}.get(result.action, "scan")
 
     def _handle_scan(self, observation):
-        """360° 原地扫描：每步先确认当前帧，未过继续转；
-        转满一圈仍未确认则拉黑当前目标点、退回探索。"""
-        arrival = self._arrival_decision(observation)
-        if arrival == "report_found":
-            print(f"[NavAgent] step={observation.step_count} 扫描第 "
-                  f"{self._scan_steps + 1} 帧确认通过，TARGET_FOUND "
-                  f"(目标='{self.target_text}')")
-            return self._confirm_and_report(observation)
-        if arrival == "reject":
-            return self._reject_current_target(observation)
+        """通用 360° 环视：只建图并均匀保存图像，不验证当前实例。"""
+        if self._scan_steps % 3 == 0 and len(self._scan_images) < 4:
+            self._scan_images.append(self.vlm.encode_rgb(observation.rgb))
         self._scan_steps += 1
         if self._scan_steps < 12:
             return int(Action.TURN_LEFT)
         self._scanning = False
-        self._verify_failures += 1
-        self._log_event(f"360 scan failed for '{self.target_text}', "
-                        f"blacklisted ({self._verify_failures} total)")
-        print(f"[NavAgent] step={observation.step_count} 360° 扫描未确认，"
-              f"拉黑目标点（累计 {self._verify_failures} 次）")
-        if self.target_point is not None:
-            node, is_new = self.memory.add_or_merge(
-                self.target_text, self._aligned_point(self.target_point), 0.0,
-                merge_dist=self._merge_dist(), status="rejected")
-            if not is_new:
-                self.memory.mark_rejected(node)
-            self.ledger.discard_near(
-                self.target_text, self._aligned_point(self.target_point),
-                self._merge_dist())
+        return self._scan_complete_decision(observation)
+
+    def _scan_complete_decision(self, observation):
+        """环视结束后刷新 task-relevant 实例，再进行一次全局高层决策。"""
+        images = [(f"panorama_view_{i}", value)
+                  for i, value in enumerate(self._scan_images)]
+        origin_instance = self.target_instance_id
+        self._log_event(
+            f"panoramic scan complete near instance {origin_instance}; "
+            f"captured {len(images)} views")
         self._clear_current_target()
         self.mode = "explore"
-        return self._explore_action(observation)
+        phrase = self.target_text or self._target_phrase(observation)
+        self.target_text = phrase
+        self._ensure_alignment()
+        self._refresh_memory_candidates()
+        # 环视期间的新关键帧可能还在 caption 队列里；先等语义记忆追上，
+        # 否则紧接的检索会漏掉刚看到的场景（有界等待，超时继续）。
+        self._wait_for_captions()
+        try:
+            results = self.client.ground_object(
+                phrase, top_k=self.ground_top_k)
+            hits = [item for item in results if item.get("found")]
+        except Exception as exc:
+            self._log_event(f"post-scan memory refresh failed: {exc}")
+            hits = []
+        if hits:
+            self._ingest_semantic_hits(observation, hits, select=False)
+        else:
+            self._no_hit_queries += 1
+        return self._choose_high_level_target(
+            observation, "scan_complete", images=images)
 
-    def _is_bad_point(self, point):
-        """目标点是否接近已拒绝/已访问实例（默认 0.75m，可配置）。"""
-        dist = self._merge_dist()
-        aligned = self._aligned_point(point)
-        return self.memory.is_rejected(self.target_text, aligned, dist) or \
-            self.memory.is_visited(self.target_text, aligned, dist)
+    def _wait_for_captions(self):
+        """检索前等待 caption worker 消化已入队关键帧（有界等待）。
+
+        环视/建图产生的新关键帧由异步 caption worker 处理；不等待直接
+        检索会漏掉刚看到的场景。超时或服务端不支持该状态时继续。"""
+        wait_s = float(os.environ.get("NAV_CAPTION_WAIT_S", "30"))
+        if wait_s <= 0:
+            return
+        try:
+            if not self.client.wait_captions(timeout=wait_s):
+                self._log_event(
+                    "caption backlog not drained before retrieval")
+        except Exception:
+            pass
 
     def _order_by_route(self, eligible):
         """候选实例按开路径 TSP 重排（欧氏距离近似），失败时保持原序。"""
@@ -893,8 +1025,8 @@ class NavAgent(MappingAgent):
             return None
 
     def _ordered_memory_nodes(self):
-        """从持久 confirmed memory 产生当前模式的真实规划序列。"""
-        instances = self.memory.unvisited(self.target_text)
+        """从未报告实例记忆产生确定性回退规划序列。"""
+        instances = self.memory.available()
         if not instances:
             return []
         start = self._current_aligned_xy()
@@ -922,100 +1054,145 @@ class NavAgent(MappingAgent):
         if not nodes:
             return False
         selected = nodes[0]
+        self.target_instance_id = selected.iid
         self.target_point = self._raw_point(selected.point)
         self.target_candidate_id = selected.candidate_id
         self._selected_evidence = None
         self._no_hit_queries = 0
         self._explore_follower = None
-        print(f"[NavAgent] 从实例记忆选择 #{selected.iid} "
-              f"confidence={selected.score:.3f}")
+        print(f"[NavAgent] 从实例记忆选择 #{selected.iid}: "
+              f"{selected.text[:80]}")
         if self._plan_to_target(observation):
             self.mode = "nav"
         return True
 
     # ------------------------------------------------------------------
-    # EXPLORE：semantic_memory 命中准入（分级置信度）
+    # EXPLORE：pointing 命中直接写入统一 instance memory
     # ------------------------------------------------------------------
-    def _ingest_semantic_hits(self, observation, hits):
-        """pointing 命中 -> 观测账本：单帧 belief 锚点 / 多帧独立观测升级
-        confirmed 进 TSP；小/远目标强制留 belief 当探索先验。"""
+    def _ingest_semantic_hits(self, observation, hits, select=True):
+        """每个具有有限 3D 点的 pointing 结果都成为可导航实例。"""
         step = observation.step_count
-        scale = self.calibrator.current_scale() or 1.0
-        self.ledger.min_pose_sep = 0.5 / scale
-        hits.sort(key=lambda r: r.get("point_score", r.get("sam_score", 0.0)),
-                  reverse=True)
-        any_confirmed = False
-        n_belief = 0
+        hits.sort(key=lambda r: r.get("point_score", 0.0), reverse=True)
+        changed = []
         for h in hits:
-            conf = h.get("point_score", h.get("sam_score", 0.0))
-            if conf < self.point_min_conf:
+            if "point" not in h:
                 continue
             pt = np.asarray(h["point"], dtype=np.float64)
-            if self._is_bad_point(pt):
+            if pt.shape != (3,) or not np.all(np.isfinite(pt)):
                 continue
             aligned = self._aligned_point(pt)
-            outcome, anchor = self.ledger.add_observation(
-                self.target_text, aligned, conf,
-                merge_dist=self._merge_dist(),
+            caption = str(h.get("text") or h.get("caption") or "").strip()
+            initial_text = caption or (
+                f"Pointed candidate retrieved for task query: {self.target_text}")
+            evidence = {
+                "frame_id": h.get("frame_id"),
+                "candidate_id": h.get("candidate_id"),
+                "source": "semantic_pointing",
+                "point_score": round(float(h.get("point_score", 0.0)), 3),
+                "bbox": h.get("bbox"),
+                "depth_std": h.get("depth_std"),
+            }
+            node, is_new = self.memory.remember(
+                aligned, text=initial_text, evidence=[evidence],
                 frame_id=h.get("frame_id"), step=step,
-                obs_xy=self._hit_obs_xy(h),
-                force_belief=self._is_small_or_far(h, scale))
-            if outcome == "confirmed":
-                node, _ = self.memory.add_or_merge(
-                    self.target_text, anchor.point, anchor.score,
-                    merge_dist=self._merge_dist(), status="confirmed",
-                    frame_id=h.get("frame_id"), step=step,
-                    candidate_id=h.get("candidate_id"))
-                node.n_obs = anchor.n_obs
-                self.ledger.discard(anchor)
-                any_confirmed = True
-                print(f"[NavAgent] step={step} 实例经 {anchor.n_obs} 帧独立"
-                      f"观测升级 confirmed（conf={anchor.score:.2f}）")
-            elif outcome == "belief":
-                n_belief += 1
-        if not any_confirmed:
+                candidate_id=h.get("candidate_id"))
+            if is_new:
+                self._generate_instance_text(node, h)
+            changed.append((node.iid, is_new))
+        if not changed:
             self._no_hit_queries += 1
-        print(f"[NavAgent] step={step} '{self.target_text}' "
-              f"新增 belief 锚点 {n_belief} 个"
-              f"（confirmed={'有' if any_confirmed else '无'}）")
-        if any_confirmed:
+            return None
+        self._no_hit_queries = 0
+        ids = ", ".join(f"#{iid}{' new' if fresh else ''}"
+                        for iid, fresh in changed)
+        self._log_event(f"pointing updated instances {ids}")
+        print(f"[NavAgent] step={step} 3D 实例记忆更新: {ids}")
+        if select:
             return self._choose_high_level_target(
                 observation, "world_state_updated")
         return None
 
-    def _hit_obs_xy(self, hit):
-        """命中帧的拍照位姿（对齐地图坐标 xy），用于独立观测判定。"""
-        pose = hit.get("pose")
-        if pose is None or self.align_R is None:
-            return None
-        pose = np.asarray(pose, dtype=np.float64)
-        if pose.shape != (4, 4):
-            return None
-        return (pose[:3, 3] @ self.align_R.T)[:2]
+    # ------------------------------------------------------------------
+    # 实例级初始文本
+    # ------------------------------------------------------------------
+    def _generate_instance_text(self, node, hit):
+        """新实例入库后生成实例级初始描述。
 
-    def _is_small_or_far(self, hit, scale):
-        """小/远目标两段式：目标像素占比小或 patch 深度方差大时，
-        不登记发现，降级 belief 锚点，逼近后复核。"""
+        输入 pointing overlay（优先）与 bbox 局部裁剪图，结合任务文本与
+        关键帧 caption。VLM 不可用、无图像证据或调用失败时，保留入库时
+        的 caption 文本，不影响主流程。"""
+        vlm = getattr(self, "vlm", None)
+        chat_text = getattr(vlm, "chat_text", None)
+        if vlm is None or not getattr(vlm, "enabled", False) or \
+                chat_text is None:
+            return
+        images = []
+        candidate_id = hit.get("candidate_id") or node.candidate_id
+        if candidate_id:
+            try:
+                meta, payload = self.client.get_candidate_evidence(
+                    candidate_id)
+                if meta.get("found") and payload:
+                    images.append(("pointing_overlay", payload))
+            except Exception:
+                pass
+        crop = self._instance_crop(hit)
+        if crop:
+            images.append(("instance_crop", crop))
+        if not images:
+            return
+        prompt = INSTANCE_TEXT_PROMPT.format(
+            task=self.target_text or "",
+            crop_line=(" The second image is a cropped close-up around the "
+                       "detection box." if crop else ""),
+            caption=str(hit.get("text") or hit.get("caption") or "")[:500])
+        try:
+            text = chat_text(prompt, images)
+        except Exception:
+            text = None
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.memory.update_text(node.iid, text)
+        self._log_event(f"instance {node.iid} described: {text[:120]}")
+
+    def _instance_crop(self, hit, margin=0.35):
+        """从源关键帧裁出 pointing bbox 局部图（JPEG 字节）；失败 None。"""
         bbox = hit.get("bbox")
-        if bbox is not None:
-            side = max(float(bbox[2]) - float(bbox[0]),
-                       float(bbox[3]) - float(bbox[1]))
-            if side < self.min_target_pixels:
-                return True
-        depth_std = hit.get("depth_std")
-        if depth_std is not None and depth_std * scale > self.max_depth_std_m:
-            return True
-        return False
+        frame_id = hit.get("frame_id")
+        if not bbox or frame_id is None:
+            return None
+        try:
+            meta, payload = self.client.get_frame_image(frame_id)
+            if not meta.get("found") or not payload:
+                return None
+            image = Image.open(io.BytesIO(payload)).convert("RGB")
+            w, h = image.size
+            x0, y0, x1, y1 = (float(v) for v in list(bbox)[:4])
+            if max(x0, y0, x1, y1) <= 1.5:      # 归一化坐标
+                x0, x1 = x0 * w, x1 * w
+                y0, y1 = y0 * h, y1 * h
+            bw, bh = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+            box = (max(0, int(x0 - bw * margin)),
+                   max(0, int(y0 - bh * margin)),
+                   min(w, int(x1 + bw * margin)),
+                   min(h, int(y1 + bh * margin)))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return None
+            crop = image.crop(box)
+            crop.thumbnail((512, 512))
+            buffer = io.BytesIO()
+            crop.save(buffer, format="JPEG", quality=85)
+            return buffer.getvalue()
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
-    # 末端视觉伺服（semantic_memory 后端）
+    # 末端视觉伺服
     # ------------------------------------------------------------------
     def _confirm_and_report(self, observation):
-        """确认通过 -> TARGET_FOUND。semantic_memory 后端先进入末端视觉
-        伺服：最后一段逼近不看坐标看图像，把 benchmark 0.25m 判定与
-        SLAM 0.33-1.0m 误差解耦；超限/异常退回坐标判定。"""
-        if self.semantic_backend == "semantic_memory" and \
-                not self._servo_active:
+        """确认通过后进入视觉伺服，再报告 TARGET_FOUND。"""
+        if not self._servo_active:
             self._servo_active = True
             self._servo_steps = 0
             self._servo_last_bbox = None
@@ -1024,19 +1201,25 @@ class NavAgent(MappingAgent):
 
     def _servo_step(self, observation):
         """视觉伺服一步：目标近且居中 -> TARGET_FOUND；否则对中/逼近；
-        超 NAV_SERVO_MAX_STEPS 步退回坐标判定（已在 0.8m 到达圈内）。"""
+        超出步数或感知异常时转入扫描，不凭坐标直接报告。"""
         self._servo_steps += 1
         if self._servo_steps > self.servo_max_steps:
             print(f"[NavAgent] step={observation.step_count} "
-                  f"伺服超 {self.servo_max_steps} 步，退回坐标判定")
+                  f"伺服超 {self.servo_max_steps} 步，转入扫描")
             self._servo_active = False
-            return self._report_found()
+            self._scanning = True
+            self._scan_steps = 0
+            self._scan_images = []
+            return int(Action.TURN_LEFT)
         try:
             r = self.client.ground_frame(observation.rgb, self.target_text)
         except Exception as e:
-            print(f"[NavAgent] 伺服 ground_frame 失败: {e}，退回坐标判定")
+            print(f"[NavAgent] 伺服 ground_frame 失败: {e}，转入扫描")
             self._servo_active = False
-            return self._report_found()
+            self._scanning = True
+            self._scan_steps = 0
+            self._scan_images = []
+            return int(Action.TURN_LEFT)
         bbox = r.get("bbox")
         if r.get("found") and bbox:
             self._servo_last_bbox = bbox
@@ -1098,30 +1281,7 @@ class NavAgent(MappingAgent):
             print(f"[NavAgent] step={step} 未定位到 '{phrase}'")
             return self._choose_high_level_target(
                 observation, "world_state_updated")
-        if self.semantic_backend == "semantic_memory":
-            return self._ingest_semantic_hits(observation, hits)
-        # 按 SAM 分数排序，跳过黑名单（扫描确认失败过）的目标点
-        hits.sort(key=lambda r: r.get("sam_score", 0.0), reverse=True)
-        eligible = []
-        for h in hits:
-            pt = np.asarray(h["point"], dtype=np.float64)
-            if h.get("sam_score", 0.0) >= self.min_sam and \
-                    not self._is_bad_point(pt):
-                eligible.append(h)
-        if not eligible:
-            self._no_hit_queries += 1
-            print(f"[NavAgent] step={step} '{phrase}' 命中均被拉黑或分数不足")
-            return None
-        # 所有当前命中先写入 confirmed memory；planner 随后对持久集合规划，
-        # 而不是只对这一次查询的临时候选排序。
-        for hit in eligible:
-            self.memory.add_or_merge(
-                self.target_text, self._aligned_point(hit["point"]),
-                hit.get("sam_score", 0.0), merge_dist=self._merge_dist(),
-                status="confirmed", frame_id=hit.get("frame_id"),
-                step=step, candidate_id=hit.get("candidate_id"))
-        return self._choose_high_level_target(
-            observation, "world_state_updated")
+        return self._ingest_semantic_hits(observation, hits)
 
     # ------------------------------------------------------------------
     # 规划

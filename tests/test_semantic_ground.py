@@ -116,7 +116,7 @@ class _MockStore:
 
 
 class _MockPointer:
-    """fid==2 的帧复核通过并 point 出一个像素；其余帧复核拒绝。"""
+    """探索 grounding 对每个召回帧直接 point；到达复核仍可用 verify。"""
 
     def __init__(self):
         self.verify_calls = []
@@ -134,7 +134,6 @@ class _MockPointer:
 
 def _make_server():
     srv = MappingServer.__new__(MappingServer)
-    srv.semantic_backend = "semantic_memory"
     srv.retrieve_top_k = 10
     srv.point_patch = 11
     srv.embedder = _MockEmbedder()
@@ -165,18 +164,18 @@ def test_semantic_ground_end_to_end():
     results = out["results"]
     # K 被 NAV_RETRIEVE_TOP_K 召回优先放大，但 store 只有 2 条
     found = [r for r in results if r.get("found")]
-    rejected = [r for r in results if not r.get("found")]
-    assert len(found) == 1
-    assert len(rejected) == 1                       # fid=1 被复核拒绝
-    hit = found[0]
+    assert len(found) == 2                         # 探索阶段不预先 VQA 拒绝
+    assert srv.pointer.verify_calls == []
+    hit = found[1]
     assert hit["frame_id"] == 2
     # patch 深度采样：先 conf 过滤再取中位数 -> 平面网格 (10, 10, 2)
     np.testing.assert_allclose(hit["point"], [10.0, 10.0, 2.0], atol=0.6)
-    # 输出格式与旧链路同构
-    for key in ("candidate_id", "sam_score", "bbox", "num_points", "point"):
+    for key in ("candidate_id", "point_score", "bbox", "num_points", "point"):
         assert key in hit
-    assert hit["sam_score"] == pytest.approx(0.8)   # = pointing 置信
-    assert srv._ground_candidates[hit["candidate_id"]]["kind"] == "point"
+    assert hit["text"] == "a gray fabric sofa"
+    assert hit["point_score"] == pytest.approx(0.8)
+    assert srv._ground_candidates[hit["candidate_id"]]["point_score"] == \
+        pytest.approx(0.8)
 
 
 def test_semantic_ground_disabled_without_models():

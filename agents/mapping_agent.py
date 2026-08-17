@@ -119,7 +119,7 @@ class MappingAgent:
             ch, cw = int(h * crop_frac), int(w * crop_frac)
             y0, x0 = (h - ch) // 2, (w - cw) // 2
             rgb = rgb[y0:y0 + ch, x0:x0 + cw]
-        # 诊断：逐帧保存喂给 SLAM/CLIP 的 RGB（默认与原观测一致）。
+        # 诊断：逐帧保存喂给 SLAM/语义记忆的 RGB（默认与原观测一致）。
         # server 端 feed_frame 也会全量保存；此处为 agent 侧冗余。
         if getattr(self, "_frame_save_dir", None):
             try:

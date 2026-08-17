@@ -185,10 +185,10 @@ def test_deterministic_candidate_fallback():
     agent.target_text = "tv"
     agent.align_R = np.eye(3)
     agent._target_mode = "any"
-    n1, _ = agent.memory.add_or_merge(
-        "tv", [0, 0, 0], 0.8, 0.5, candidate_id="c1", frame_id=1)
-    n2, _ = agent.memory.add_or_merge(
-        "tv", [2, 0, 0], 0.9, 0.5, candidate_id="c2", frame_id=2)
+    n1, _ = agent.memory.remember(
+        [0, 0, 0], "TV candidate", candidate_id="c1", frame_id=1)
+    n2, _ = agent.memory.remember(
+        [2, 0, 0], "TV candidate", candidate_id="c2", frame_id=2)
     agent._ordered_memory_nodes = lambda: [n1, n2]
     agent._plan_to_target = lambda obs: False
     obs = SimpleNamespace(
@@ -208,9 +208,8 @@ def test_runtime_memory_route_uses_persistent_instances():
     agent._reported_count = 0
     agent._current_aligned_xy = lambda: (0.0, 0.0)
     for x in (10.0, 2.0, 5.0):
-        agent.memory.add_or_merge(
-            "bag", [x, 0, 0], 0.9, 0.5,
-            status="confirmed", candidate_id=f"c{x}")
+        agent.memory.remember(
+            [x, 0, 0], "bag candidate", candidate_id=f"c{x}")
     ordered = agent._ordered_memory_nodes()
     assert [float(nd.point[0]) for nd in ordered] == [2.0, 5.0]
 
@@ -416,19 +415,3 @@ if __name__ == "__main__":
     test_freespace_connectivity()
     test_frame_points_freespace()
     print("ALL TESTS PASSED")
-
-
-
-
-def test_expand_prompts_basket():
-    """basket 同义词展开 + 复数归一化（"baskets" 也能匹配 "basket" 条目）。"""
-    from mapping.semantic import Sam3Grounder
-    g = Sam3Grounder()
-    out = g.expand_prompts("basket")
-    assert out[0] == "basket"
-    assert "laundry basket" in out and "storage basket" in out and "hamper" in out
-    out2 = g.expand_prompts("baskets")
-    assert out2[0] == "baskets"
-    assert "laundry baskets" in out2
-    # 无同义词的类别保持原样
-    assert g.expand_prompts("sink") == ["sink"]

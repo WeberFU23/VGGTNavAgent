@@ -1,8 +1,8 @@
 """俯视标注地图渲染（Phase 4a，agent 端，仅依赖 numpy + PIL）。
 
 占据栅格 -> 俯视图 PNG：free 白 / obstacle 黑 / unknown 灰；叠加历史
-轨迹（红折线）、当前位姿箭头（蓝）、confirmed 实例（绿编号实线圈）、
-belief 锚点（橙编号虚线圈）、frontier（紫编号十字）。编号与决策状态
+轨迹（红折线）、当前位姿箭头（蓝）、3D 实例（绿编号圆）、
+frontier（紫编号十字）。编号与决策状态
 JSON 中的 id 严格一一对应（由调用方传入同一个 id）。
 """
 
@@ -15,19 +15,17 @@ from PIL import Image, ImageDraw
 _COLOR_TRAJECTORY = (220, 40, 40)
 _COLOR_POSE = (40, 80, 220)
 _COLOR_INSTANCE = (30, 160, 60)
-_COLOR_ANCHOR = (230, 150, 30)
 _COLOR_FRONTIER = (150, 60, 200)
 
 
 def render_topdown(grid, trajectory=None, pose=None, instances=None,
-                   anchors=None, frontiers=None, pixels_per_cell=4):
+                   frontiers=None, pixels_per_cell=4):
     """渲染俯视标注地图，返回 PNG bytes。
 
     grid: OccupancyGrid（free/obstacle (H,W) bool，[y, x] 索引）；
     trajectory: [(x, y), ...] 世界坐标折线；
     pose: (x, y, yaw) 当前位姿（yaw 为对齐地图系朝向，弧度）；
-    instances: [{"id", "xy", "visited"}] confirmed/visited 实例；
-    anchors: [{"id", "xy"}] belief 锚点；
+    instances: [{"id", "xy", "reported"}] 3D 实例；
     frontiers: [{"id", "xy"}] 探索前沿。
     """
     free = np.asarray(grid.free)
@@ -59,20 +57,13 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
         draw.line([(x, y - r), (x, y + r)], fill=_COLOR_FRONTIER, width=2)
         draw.text((x + r + 1, y - r), str(fr["id"]), fill=_COLOR_FRONTIER)
 
-    # belief 锚点：编号虚线圈
-    for a in anchors or []:
-        x, y = to_px(a["xy"])
-        r = max(5, ppc * 2)
-        _dashed_circle(draw, (x, y), r, _COLOR_ANCHOR)
-        draw.text((x + r + 1, y - r), str(a["id"]), fill=_COLOR_ANCHOR)
-
-    # confirmed 实例：编号实线圈（visited 画叉）
+    # 3D 实例：编号圆（已报告画叉）
     for inst in instances or []:
         x, y = to_px(inst["xy"])
         r = max(5, ppc * 2)
         draw.ellipse([x - r, y - r, x + r, y + r],
                      outline=_COLOR_INSTANCE, width=2)
-        if inst.get("visited"):
+        if inst.get("reported"):
             draw.line([(x - r, y - r), (x + r, y + r)],
                       fill=_COLOR_INSTANCE, width=2)
             draw.line([(x - r, y + r), (x + r, y - r)],
@@ -92,12 +83,3 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
     buf = io.BytesIO()
     pil.save(buf, format="PNG")
     return buf.getvalue()
-
-
-def _dashed_circle(draw, center, r, color, segments=12, duty=0.55):
-    x, y = center
-    step = 360.0 / segments
-    for i in range(segments):
-        a0 = i * step
-        a1 = a0 + step * duty
-        draw.arc([x - r, y - r, x + r, y + r], a0, a1, fill=color, width=2)

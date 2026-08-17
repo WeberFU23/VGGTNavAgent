@@ -1,8 +1,8 @@
-"""VLM pointing 定位：替代 SAM3 mask 投影（server 端，vggtslam 环境）。
+"""VLM pointing 定位（server 端，vggtslam 环境）。
 
-链路：retrieve_captions 粗筛 → verify_frame 查询条件化复核（逐条核对
-属性，滤假阳性帧）→ point 输出目标像素（point 优先，bbox 只作交叉
-验证：point 落在 bbox 外则降置信；一次调用允许返回多个实例点）→
+链路：探索时 retrieve_captions 粗筛 → point 输出目标像素（point 优先，
+bbox 只作交叉验证：point 落在 bbox 外则降置信；一次调用允许返回多个
+实例点）；到达实例后才调用 verify_frame 做查询条件化复核。随后由
 sample_point_depth 在像素周围 patch 内先按 VGGT confidence 过滤低分
 点再取中位数，得 3D 点。
 
@@ -148,8 +148,7 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
 
     先按 conf 过滤低分点再取中位数。返回 {found, point, num_points,
     depth_std, spread}；depth_std 是 patch 内点到相机原点距离的标准差
-    （cam_origin 缺省时用世界原点），用于"深度方差过大 → 降级 belief"
-    的小/远目标两段式判定。
+    （cam_origin 缺省时用世界原点），作为实例的几何证据供 VLM 判断。
     """
     points = np.asarray(points_hw3, dtype=np.float64)
     conf = np.asarray(conf_mask_hw, dtype=bool)

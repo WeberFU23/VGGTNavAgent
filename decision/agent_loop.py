@@ -179,10 +179,8 @@ class DecisionLoop:
         """一次事件驱动决策。返回 DecisionResult；最终非法/模型不可用
         返回 None（调用方回退确定性规则）。
 
-        state_fn: 可选无参回调，在写工具（update_instance/merge_instances）
-        成功执行后调用，返回重新生成的 world-state dict；之后的动作校验、
-        FINISH 强制与日志都基于刷新后的状态，避免 VLM 选择已被合并删除
-        或状态改变的实例。"""
+        state_fn: 可选无参回调，在写工具成功后调用。可返回重新生成的
+        world-state dict，或 (world-state, map_png)；后者会同时替换旧地图。"""
         state = world_state
         prompt = self._build_prompt(event, state)
         images = list(images or [])
@@ -206,7 +204,13 @@ class DecisionLoop:
                     images.append(("tool_instance_evidence", tool_img))
                 if ok and state_fn is not None and \
                         str(tool_call.get("name") or "") in WRITE_TOOLS:
-                    state = self._refresh_state(state_fn, state)
+                    state, refreshed_map, has_map = self._refresh_context(
+                        state_fn, state)
+                    if has_map:
+                        images = [(name, value) for name, value in images
+                                  if name != "topdown_map"]
+                        if refreshed_map:
+                            images.append(("topdown_map", refreshed_map))
                     prompt += ("\n\nWorld state after your write:\n"
                                + json.dumps(state, ensure_ascii=False))
                 continue
@@ -235,13 +239,20 @@ class DecisionLoop:
         return None
 
     @staticmethod
-    def _refresh_state(state_fn, fallback):
-        """写工具后重新生成 world-state；失败时保留调用前状态。"""
+    def _refresh_context(state_fn, fallback):
+        """写工具后刷新状态及可选地图；失败时保留调用前上下文。"""
         try:
             refreshed = state_fn()
         except Exception:
-            return fallback
-        return refreshed if isinstance(refreshed, dict) else fallback
+            return fallback, None, False
+        if isinstance(refreshed, tuple) and len(refreshed) == 2:
+            state, map_png = refreshed
+            if isinstance(state, dict):
+                return state, map_png, True
+            return fallback, None, False
+        if isinstance(refreshed, dict):
+            return refreshed, None, False
+        return fallback, None, False
 
     # ------------------------------------------------------------------
     def _build_prompt(self, event, world_state):

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+from benchmark_api import Action
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -191,6 +192,26 @@ def test_write_tool_refreshes_world_state_before_validation():
         "World state after your write")[-1]
 
 
+def test_write_tool_refreshes_topdown_map_image():
+    old_map = b"old-map"
+    new_map = b"new-map"
+    chat = _ScriptedChat([
+        {"tool_call": {"name": "update_instance", "instance_id": 1,
+                       "text": "updated basket"}},
+        {"action": "GOTO_INSTANCE", "target_id": "1"},
+    ])
+    loop = DecisionLoop(chat, tools={
+        "update_instance": lambda instance_id, text: {
+            "id": instance_id, "text": text}})
+    result = loop.decide(
+        "world_state_updated", _state(), map_png=old_map,
+        state_fn=lambda: (_state(), new_map))
+    assert result.action == "GOTO_INSTANCE"
+    second_images = chat.calls[1][1]
+    assert ("topdown_map", new_map) in second_images
+    assert ("topdown_map", old_map) not in second_images
+
+
 def test_failed_write_tool_does_not_refresh_state():
     calls = []
 
@@ -239,12 +260,15 @@ def test_finish_only_enforces_explicit_many_count():
 
 def test_trace_log_written():
     path = Path(".decision_trace_test.jsonl")
+    if path.exists():
+        path.unlink()
     loop = DecisionLoop(
         _ScriptedChat([{"action": "FINISH"}]),
         logger=DecisionTraceLogger(path))
     loop.decide("finish_check", _state())
     record = json.loads(path.read_text(encoding="utf-8"))
     assert record["output"]["action"] == "FINISH"
+    path.unlink()
 
 
 def _grid(h=30, w=40):
@@ -382,6 +406,34 @@ def test_navagent_undo_merge_restores_originals():
     assert "error" in agent._tool_undo_merge()
 
 
+def test_navagent_undo_merge_restores_removed_navigation_target():
+    agent = _make_agent()
+    a = agent.memory.add([0, 0, 0], "view A", candidate_id="ca")
+    b = agent.memory.add([2, 0, 0], "view B", candidate_id="cb")
+    agent.target_instance_id = b.iid
+    agent.target_point = np.asarray(b.point)
+    agent.target_candidate_id = b.candidate_id
+    agent._tool_merge_instances([a.iid, b.iid], "one basket")
+    assert agent.target_instance_id == a.iid
+    agent._tool_undo_merge()
+    assert agent.target_instance_id == b.iid
+    assert np.allclose(agent.target_point, b.point)
+    assert agent.target_candidate_id == "cb"
+
+
+def test_report_found_does_not_emit_duplicate_target_found():
+    agent = _make_agent()
+    node = agent.memory.add([0, 0, 0], "basket")
+    agent.memory.mark_reported(node)
+    agent.target_instance_id = node.iid
+    agent.target_point = np.asarray(node.point)
+    before = agent._reported_count
+    action = agent._report_found()
+    assert action != int(Action.TARGET_FOUND)
+    assert agent._reported_count == before
+    assert agent.target_instance_id is None
+
+
 def test_undo_merge_never_revokes_report():
     agent = _make_agent()
     a = agent.memory.add([0, 0, 0], "A")
@@ -501,6 +553,21 @@ def test_wait_for_captions_logs_timeout_and_swallows_errors():
         del os.environ["NAV_CAPTION_WAIT_S"]
 
 
+def test_scan_flushes_tail_map_before_waiting_and_retrieving():
+    agent = _make_agent()
+    order = []
+    agent.client = SimpleNamespace(
+        flush_map=lambda: order.append("flush") or {"flushed": True},
+        wait_captions=lambda timeout: order.append("wait") or True,
+        ground_object=lambda phrase, top_k:
+            order.append("retrieve") or [])
+    agent._choose_high_level_target = lambda *args, **kwargs: 123
+    obs = SimpleNamespace(step_count=50, max_steps=500,
+                          goal_text="Find all baskets")
+    assert agent._scan_complete_decision(obs) == 123
+    assert order == ["flush", "wait", "retrieve"]
+
+
 def test_navagent_search_instances_uses_vlm_keywords():
     agent = _make_agent()
     red_cup = agent.memory.add(
@@ -539,6 +606,7 @@ if __name__ == "__main__":
     test_scan_complete_reselects_globally_instead_of_reporting()
     test_generic_memory_tool_call()
     test_write_tool_refreshes_world_state_before_validation()
+    test_write_tool_refreshes_topdown_map_image()
     test_failed_write_tool_does_not_refresh_state()
     test_broken_state_fn_falls_back_to_pre_write_state()
     test_finish_only_enforces_explicit_many_count()
@@ -551,12 +619,15 @@ if __name__ == "__main__":
     test_omitted_instance_is_valid_goto_target()
     test_navagent_memory_tools_update_and_merge()
     test_navagent_undo_merge_restores_originals()
+    test_navagent_undo_merge_restores_removed_navigation_target()
+    test_report_found_does_not_emit_duplicate_target_found()
     test_undo_merge_never_revokes_report()
     test_undo_merge_tool_refreshes_state()
     test_ingest_generates_instance_level_text()
     test_ingest_keeps_caption_text_when_vlm_unavailable()
     test_ingest_does_not_redescribe_existing_instance()
     test_wait_for_captions_logs_timeout_and_swallows_errors()
+    test_scan_flushes_tail_map_before_waiting_and_retrieving()
     test_navagent_search_instances_uses_vlm_keywords()
     test_navagent_look_instance_prefers_candidate_overlay()
     print("decider tests passed")

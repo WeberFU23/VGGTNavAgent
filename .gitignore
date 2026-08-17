@@ -1,0 +1,48 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ===== 测试 / 静态检查缓存 =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 日志 / 运行痕迹 =====
+*.log
+*.jsonl
+decision_trace*.jsonl
+.decision_trace*.jsonl
+
+# ===== 调试输出 =====
+mapping_debug/
+
+# ===== 数据文件 / 权重 =====
+VGGT-SLAM/office_loop.zip
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+VGGT-SLAM/ckpts/
+VGGT-SLAM/*.egg-info/
+
+# ===== IDE / 系统 =====
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -5,6 +5,7 @@
 
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -163,6 +164,54 @@ def test_worker_skips_duplicate_and_empty_model(tmp_path):
     time.sleep(0.1)
     assert not store.has(9)
     worker2.close()
+
+
+def test_worker_deduplicates_frames_that_are_still_pending(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    gw = _MockGateway()
+    busy = {"flag": True}
+    worker = CaptionWorker(gw, _MockEmbedder(), store, model="qwen-3b",
+                           busy_fn=lambda: busy["flag"])
+    from PIL import Image
+    img = Image.new("RGB", (8, 8))
+    worker.enqueue(5, img)
+    worker.enqueue(5, img)
+    assert worker.pending() == 1
+    busy["flag"] = False
+    assert _wait_for(lambda: worker.pending() == 0)
+    assert len(gw.calls) == 1
+    worker.close()
+
+
+def test_worker_clear_rejects_inflight_previous_episode(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingGateway(_MockGateway):
+        def chat(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if len(self.calls) == 1:
+                started.set()
+                release.wait(timeout=2.0)
+            return self.reply
+
+    gw = _BlockingGateway()
+    worker = CaptionWorker(gw, _MockEmbedder(), store, model="qwen-3b",
+                           busy_fn=lambda: False)
+    from PIL import Image
+    img = Image.new("RGB", (8, 8))
+    worker.enqueue(5, img)
+    assert started.wait(timeout=2.0)
+    worker.clear()
+    store.clear()
+    # 新 episode 可以复用相同 frame_id，旧任务的 finally 不得清掉它。
+    worker.enqueue(5, img)
+    release.set()
+    assert _wait_for(lambda: store.has(5))
+    assert len(gw.calls) == 2
+    assert worker.pending() == 0
+    worker.close()
 
 
 def test_worker_survives_gateway_error(tmp_path):

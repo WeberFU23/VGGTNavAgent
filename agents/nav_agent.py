@@ -102,6 +102,8 @@ class NavAgent(MappingAgent):
         self.target_point = None        # 地图坐标（未缩放单位），(3,)
         self.target_candidate_id = None
         self.target_instance_id = None
+        # 与 InstanceMemory 的 merge 历史一一对应，用于恢复被 merge 改写的目标。
+        self._target_merge_history = []
         self.follower = None
         self.grid = None
         self.align_R = None
@@ -497,8 +499,13 @@ class NavAgent(MappingAgent):
                 step=getattr(self, "_last_report_step", 0),
                 candidate_id=self.target_candidate_id)
             self.target_instance_id = node.iid
-        if self.memory.mark_reported(node):
-            self._reported_count += 1
+        if not self.memory.mark_reported(node):
+            self._log_event("ignored duplicate/invalid TARGET_FOUND report")
+            self._clear_current_target()
+            self.mode = "explore"
+            self._scanning = False
+            return int(Action.TURN_LEFT)
+        self._reported_count += 1
         self._no_hit_queries = 0
         self._log_event(f"reported TARGET_FOUND '{self.target_text}' "
                         f"(total {self._reported_count})")
@@ -633,6 +640,13 @@ class NavAgent(MappingAgent):
         if merged is None:
             return {"error": "merge requires at least two existing instances"}
         requested = {str(value) for value in (instance_ids or [])}
+        self._target_merge_history.append({
+            "target_was_merged": (old_target is not None and
+                                  str(old_target.iid) in requested),
+            "target_id": old_target.iid if old_target is not None else None,
+            "merged_id": merged.iid,
+        })
+        self._target_merge_history = self._target_merge_history[-50:]
         if old_target is not None and str(old_target.iid) in requested:
             self.target_instance_id = merged.iid
             self.target_point = self._raw_point(merged.point)
@@ -645,11 +659,21 @@ class NavAgent(MappingAgent):
         outcome = self.memory.undo_merge()
         if outcome is None:
             return {"error": "no merge to undo"}
+        target_record = (self._target_merge_history.pop()
+                         if self._target_merge_history else None)
         keep = self.memory.get(outcome["keep_id"])
-        if keep is not None and self.target_instance_id == keep.iid:
-            # 当前导航目标是 keeper：坐标/候选随撤销一并回滚
-            self.target_point = self._raw_point(keep.point)
-            self.target_candidate_id = keep.candidate_id
+        restore_id = None
+        if target_record and target_record["target_was_merged"] and \
+                self.target_instance_id == target_record["merged_id"]:
+            restore_id = target_record["target_id"]
+        target = self.memory.get(restore_id) if restore_id is not None else None
+        if target is None and keep is not None and \
+                self.target_instance_id == keep.iid:
+            target = keep
+        if target is not None:
+            self.target_instance_id = target.iid
+            self.target_point = self._raw_point(target.point)
+            self.target_candidate_id = target.candidate_id
         self._log_event(
             f"VLM undid merge -> kept {outcome['keep_id']}, "
             f"restored {outcome['restored_ids']}")
@@ -759,7 +783,7 @@ class NavAgent(MappingAgent):
         state, map_png = self._build_decider_input(observation)
         result = self.decision_loop.decide(
             "finish_check", state, map_png,
-            state_fn=lambda: self._build_decider_input(observation)[0])
+            state_fn=lambda: self._build_decider_input(observation))
         if result is None:
             return None                       # 回退规则
         print(f"[NavAgent] 决策层 finish_check: {result}")
@@ -774,7 +798,7 @@ class NavAgent(MappingAgent):
             state, map_png = self._build_decider_input(observation)
             result = self.decision_loop.decide(
                 event, state, map_png, images=images,
-                state_fn=lambda: self._build_decider_input(observation)[0])
+                state_fn=lambda: self._build_decider_input(observation))
         except Exception as exc:
             print(f"[NavAgent] 决策层调用失败，回退规则: {exc}")
             return None, None
@@ -909,9 +933,9 @@ class NavAgent(MappingAgent):
         state["arrival"] = arrival_info
 
         def refresh_state():
-            new_state, _ = self._build_decider_input(observation)
+            new_state, new_map = self._build_decider_input(observation)
             new_state["arrival"] = dict(arrival_info)
-            return new_state
+            return new_state, new_map
 
         images = [("current_observation",
                    self.vlm.encode_rgb(observation.rgb))]
@@ -949,6 +973,11 @@ class NavAgent(MappingAgent):
         self.mode = "explore"
         phrase = self.target_text or self._target_phrase(observation)
         self.target_text = phrase
+        try:
+            # Caption 只为已进入子图的帧排队；先提交环视产生的尾部关键帧。
+            self.client.flush_map()
+        except Exception as exc:
+            self._log_event(f"post-scan map flush unavailable: {exc}")
         self._ensure_alignment()
         self._refresh_memory_candidates()
         # 环视期间的新关键帧可能还在 caption 队列里；先等语义记忆追上，

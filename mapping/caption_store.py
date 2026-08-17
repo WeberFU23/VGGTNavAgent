@@ -42,16 +42,19 @@ class CaptionStore:
         self.episode_id = None
         self.records = []            # [{frame_id, pose, caption}]
         self._embeddings = []        # list of (D,) float32
+        self._lock = threading.RLock()
         if self.persist_dir:
             os.makedirs(self.persist_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     def __len__(self):
-        return len(self.records)
+        with self._lock:
+            return len(self.records)
 
     @property
     def frame_ids(self):
-        return [r["frame_id"] for r in self.records]
+        with self._lock:
+            return [r["frame_id"] for r in self.records]
 
     def add(self, frame_id, pose, caption, embedding):
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
@@ -61,31 +64,37 @@ class CaptionStore:
         pose_arr = None
         if pose is not None:
             pose_arr = np.asarray(pose, dtype=np.float32).reshape(4, 4)
-        self.records.append({
-            "frame_id": int(frame_id),
-            "pose": pose_arr,
-            "caption": str(caption),
-        })
-        self._embeddings.append(emb)
+        with self._lock:
+            self.records.append({
+                "frame_id": int(frame_id),
+                "pose": pose_arr,
+                "caption": str(caption),
+            })
+            self._embeddings.append(emb)
 
     def has(self, frame_id):
-        return int(frame_id) in set(self.frame_ids)
+        frame_id = int(frame_id)
+        with self._lock:
+            return any(r["frame_id"] == frame_id for r in self.records)
 
     # ------------------------------------------------------------------
     def retrieve(self, query_embedding, k=10):
         """余弦 top-K，返回 [{frame_id, caption, score, pose}]（score 降序）。"""
-        if not self.records:
-            return []
+        with self._lock:
+            if not self.records:
+                return []
+            records = list(self.records)
+            embeddings = list(self._embeddings)
         q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
         qn = float(np.linalg.norm(q))
         if qn > 0:
             q = q / qn
-        mat = np.stack(self._embeddings)          # (N, D)，已归一
+        mat = np.stack(embeddings)                # (N, D)，已归一
         sims = mat @ q
-        k = max(1, min(int(k), len(self.records)))
+        k = max(1, min(int(k), len(records)))
         out = []
         for idx in np.argsort(-sims)[:k]:
-            rec = self.records[int(idx)]
+            rec = records[int(idx)]
             out.append({
                 "frame_id": rec["frame_id"],
                 "caption": rec["caption"],
@@ -101,28 +110,33 @@ class CaptionStore:
     def set_episode(self, episode_id):
         """切换 episode：先落盘当前记忆，再清空（跨 episode 不共享）。"""
         episode_id = str(episode_id or "unknown")
-        if episode_id == self.episode_id:
-            return
-        self.save()
-        self.clear()
-        self.episode_id = episode_id
+        with self._lock:
+            if episode_id == self.episode_id:
+                return
+            self.save()
+            self.clear()
+            self.episode_id = episode_id
 
     def clear(self):
-        self.records = []
-        self._embeddings = []
+        with self._lock:
+            self.records = []
+            self._embeddings = []
 
     def _episode_dir(self, episode_id=None):
         ep = episode_id or self.episode_id or "unknown"
         return os.path.join(self.persist_dir, ep)
 
     def save(self, episode_id=None):
-        if not self.persist_dir or not self.records:
-            return
+        with self._lock:
+            if not self.persist_dir or not self.records:
+                return
+            records = list(self.records)
+            embeddings = list(self._embeddings)
         out_dir = self._episode_dir(episode_id)
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "captions.jsonl"),
                   "w", encoding="utf-8") as fp:
-            for rec in self.records:
+            for rec in records:
                 fp.write(json.dumps({
                     "frame_id": rec["frame_id"],
                     "caption": rec["caption"],
@@ -130,26 +144,27 @@ class CaptionStore:
                              if rec["pose"] is not None else None),
                 }, ensure_ascii=False) + "\n")
         np.save(os.path.join(out_dir, "embeddings.npy"),
-                np.stack(self._embeddings))
+                np.stack(embeddings))
 
     def load(self, episode_id):
         """从磁盘恢复一个 episode 的记忆（离线检索验证用）。"""
-        self.clear()
-        if not self.persist_dir:
-            return 0
-        in_dir = self._episode_dir(episode_id)
-        jsonl = os.path.join(in_dir, "captions.jsonl")
-        npy = os.path.join(in_dir, "embeddings.npy")
-        if not (os.path.exists(jsonl) and os.path.exists(npy)):
-            return 0
-        embs = np.load(npy)
-        with open(jsonl, encoding="utf-8") as fp:
-            for i, line in enumerate(fp):
-                item = json.loads(line)
-                self.add(item["frame_id"], item.get("pose"),
-                         item["caption"], embs[i])
-        self.episode_id = str(episode_id)
-        return len(self.records)
+        with self._lock:
+            self.clear()
+            if not self.persist_dir:
+                return 0
+            in_dir = self._episode_dir(episode_id)
+            jsonl = os.path.join(in_dir, "captions.jsonl")
+            npy = os.path.join(in_dir, "embeddings.npy")
+            if not (os.path.exists(jsonl) and os.path.exists(npy)):
+                return 0
+            embs = np.load(npy)
+            with open(jsonl, encoding="utf-8") as fp:
+                for i, line in enumerate(fp):
+                    item = json.loads(line)
+                    self.add(item["frame_id"], item.get("pose"),
+                             item["caption"], embs[i])
+            self.episode_id = str(episode_id)
+            return len(self.records)
 
 
 class BGEM3Embedder:
@@ -205,10 +220,12 @@ class CaptionWorker:
         self.prompt = prompt
         self._queue = queue.Queue()
         self._closed = False
+        self._state_lock = threading.RLock()
+        self._generation = 0
         self.errors = 0
         # 语义记忆进度：已入队但尚未生成 caption 的关键帧（含在途处理）。
         # agent 端据此判断检索是否会漏掉最新关键帧。
-        self._pending_ids = set()
+        self._pending = set()       # (generation, frame_id)
         self.last_completed_frame_id = None
         self._thread = threading.Thread(
             target=self._consume, name="caption-worker", daemon=True)
@@ -218,26 +235,36 @@ class CaptionWorker:
     def enqueue(self, frame_id, pil_img, pose=None):
         if self._closed or not self.model:
             return
-        if self.store.has(frame_id):
-            return
-        self._pending_ids.add(int(frame_id))
-        self._queue.put((int(frame_id), pil_img, pose))
+        frame_id = int(frame_id)
+        with self._state_lock:
+            key = (self._generation, frame_id)
+            if self.store.has(frame_id) or key in self._pending:
+                return
+            self._pending.add(key)
+            self._queue.put((self._generation, frame_id, pil_img, pose))
 
     def clear(self):
-        """episode 切换时丢弃未处理的 caption 任务。"""
-        try:
-            while True:
-                self._queue.get_nowait()
-        except queue.Empty:
-            pass
-        self._pending_ids.clear()
+        """切换 generation，使排队及在途的旧 episode 任务全部失效。"""
+        with self._state_lock:
+            self._generation += 1
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._pending.clear()
+            self.last_completed_frame_id = None
 
     def pending(self):
         """已入队但尚未完成 caption 的关键帧数。"""
-        return len(self._pending_ids)
+        with self._state_lock:
+            return sum(1 for gen, _ in self._pending
+                       if gen == self._generation)
 
     def pending_frame_ids(self):
-        return sorted(self._pending_ids)
+        with self._state_lock:
+            return sorted(frame_id for gen, frame_id in self._pending
+                          if gen == self._generation)
 
     def close(self):
         self._closed = True
@@ -250,7 +277,7 @@ class CaptionWorker:
             item = self._queue.get()
             if item is None:
                 return
-            frame_id, pil_img, pose = item
+            generation, frame_id, pil_img, pose = item
             # GPU 忙时让路：稍后再试（不丢任务）
             if self.busy_fn is not None:
                 while not self._closed:
@@ -271,13 +298,18 @@ class CaptionWorker:
                 if not caption:
                     raise VLLMError("caption 为空")
                 emb = self.embedder.encode([caption])[0]
-                self.store.add(frame_id, pose, caption, emb)
-                if self.last_completed_frame_id is None or \
-                        frame_id > self.last_completed_frame_id:
-                    self.last_completed_frame_id = frame_id
+                # clear() 与此临界区互斥；旧 generation 不能写入新 episode。
+                with self._state_lock:
+                    if generation != self._generation:
+                        continue
+                    self.store.add(frame_id, pose, caption, emb)
+                    if self.last_completed_frame_id is None or \
+                            frame_id > self.last_completed_frame_id:
+                        self.last_completed_frame_id = frame_id
             except Exception as exc:  # noqa: BLE001 - 单帧失败不拖垮线程
                 self.errors += 1
                 print(f"[CaptionWorker] frame {frame_id} caption 失败: {exc}",
                       flush=True)
             finally:
-                self._pending_ids.discard(frame_id)
+                with self._state_lock:
+                    self._pending.discard((generation, frame_id))

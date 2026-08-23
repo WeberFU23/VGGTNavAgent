@@ -8,21 +8,24 @@ agent 边界之外计算。
 
     python run_eval.py \
       --config hm3d_config.yaml \
-      --agent agents_to_test.mapping_agent:MappingAgent \
+      --agent agents.mapping_agent:MappingAgent \
       --goal-type description \
       --dataset-dir dataset_semantic \
-      --scene-root /home/wenbofu/datasets/hm3d/versioned_data/hm3d-0.2/hm3d/val \
+      --scene-root /path/to/hm3d/val \
       --limit 1 --episode-limit 1 --max-steps 300
 """
 
 import atexit
+import json
 import os
+import time
 
 import numpy as np
 
 from benchmark_api import Action
 from mapping.client import MappingClient
 from mapping.scale_calibration import ScaleCalibrator
+from runtime_paths import env_debug_path, run_debug_path
 
 class MappingAgent:
     def __init__(self):
@@ -30,9 +33,8 @@ class MappingAgent:
             host=os.environ.get("VGGT_SLAM_HOST", "127.0.0.1"),
             port=int(os.environ.get("VGGT_SLAM_PORT", "5555")),
         )
-        self.output_dir = os.environ.get(
-            "MAPPING_DEBUG_DIR",
-            os.path.expanduser("~/vggt_nav_agent/mapping_debug"))
+        self.output_dir = env_debug_path(
+            "MAPPING_DEBUG_DIR", run_debug_path("agent"))
         os.makedirs(self.output_dir, exist_ok=True)
         self.episode_id = None
         self.rng = np.random.default_rng(0)
@@ -40,6 +42,13 @@ class MappingAgent:
         self._last_motion_failed = False
         self.stuck_steps = 0
         self._server_busy = False
+        self._last_feed_info = {}
+        self._action_trace_path = env_debug_path(
+            "NAV_ACTION_TRACE",
+            os.path.join(self.output_dir, "action_trace.jsonl"))
+        self._trace_write_warned = False
+        self._episode_diag_warned = False
+        self._frame_save_err = False
         self.calibrator = ScaleCalibrator(
             window=int(os.environ.get("MAPPING_SCALE_WINDOW", "20")))
         # NAV_ORACLE_GEOMETRY=1：离线消融钩——用 GT 位移（米）替换
@@ -63,6 +72,8 @@ class MappingAgent:
         self._last_motion_failed = False
         self.stuck_steps = 0
         self._server_busy = False
+        self._last_feed_info = {}
+        self._frame_save_err = False
         self.calibrator.reset()
         self._oracle_gt = []
 
@@ -81,13 +92,21 @@ class MappingAgent:
             self.episode_id = observation.episode_id
             try:
                 self.client.set_episode(self.episode_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                if not self._episode_diag_warned:
+                    print(f"[MappingAgent] episode 诊断归档未启用: {exc}")
+                    self._episode_diag_warned = True
             self._frame_save_dir = None
             save_root = os.environ.get("NAV_SAVE_FRAMES_DIR")
             if save_root:
+                save_root = env_debug_path(
+                    "NAV_SAVE_FRAMES_DIR",
+                    os.path.join(self.output_dir, "rgb"))
+                safe_episode = "".join(
+                    ch if ch.isalnum() or ch in "-_." else "_"
+                    for ch in str(self.episode_id))[:120] or "unknown"
                 self._frame_save_dir = os.path.join(
-                    save_root, str(self.episode_id))
+                    save_root, safe_episode)
                 os.makedirs(self._frame_save_dir, exist_ok=True)
                 print(f"[MappingAgent] 逐帧 RGB 保存到 {self._frame_save_dir}")
 
@@ -123,6 +142,7 @@ class MappingAgent:
         # server 端 feed_frame 也会全量保存；此处为 agent 侧冗余。
         if getattr(self, "_frame_save_dir", None):
             try:
+                import cv2
                 arr = np.asarray(rgb)
                 if arr.ndim == 3 and arr.shape[2] == 3:
                     img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -130,16 +150,19 @@ class MappingAgent:
                     img = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
                 else:
                     img = arr
-                cv2.imwrite(
+                saved = cv2.imwrite(
                     os.path.join(
                         self._frame_save_dir,
                         f"rgb_{observation.step_count:05d}.jpg"),
                     img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if not saved:
+                    raise OSError("cv2.imwrite returned false")
             except Exception as exc:
                 if getattr(self, "_frame_save_err", False) is False:
                     self._frame_save_err = True
                     print(f"[MappingAgent] 逐帧 RGB 保存失败: {exc}")
         info = self.client.feed_frame(rgb)
+        self._last_feed_info = dict(info or {})
         self._server_busy = bool(info.get("busy"))
         if observation.step_count % 20 == 0:
             print(f"[MappingAgent] step={observation.step_count} "
@@ -169,6 +192,7 @@ class MappingAgent:
 
     def _record_and_update(self, observation, action):
         """记录动作 + 定期更新在线尺度估计（滑动窗口，带 pacing 时位姿基本最新）。"""
+        self._trace_action(observation, action)
         self.calibrator.record_action(action)
         if self.oracle_geometry:
             gps = getattr(observation, "gps", None)
@@ -187,6 +211,50 @@ class MappingAgent:
                     print(f"[MappingAgent] step={observation.step_count} "
                           f"在线尺度估计={scale:.4f} m/unit")
 
+    def _trace_action(self, observation, action):
+        """Record every executed benchmark action and its decision context."""
+        try:
+            action_name = Action(int(action)).name
+        except Exception:
+            action_name = str(action)
+        previous = getattr(observation, "previous_action", None)
+        try:
+            previous_name = Action(int(previous)).name
+        except Exception:
+            previous_name = None
+        feed = dict(getattr(self, "_last_feed_info", {}) or {})
+        record = {
+            "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "episode": str(getattr(observation, "episode_id", self.episode_id)),
+            "step": int(observation.step_count),
+            "goal_text": str(getattr(observation, "goal_text", "") or ""),
+            "actual_action": {"id": int(action), "name": action_name},
+            "previous_action": {"id": previous, "name": previous_name},
+            "agent_mode": getattr(self, "mode", None),
+            "target_instance_id": getattr(self, "target_instance_id", None),
+            "target_candidate_id": getattr(self, "target_candidate_id", None),
+            "adjusting": bool(getattr(self, "_adjusting", False)),
+            "scanning": bool(getattr(self, "_scanning", False)),
+            "last_motion_failed": bool(self._last_motion_failed),
+            "mapping_frame_id": feed.get("frame_id"),
+            "mapping": {
+                "is_keyframe": feed.get("is_keyframe"),
+                "queued_keyframes": feed.get("queued_keyframes"),
+                "busy": feed.get("busy"),
+            },
+            "last_decision": getattr(self, "_last_decision_output", None),
+        }
+        try:
+            os.makedirs(os.path.dirname(self._action_trace_path) or ".",
+                        exist_ok=True)
+            with open(self._action_trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(
+                    record, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            if not self._trace_write_warned:
+                print(f"[MappingAgent] action trace 写入失败: {exc}")
+                self._trace_write_warned = True
+
     def _oracle_scale_update(self, poses, frame_ids):
         """oracle 消融尺度：分子用 GT 位移（米）替换动作步长假设。
 
@@ -204,9 +272,10 @@ class MappingAgent:
         for i in range(1, len(positions)):
             f_a, f_b = int(frame_ids[i - 1]), int(frame_ids[i])
             lo, hi = f_a - 1, f_b - 1
-            if lo < 0 or hi > len(self._oracle_gt) or hi <= lo:
+            if lo < 0 or hi >= len(self._oracle_gt) or hi <= lo:
                 continue
-            seg = self._oracle_gt[lo:hi]
+            # 两端关键帧的观测位置都需要保留，右端索引是闭区间。
+            seg = self._oracle_gt[lo:hi + 1]
             if not seg or any(g is None for g in seg):
                 continue
             gt_dist = float(np.linalg.norm(seg[-1] - seg[0]))
@@ -225,19 +294,25 @@ class MappingAgent:
     def _finalize(self):
         if self.episode_id is None:
             return
-        # flush_map 同时等待在途子图并提交未满子图的尾帧。
-        self.client.flush_map()
-
-        poses, frame_ids = self.client.get_all_poses()
         episode = self.episode_id
         self.episode_id = None
+        try:
+            # flush_map 同时等待在途子图并提交未满子图的尾帧。
+            self.client.flush_map()
+            poses, frame_ids = self.client.get_all_poses()
+        except Exception as exc:
+            print(f"[MappingAgent] episode {episode}: 收尾失败: {exc}")
+            return
         if poses is None or len(poses) < 1:
             print(f"[MappingAgent] episode {episode}: SLAM 位姿不足，跳过保存")
             return
         slam_xyz = poses[:, 0:3, 3]
         cal_scale = self.calibrator.current_scale()
 
-        out = os.path.join(self.output_dir, f"traj_{episode}.npz")
+        safe_episode = "".join(
+            ch if ch.isalnum() or ch in "-_." else "_"
+            for ch in str(episode))[:120] or "unknown"
+        out = os.path.join(self.output_dir, f"traj_{safe_episode}.npz")
         np.savez(out, slam_xyz=slam_xyz, frame_ids=frame_ids,
                  actions=np.asarray(self.calibrator.actions),
                  calibrator_scale=cal_scale if cal_scale else np.nan,

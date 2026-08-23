@@ -11,6 +11,8 @@ import json
 import struct
 
 _HEADER_STRUCT = struct.Struct(">Q")
+MAX_HEADER_BYTES = 1024 * 1024
+MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def send_msg(sock, header, payload=b""):
@@ -34,6 +36,13 @@ def _recv_exact(sock, n):
 def recv_msg(sock):
     """接收一条消息，返回 (header: dict, payload: bytes)。"""
     (hlen,) = _HEADER_STRUCT.unpack(_recv_exact(sock, _HEADER_STRUCT.size))
+    if hlen <= 0 or hlen > MAX_HEADER_BYTES:
+        raise ValueError(f"invalid header length: {hlen}")
     header = json.loads(_recv_exact(sock, hlen).decode("utf-8"))
-    payload = _recv_exact(sock, header.get("payload_len", 0))
+    if not isinstance(header, dict):
+        raise ValueError("message header must be a JSON object")
+    payload_len = header.get("payload_len", 0)
+    if not isinstance(payload_len, int) or not 0 <= payload_len <= MAX_PAYLOAD_BYTES:
+        raise ValueError(f"invalid payload length: {payload_len!r}")
+    payload = _recv_exact(sock, payload_len)
     return header, payload

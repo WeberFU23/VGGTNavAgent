@@ -53,6 +53,15 @@ def test_add_and_retrieve_order():
     assert results[0]["caption"] == "blue sofa"
 
 
+def test_store_rejects_mismatched_embedding_dimensions():
+    store = CaptionStore()
+    store.add(1, None, "red chair", _vec(1, dim=8))
+    with pytest.raises(ValueError, match="维度不一致"):
+        store.add(2, None, "blue sofa", _vec(2, dim=4))
+    with pytest.raises(ValueError, match="维度不一致"):
+        store.retrieve(_vec(3, dim=4))
+
+
 def test_retrieve_empty_store():
     assert CaptionStore().retrieve(_vec(1), k=5) == []
 
@@ -125,6 +134,21 @@ def test_worker_generates_caption(tmp_path):
     assert "sofa" in rec["caption"]
     assert rec["pose"] is not None
     assert gw.calls[0][1] == "caption"
+    worker.close()
+
+
+def test_worker_emits_frame_caption_pair(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    events = []
+    worker = CaptionWorker(
+        _MockGateway(), _MockEmbedder(), store, model="qwen-3b",
+        busy_fn=lambda: False, result_fn=events.append)
+    from PIL import Image
+    worker.enqueue(42, Image.new("RGB", (8, 8)), np.eye(4))
+    assert _wait_for(lambda: len(events) == 1)
+    assert events[0]["frame_id"] == 42
+    assert events[0]["status"] == "completed"
+    assert "sofa" in events[0]["caption"]
     worker.close()
 
 
@@ -212,6 +236,49 @@ def test_worker_clear_rejects_inflight_previous_episode(tmp_path):
     assert len(gw.calls) == 2
     assert worker.pending() == 0
     worker.close()
+
+
+def test_worker_cache_key_changes_between_generations(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    gateway = _MockGateway()
+    worker = CaptionWorker(gateway, _MockEmbedder(), store, model="qwen-3b")
+    from PIL import Image
+    image = Image.new("RGB", (8, 8))
+
+    worker.enqueue(5, image)
+    assert _wait_for(lambda: store.has(5))
+    first_key = gateway.calls[-1][2]
+    worker.clear()
+    store.clear()
+    worker.enqueue(5, image)
+    assert _wait_for(lambda: store.has(5))
+    second_key = gateway.calls[-1][2]
+
+    assert first_key != second_key
+    worker.close()
+
+
+def test_worker_close_rejects_inflight_result(tmp_path):
+    store = CaptionStore(persist_dir=str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingGateway(_MockGateway):
+        def chat(self, *args, **kwargs):
+            started.set()
+            release.wait(timeout=2.0)
+            return self.reply
+
+    worker = CaptionWorker(
+        _BlockingGateway(), _MockEmbedder(), store, model="qwen-3b")
+    from PIL import Image
+    worker.enqueue(3, Image.new("RGB", (8, 8)))
+    assert started.wait(timeout=2.0)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    release.set()
+    closer.join(timeout=2.0)
+    assert not store.has(3)
 
 
 def test_worker_survives_gateway_error(tmp_path):

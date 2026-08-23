@@ -14,7 +14,7 @@
 # AGENT_ARCHITECTURE.md 的 flag 表：NAV_VLLM_URL / NAV_CAPTION_MODEL_PATH /
 # NAV_POINTING_MODEL_PATH / NAV_EMBED_MODEL_PATH）。
 
-set -u
+set -euo pipefail
 
 BENCH_DIR=${BENCH_DIR:-/root/habitat_benchmark}
 SCENE_ROOT=${SCENE_ROOT:-/root/autodl-tmp/hm3d/val}
@@ -23,10 +23,26 @@ AGENT=${AGENT:-agents.nav_agent:NavAgent}
 MAX_STEPS=${MAX_STEPS:-500}
 EPISODE_LIMIT=${EPISODE_LIMIT:-8}          # 混合模式 smoke
 EPISODE_REDLINE=${EPISODE_REDLINE:-ep0000004}
-OUT_ROOT=${OUT_ROOT:-smoke_matrix_$(date +%m%d_%H%M)}
+PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export NAV_DEBUG_ROOT=${NAV_DEBUG_ROOT:-$PROJECT_DIR/debug_output}
+export NAV_RUN_ID=${NAV_RUN_ID:-smoke_$(date +%m%d_%H%M)}
+OUT_ROOT=${OUT_ROOT:-$NAV_DEBUG_ROOT/$NAV_RUN_ID/benchmark}
 
 mkdir -p "$OUT_ROOT"
-cd "$BENCH_DIR" || exit 1
+OUT_ROOT=$(cd "$OUT_ROOT" && pwd)
+if [ ! -d "$BENCH_DIR" ]; then
+  echo "BENCH_DIR does not exist: $BENCH_DIR" >&2
+  exit 1
+fi
+if [ ! -d "$SCENE_ROOT" ]; then
+  echo "SCENE_ROOT does not exist: $SCENE_ROOT" >&2
+  exit 1
+fi
+cd "$BENCH_DIR"
+if [ ! -f "$CONFIG" ]; then
+  echo "Benchmark config does not exist: $BENCH_DIR/$CONFIG" >&2
+  exit 1
+fi
 
 run_eval() {
   local tag=$1; shift

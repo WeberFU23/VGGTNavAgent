@@ -6,7 +6,8 @@
 
 用法（在 habitat 环境，eval 跑完、mapping server 仍持图时执行）::
 
-    PYTHONPATH=/path/to/vggt_nav_agent python scripts/check_gravity.py --port 5555
+    PYTHONPATH=/path/to/vggt_nav_agent python scripts/diagnostics/check_gravity.py \
+        --port 5555
 
 输出每个候选俯仰角下的高度散布，并给出推荐值。
 """
@@ -57,9 +58,7 @@ def main():
         print("注意：与配置的安装角 30° 不一致，"
               "可能是 habitat 俯仰角符号约定相反，请更新 navigator.MOUNT_PITCH_DOWN_RAD")
 
-    # ---- 轨迹 PCA 直接估 up 轴（不依赖安装角假设）----
-    # 相机中心近似共面（单楼层），高度轴 = 协方差最小特征向量。
-    # 轨迹为近直线时退化，用特征值比做平面性检查。
+    # 用轨迹 PCA 给安装角估计提供独立交叉检查。
     centers = poses[:, :3, 3]
     cov = np.cov((centers - centers.mean(0)).T)
     eigval, eigvec = np.linalg.eigh(cov)

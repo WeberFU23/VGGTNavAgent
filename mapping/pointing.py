@@ -2,11 +2,11 @@
 
 链路：探索时 retrieve_captions 粗筛 → point 输出目标像素（point 优先，
 bbox 只作交叉验证：point 落在 bbox 外则降置信；一次调用允许返回多个
-实例点）；到达实例后才调用 verify_frame 做查询条件化复核。随后由
-sample_point_depth 在像素周围 patch 内先按 VGGT confidence 过滤低分
-点再取中位数，得 3D 点。
+实例点）→ sample_point_depth 在像素周围 patch 内过滤低置信点并取
+中位数，得到 3D instance。到达后的判断由决策 VLM 直接完成；
+verify_frame 仅保留给 ground_frame 诊断接口。
 
-模型固定 Qwen2.5-VL-7B（4bit，经 VLLMGateway 调用）。输出走 JSON
+模型由 NAV_POINTING_MODEL_PATH 配置并经 VLLMGateway 调用。输出走 JSON
 schema 校验，解析失败重试 1 次。本模块不 import torch/cv2，
 sample_point_depth 为纯 numpy 函数，可脱离 GPU 单测。
 """
@@ -56,7 +56,7 @@ _BBOX_MISMATCH_FACTOR = 0.5
 
 
 class PointingGrounder:
-    """Qwen2.5-VL-7B pointing + 属性复核。model 为空时构造报错。"""
+    """本地多模态 VLM pointing；model 为空时构造报错。"""
 
     def __init__(self, gateway, model, parse_retries=1, max_tokens=512):
         self.gateway = gateway
@@ -68,10 +68,8 @@ class PointingGrounder:
         self.parse_retries = int(parse_retries)
         self.max_tokens = int(max_tokens)
 
-    # ------------------------------------------------------------------
     def verify_frame(self, pil_img, goal_text, frame_key=None):
-        """查询条件化复核。返回 {match, checked_attributes, confidence, reason}；
-        模型持续非法输出时返回 match=False（保守滤除）。"""
+        """诊断用条件化复核；模型持续非法输出时保守返回 match=False。"""
         prompt = VERIFY_PROMPT.format(goal_text=str(goal_text))
         data = self._chat_checked(prompt, pil_img, frame_key, "verify")
         if data is None:
@@ -118,7 +116,6 @@ class PointingGrounder:
             out.append({"pixel": (x, y), "confidence": conf, "bbox": bbox})
         return out
 
-    # ------------------------------------------------------------------
     def _chat_checked(self, prompt, pil_img, frame_key, kind):
         """调模型并解析 JSON；失败时带错误提示重试 parse_retries 次。"""
         retry_note = ""
@@ -177,7 +174,6 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
     }
 
 
-# ----------------------------------------------------------------------
 def _clamp01(value):
     try:
         return min(1.0, max(0.0, float(value)))

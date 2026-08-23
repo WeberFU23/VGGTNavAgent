@@ -10,8 +10,6 @@
 
 import itertools
 
-import numpy as np
-
 
 def route_order(start_xy, goals, dist_fn, max_exact=8):
     """返回访问 goals 的最优顺序（索引列表）；空 goals 返回 []。

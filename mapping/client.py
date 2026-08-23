@@ -14,6 +14,7 @@
 """
 
 import socket
+import time
 import uuid
 
 import numpy as np
@@ -29,6 +30,7 @@ class MappingClient:
         self._sock = None
         self._session_id = uuid.uuid4().hex
         self._request_seq = 0
+        self.last_frame_snapshot_revision = None
 
     def _connect(self):
         if self._sock is None:
@@ -62,11 +64,12 @@ class MappingClient:
 
     # ------------------------------------------------------------------
     def ping(self):
-        resp, _ = self._request({"cmd": "ping"})
+        self._request({"cmd": "ping"})
         return True
 
     def reset_map(self):
         resp, _ = self._request({"cmd": "reset_map"})
+        self.last_frame_snapshot_revision = None
         return resp
 
     def set_episode(self, episode_id):
@@ -83,6 +86,7 @@ class MappingClient:
     def feed_frame(self, rgb):
         """喂入一帧 RGB (H, W, 3) uint8，返回关键帧筛选等信息。"""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        self._validate_rgb(rgb)
         resp, _ = self._request(
             {"cmd": "feed", "shape": list(rgb.shape)}, rgb.tobytes())
         return resp
@@ -97,7 +101,6 @@ class MappingClient:
         用于 agent pacing：Habitat 离散步执行速度远快于 SLAM 吞吐，
         忙时短暂等待可避免关键帧缓冲被裁剪丢弃。
         """
-        import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.get_state().get("busy"):
@@ -108,7 +111,6 @@ class MappingClient:
     def wait_captions(self, timeout=30.0, poll=0.5):
         """等待 caption worker 消化完已入队关键帧（语义记忆追上 SLAM）。
         返回 True 表示队列清空；超时返回 False（调用方继续，检索可能漏新帧）。"""
-        import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             if int(self.get_state().get("caption_pending") or 0) <= 0:
@@ -134,9 +136,13 @@ class MappingClient:
     def get_map_points(self, max_points=200000):
         """返回 (points (N,3) float32, colors (N,3) uint8)。"""
         resp, payload = self._request({"cmd": "get_map", "max_points": max_points})
-        n = resp.get("num_points", 0)
+        n = int(resp.get("num_points", 0))
         if n == 0:
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+        expected = n * 15
+        if len(payload) != expected:
+            raise RuntimeError(
+                f"mapping payload 长度不匹配: {len(payload)} != {expected}")
         points = np.frombuffer(payload[: n * 12], dtype=np.float32).reshape(n, 3)
         colors = np.frombuffer(payload[n * 12:], dtype=np.uint8).reshape(n, 3)
         return points.copy(), colors.copy()
@@ -146,16 +152,24 @@ class MappingClient:
         float32（NaN=无效）, rows (N,) int32 原始图像行号}]。"""
         resp, payload = self._request(
             {"cmd": "get_frame_points", "stride": stride})
+        revision = resp.get("snapshot_revision")
+        self.last_frame_snapshot_revision = (
+            dict(revision) if isinstance(revision, dict) else None)
         frames = []
         offset = 0
         for meta in resp.get("frames", []):
-            n = meta["h"] * meta["w"]
-            pts = np.frombuffer(payload[offset: offset + n * 12],
+            h, w = int(meta["h"]), int(meta["w"])
+            if h <= 0 or w <= 0:
+                raise RuntimeError(f"mapping frame 尺寸无效: {h}x{w}")
+            n = h * w
+            end = offset + n * 12
+            if end > len(payload):
+                raise RuntimeError("mapping frame payload 截断")
+            pts = np.frombuffer(payload[offset:end],
                                 dtype=np.float32).reshape(n, 3)
-            offset += n * 12
+            offset = end
             rows = np.repeat(
-                np.arange(meta["h"], dtype=np.int32) * meta["stride"],
-                meta["w"])
+                np.arange(h, dtype=np.int32) * meta["stride"], w)
             frames.append({
                 "frame_id": meta["frame_id"],
                 "pose": np.asarray(meta["pose"], dtype=np.float32)
@@ -163,7 +177,16 @@ class MappingClient:
                 "points": pts.copy(),
                 "rows": rows,
             })
+        if offset != len(payload):
+            raise RuntimeError(
+                f"mapping frame payload 有多余字节: {len(payload) - offset}")
         return frames
+
+    def get_captioned_frame_ids(self):
+        """返回 (semantic_enabled, completed_frame_ids)。"""
+        resp, _ = self._request({"cmd": "get_captioned_frame_ids"})
+        return bool(resp.get("enabled")), [
+            int(fid) for fid in resp.get("frame_ids", [])]
 
     def get_intrinsics(self):
         """返回 VGGT 预测的各子图首帧内参列表（预处理图像坐标系）。"""
@@ -184,7 +207,7 @@ class MappingClient:
         return resp.get("results", [])
 
     def get_frame_image(self, frame_id):
-        """返回指定关键帧的 JPEG（决策层 look_at 工具）。
+        """返回指定关键帧的 JPEG（决策层 look_instance 工具）。
         返回 (meta, payload)；失败时 meta["found"]=False。"""
         resp, payload = self._request(
             {"cmd": "get_frame_image", "frame_id": int(frame_id)})
@@ -203,6 +226,14 @@ class MappingClient:
             {"cmd": "resolve_candidate", "candidate_id": candidate_id})
         return resp
 
+    def resolve_candidates(self, candidate_ids):
+        """批量返回候选在最新图优化坐标系中的 3D 点。"""
+        resp, _ = self._request({
+            "cmd": "resolve_candidates",
+            "candidate_ids": list(candidate_ids or []),
+        })
+        return resp.get("candidates", {})
+
     def get_candidate_evidence(self, candidate_id):
         """返回候选的紧凑 mask-overlay JPEG，供 VLM 复核。"""
         resp, payload = self._request(
@@ -210,12 +241,20 @@ class MappingClient:
         return resp, payload
 
     def ground_frame(self, rgb, text):
-        """对当前实时帧做 VQA + pointing 到达确认。"""
+        """对当前实时帧做 VQA + pointing；仅保留给诊断/兼容调用。"""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        self._validate_rgb(rgb)
         resp, _ = self._request(
             {"cmd": "ground_frame", "text": text,
              "shape": list(rgb.shape)}, rgb.tobytes())
         return resp
+
+    @staticmethod
+    def _validate_rgb(rgb):
+        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[0] <= 0 \
+                or rgb.shape[1] <= 0:
+            raise ValueError(
+                f"RGB 必须是非空 HxWx3 数组，实际为 {rgb.shape}")
 
     def shutdown_server(self):
         resp, _ = self._request({"cmd": "shutdown"})

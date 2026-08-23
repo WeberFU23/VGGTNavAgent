@@ -12,7 +12,6 @@ GPU 上，子图累积 + Habitat 渲染 + SALAD/VGGT 常驻会很快 OOM。
 
 import time
 
-import numpy as np
 import torch
 from termcolor import colored
 
@@ -25,30 +24,36 @@ from vggt_slam.submap import Submap
 
 class OnlineSolver(Solver):
     def run_predictions(self, image_names, model, max_loops):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if not torch.cuda.is_available():
+            raise RuntimeError("OnlineSolver requires CUDA")
+        device = "cuda"
         t1 = time.time()
         with self.vggt_timer:
             images = load_and_preprocess_images(image_names).to(device)
-        print(f"Loaded and preprocessed {len(image_names)} images in {time.time() - t1:.2f} seconds")
+        print(
+            f"Loaded and preprocessed {len(image_names)} images in "
+            f"{time.time() - t1:.2f} seconds")
         print(f"Preprocessed images shape: {images.shape}")
         img_hw = images.shape[-2:]
 
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-
-        # First submap so set new pcd num to 0
+        # Submap ids follow the last persistent non-loop frame.
         if self.map.get_largest_key() is None:
             new_pcd_num = 0
         else:
-            new_pcd_num = self.map.get_largest_key() + self.map.get_latest_submap().get_last_non_loop_frame_index() + 1
+            new_pcd_num = (
+                self.map.get_largest_key()
+                + self.map.get_latest_submap().get_last_non_loop_frame_index()
+                + 1)
 
         print(f"Creating new submap with id {new_pcd_num}")
         t1 = time.time()
         new_submap = Submap(new_pcd_num)
-        # 修改点 1：帧张量存 CPU，避免随子图数线性增长的显存占用
+        # Persistent submap frames live on CPU to bound GPU memory growth.
         new_submap.add_all_frames(images.cpu())
         new_submap.set_frame_ids(image_names)
         new_submap.set_last_non_loop_frame_index(images.shape[0] - 1)
-        new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
+        new_submap.set_all_retrieval_vectors(
+            self.image_retrieval.get_all_submap_embeddings(new_submap))
         new_submap.set_img_names(image_names)
 
         self.current_working_submap = new_submap
@@ -64,23 +69,34 @@ class OnlineSolver(Solver):
         del images
         torch.cuda.empty_cache()
 
-        # Check for loop closures and add retrieval vectors from new submap to the database
+        # Loop closure uses only the selected frame pair on GPU.
         predictions_lc = None
         with self.loop_closure_timer:
-            detected_loops = self.image_retrieval.find_loop_closures(self.map, new_submap, max_loop_closures=max_loops, max_similarity_thres=self.lc_thres)
+            detected_loops = self.image_retrieval.find_loop_closures(
+                self.map, new_submap, max_loop_closures=max_loops,
+                max_similarity_thres=self.lc_thres)
         loop_closure_frame_names = []
         if len(detected_loops) > 0:
             print(colored("detected_loops", "yellow"), detected_loops)
             retrieved_frames = self.map.get_frames_from_loops(detected_loops)
             with torch.no_grad():
-                # 修改点 2：子图帧已在 CPU，回环两帧临时搬回 GPU
-                lc_frames = torch.stack((new_submap.get_frame_at_index(detected_loops[0].query_submap_frame), retrieved_frames[0]), axis=0).to(device)
+                query_frame = new_submap.get_frame_at_index(
+                    detected_loops[0].query_submap_frame)
+                lc_frames = torch.stack(
+                    (query_frame, retrieved_frames[0]), axis=0).to(device)
                 predictions_lc = model(lc_frames, compute_similarity=True)
-                loop_closure_frame_names = [new_submap.get_img_names_at_index(detected_loops[0].query_submap_frame),
-                self.map.get_submap(detected_loops[0].detected_submap_id).get_img_names_at_index(detected_loops[0].detected_submap_frame)]
+                detected_submap = self.map.get_submap(
+                    detected_loops[0].detected_submap_id)
+                loop_closure_frame_names = [
+                    new_submap.get_img_names_at_index(
+                        detected_loops[0].query_submap_frame),
+                    detected_submap.get_img_names_at_index(
+                        detected_loops[0].detected_submap_frame),
+                ]
 
         print("Converting pose encoding to extrinsic and intrinsic matrices...")
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], img_hw)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            predictions["pose_enc"], img_hw)
         predictions["extrinsic"] = extrinsic
         predictions["intrinsic"] = intrinsic
 
@@ -89,20 +105,22 @@ class OnlineSolver(Solver):
         if predictions_lc is not None:
             image_match_ratio = predictions_lc["image_match_ratio"]
             if image_match_ratio < 0.95:
-                print(colored("Loop closure image match ratio too low, skipping loop closure", "red"))
-                predictions_lc = None # We set to None to ignore the loop closure
+                print(colored(
+                    "Loop closure image match ratio too low; skipping", "red"))
+                predictions_lc = None
                 predictions["detected_loops"] = []
             else:
                 self.graph.increment_loop_closure()
-                extrinsic_lc, intrinsic_lc = pose_encoding_to_extri_intri(predictions_lc["pose_enc"], retrieved_frames[0].shape[-2:])
+                extrinsic_lc, intrinsic_lc = pose_encoding_to_extri_intri(
+                    predictions_lc["pose_enc"], retrieved_frames[0].shape[-2:])
                 predictions["extrinsic_lc"] = extrinsic_lc
                 predictions["intrinsic_lc"] = intrinsic_lc
                 predictions["depth_lc"] = predictions_lc["depth"]
                 predictions["depth_conf_lc"] = predictions_lc["depth_conf"]
 
-        for key in predictions.keys():
-            if isinstance(predictions[key], torch.Tensor) and key != "target_tokens":
-                predictions[key] = predictions[key].float().cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+        for key, value in predictions.items():
+            if isinstance(value, torch.Tensor) and key != "target_tokens":
+                predictions[key] = value.float().cpu().numpy().squeeze(0)
 
         if predictions_lc is not None:
             predictions["frames_lc"] = lc_frames[0:2, ...]

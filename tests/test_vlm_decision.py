@@ -66,6 +66,21 @@ def test_disabled_client_is_network_free():
     assert called == []
 
 
+def test_png_topdown_map_uses_png_data_uri():
+    fake = _FakePost([{"action": "END_ADJUST"}])
+    client = VLMDecisionClient(
+        api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
+        post_fn=fake)
+    png = b"\x89PNG\r\n\x1a\nmap-bytes"
+    client.agentic_chat("Event: adjustment", [
+        ("current_observation", b"jpeg"), ("topdown_map", png)])
+    content = fake.calls[-1][1]["json"]["messages"][1]["content"]
+    urls = [part["image_url"]["url"] for part in content
+            if part.get("type") == "image_url"]
+    assert urls[0].startswith("data:image/jpeg;base64,")
+    assert urls[1].startswith("data:image/png;base64,")
+
+
 def test_chat_text_returns_plain_text_without_json_mode():
     calls = []
 
@@ -87,8 +102,49 @@ def test_chat_text_returns_plain_text_without_json_mode():
     assert "Image label: pointing_overlay" in labels
 
 
+def test_vlm_trace_contains_raw_and_parsed_outputs(tmp_path):
+    path = tmp_path / "vlm_calls.jsonl"
+    fake = _FakePost([{"action": "EXPLORE", "reason": "continue"}])
+    client = VLMDecisionClient(
+        api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
+        post_fn=fake, trace_path=str(path))
+    client.set_trace_context(episode="ep1", step=12)
+    assert client.agentic_chat("event", [("current", b"jpeg")])["action"] \
+        == "EXPLORE"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["parsed_output"]["action"] == "EXPLORE"
+    assert "choices" in record["raw_response"]
+    assert record["context"] == {"episode": "ep1", "step": 12}
+    assert record["images"][0]["label"] == "current"
+
+
+def test_vlm_trace_saves_exact_transmitted_images(tmp_path):
+    trace_path = tmp_path / "vlm_calls.jsonl"
+    image_dir = tmp_path / "vlm_inputs"
+    fake = _FakePost([{"action": "END_ADJUST"}])
+    client = VLMDecisionClient(
+        api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
+        post_fn=fake, trace_path=str(trace_path), image_dir=str(image_dir))
+    client.set_trace_context(episode="scene/ep1", step=7)
+    topdown = b"\x89PNG\r\n\x1a\nexact-map-bytes"
+    client.agentic_chat("event", [
+        ("current_observation", b"jpeg-bytes"),
+        ("topdown_map", topdown),
+    ])
+
+    record = json.loads(trace_path.read_text(encoding="utf-8"))
+    topdown_meta = next(
+        item for item in record["images"] if item["label"] == "topdown_map")
+    saved = topdown_meta["saved_path"]
+    assert os.path.basename(saved).endswith("topdown_map.png")
+    with open(saved, "rb") as fp:
+        assert fp.read() == topdown
+    assert topdown_meta["sha1"] == __import__("hashlib").sha1(topdown).hexdigest()
+
+
 if __name__ == "__main__":
     test_openai_compatible_unified_call()
     test_disabled_client_is_network_free()
+    test_png_topdown_map_uses_png_data_uri()
     test_chat_text_returns_plain_text_without_json_mode()
     print("VLM decision tests passed")

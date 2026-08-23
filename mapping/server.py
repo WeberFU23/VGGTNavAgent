@@ -26,25 +26,37 @@ import cv2
 import numpy as np
 import torch
 
+from mapping.keyframes import AdaptiveKeyframeSelector, pop_submap_window
+from runtime_paths import run_debug_path
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="VGGT-SLAM mapping server")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--submap-size", type=int, default=16)
-    parser.add_argument("--overlapping-window-size", type=int, default=1)
+    parser.add_argument(
+        "--overlapping-window-size", type=int, default=3,
+        help="相邻子图共享的关键帧数；室内导航默认 3 以增强子图配准")
     parser.add_argument("--max-loops", type=int, default=1,
                         help="0 关闭回环检测（SALAD ckpt 缺失时也会自动关闭）")
-    parser.add_argument("--min-disparity", type=float, default=50)
+    parser.add_argument(
+        "--min-disparity", type=float, default=40,
+        help="相对上一关键帧的平均光流像素阈值")
+    parser.add_argument(
+        "--max-keyframe-interval", type=int, default=3,
+        help="最多允许连续多少个观测不刷新关键帧，防止弱纹理直行断链")
     parser.add_argument("--conf-threshold", type=float, default=25.0)
     parser.add_argument("--lc-thres", type=float, default=0.95)
-    parser.add_argument("--keyframe-dir", type=str, default="mapping_keyframes",
+    parser.add_argument("--keyframe-dir", type=str,
+                        default=run_debug_path("mapping", "keyframes"),
                         help="关键帧临时落盘目录（复用 VGGT 官方预处理）")
     parser.add_argument("--vis", action="store_true",
                         help="开启 viser 可视化（占用 8080 端口）")
     parser.add_argument("--no-semantic", action="store_true",
                         help="关闭 caption/pointing 语义记忆（语义查询不可用）")
-    parser.add_argument("--diag-dir", type=str, default="mapping_diag",
+    parser.add_argument("--diag-dir", type=str,
+                        default=run_debug_path("mapping", "diagnostics"),
                         help="语义查询诊断目录：JSONL 记录 + top-K 帧图像转储")
     return parser.parse_args()
 
@@ -64,6 +76,17 @@ def _has_salad_ckpt():
 class MappingServer:
     def __init__(self, args):
         self.args = args
+        self._closed = False
+        self._server_socket = None
+        self._frame_save_warned = False
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("mapping server 需要可用的 CUDA GPU")
+        if args.submap_size < 2:
+            raise ValueError("submap-size 必须至少为 2")
+        if not 1 <= args.overlapping_window_size < args.submap_size:
+            raise ValueError(
+                "overlapping-window-size 必须在 [1, submap-size) 范围内")
 
         if not args.vis:
             import vggt_slam.solver as solver_module
@@ -80,28 +103,63 @@ class MappingServer:
 
         self.use_loop_closure = args.max_loops > 0 and _has_salad_ckpt()
         if args.max_loops > 0 and not self.use_loop_closure:
-            print("[server] WARNING: dino_salad.ckpt 缺失，回环检测已禁用")
+            expected_salad = os.path.join(
+                torch.hub.get_dir(), "checkpoints", "dino_salad.ckpt")
+            print(f"[server] WARNING: {expected_salad} 缺失，回环检测已禁用")
 
         self.solver = OnlineSolver(
             init_conf_threshold=args.conf_threshold,
             lc_thres=args.lc_thres,
         )
+        self.keyframe_selector = AdaptiveKeyframeSelector(
+            self.solver.flow_tracker,
+            min_disparity=args.min_disparity,
+            max_interval=args.max_keyframe_interval,
+        )
         if not self.use_loop_closure:
             # 用一个返回空结果的 dummy 替换 SALAD 检索，避免依赖 ckpt。
             self.solver.image_retrieval = _NullRetrieval()
 
-        print("[server] 加载 VGGT-1B 权重（首次运行会从 HuggingFace 下载约 5GB）...")
+        default_ckpt = os.path.join(
+            torch.hub.get_dir(), "checkpoints", "model.pt")
+        checkpoint = os.environ.get("VGGT_MODEL_CKPT", default_ckpt)
+        allow_download = os.environ.get("VGGT_ALLOW_DOWNLOAD", "0") == "1"
+        if not os.path.isfile(checkpoint) and not allow_download:
+            raise RuntimeError(
+                f"VGGT-1B 权重未找到: {checkpoint}。为避免意外下载大模型，"
+                "请设置 VGGT_MODEL_CKPT 指向已有 model.pt；确认需要下载时才"
+                "设置 VGGT_ALLOW_DOWNLOAD=1")
+        print(f"[server] 加载 VGGT-1B 权重: {checkpoint}")
         from vggt.models.vggt import VGGT
         model = VGGT()
         url = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-        model.load_state_dict(torch.hub.load_state_dict_from_url(url))
+        if os.path.isfile(checkpoint) and \
+                os.path.realpath(checkpoint) != os.path.realpath(default_ckpt):
+            state_dict = torch.load(checkpoint, map_location="cpu")
+        else:
+            # torch hub 命中 checkpoints/model.pt 时不会重新下载。
+            state_dict = torch.hub.load_state_dict_from_url(url)
+        model.load_state_dict(state_dict)
         model.eval()
-        self.model = model.to(torch.bfloat16).to("cuda")
+        major, _minor = torch.cuda.get_device_capability()
+        model_dtype = torch.bfloat16 if major >= 8 else torch.float16
+        self.model = model.to(dtype=model_dtype, device="cuda")
         print("[server] 模型加载完成")
 
         self.solver_lock = threading.Lock()  # 保证同时只有一个子图在处理
         self.data_lock = threading.Lock()    # 保护 solver 内部状态
         self.gpu_lock = threading.Lock()     # VGGT/语义模型不并发抢显存
+
+        # 诊断设施必须先于语义 worker 初始化，因为 vLLM trace 回调依赖它。
+        self.diag_dir = args.diag_dir
+        self.diag_lock = threading.Lock()
+        self._current_episode = None
+        self._diag_fp = None
+        self._frame_manifest_fp = None
+        self._diag_frame_dir = None
+        self._diag_write_warned = False
+        self._frame_manifest_warned = False
+        os.makedirs(self.diag_dir, exist_ok=True)
 
         # 唯一语义链路：查询无关 caption + BGE-M3 检索 + VLM pointing。
         self.retrieve_top_k = int(os.environ.get("NAV_RETRIEVE_TOP_K", "10"))
@@ -124,21 +182,9 @@ class MappingServer:
 
         os.makedirs(args.keyframe_dir, exist_ok=True)
 
-        # 语义查询诊断：JSONL 记录 caption 检索、VQA 与 pointing 结果，
-        # 并转储候选帧（keyframe_dir 会在 reset_map 时清空）。
-        self.diag_dir = args.diag_dir
-        self.diag_lock = threading.Lock()
-        self._current_episode = None
-        self._diag_fp = None
-        self._diag_frame_dir = None
-        os.makedirs(self.diag_dir, exist_ok=True)
-
     # ------------------------------------------------------------------
     # caption / pointing 语义记忆
     # ------------------------------------------------------------------
-    def _semantic_enabled(self):
-        return self.embedder is not None
-
     def _init_semantic_memory(self):
         """caption 语义记忆 + VLM pointing 链路。
 
@@ -153,14 +199,18 @@ class MappingServer:
 
         self.vllm = VLLMGateway(
             url=os.environ.get("NAV_VLLM_URL", "http://127.0.0.1:8000/v1"),
-            api_key=os.environ.get("NAV_VLLM_API_KEY", "EMPTY"))
+            api_key=os.environ.get("NAV_VLLM_API_KEY", "EMPTY"),
+            trace_fn=lambda record: self._diag_write(
+                {"cmd": "vlm_call", **record}))
         store_path = os.environ.get(
             "NAV_CAPTION_STORE_PATH",
             os.path.join(self.args.diag_dir, "caption_store"))
         self.caption_store = CaptionStore(persist_dir=store_path)
         try:
             self.embedder = BGEM3Embedder(
-                os.environ.get("NAV_EMBED_MODEL_PATH", ""))
+                os.environ.get("NAV_EMBED_MODEL_PATH", ""),
+                device=os.environ.get("NAV_EMBED_DEVICE", "cuda"),
+            )
         except RuntimeError as exc:
             print(f"[server] WARNING: {exc}；caption 检索不可用", flush=True)
             self.embedder = None
@@ -170,7 +220,8 @@ class MappingServer:
                 self.vllm, self.embedder, self.caption_store,
                 model=caption_model,
                 busy_fn=lambda: self.gpu_lock.locked()
-                or self.solver_lock.locked())
+                or self.solver_lock.locked(),
+                result_fn=self._caption_diag_result)
             print("[server] caption worker 已启动 "
                   f"(model={caption_model})", flush=True)
         else:
@@ -195,52 +246,79 @@ class MappingServer:
         # "目标是否进入视野"核查。episode 目录由 set_episode 创建。
         if self._current_episode and self._diag_frame_dir:
             try:
-                cv2.imwrite(
+                saved = cv2.imwrite(
                     os.path.join(
                         self._diag_frame_dir,
                         f"rgb_{self.num_frames:06d}.jpg"),
                     bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            except Exception:
-                pass
-        is_keyframe = self.solver.flow_tracker.compute_disparity(
-            bgr, self.args.min_disparity)
+                if not saved:
+                    raise OSError("cv2.imwrite returned false")
+            except Exception as exc:  # OpenCV/文件系统失败不应中断建图
+                if not self._frame_save_warned:
+                    print(f"[server] WARNING: RGB 诊断图保存失败: {exc}",
+                          flush=True)
+                    self._frame_save_warned = True
+        is_keyframe, keyframe_reason = self.keyframe_selector.select(bgr)
+        self._frame_manifest_write({
+            "event": "frame_saved",
+            "frame_id": int(self.num_frames),
+            "image": f"rgb_{self.num_frames:06d}.jpg",
+            "is_keyframe": bool(is_keyframe),
+            "keyframe_reason": keyframe_reason,
+            "frames_since_keyframe": (
+                self.keyframe_selector.frames_since_keyframe),
+            "caption_expected": bool(is_keyframe and self.caption_worker),
+        })
 
         if is_keyframe:
             path = os.path.join(
                 self.args.keyframe_dir, f"frame_{self.num_frames:06d}.png")
-            cv2.imwrite(path, bgr)
+            if not cv2.imwrite(path, bgr):
+                raise OSError(f"关键帧保存失败: {path}")
             self.keyframe_paths.append(path)
 
         launched = False
         if len(self.keyframe_paths) >= self.target_size:
-            if self.solver_lock.acquire(blocking=False):
-                self.num_submaps_launched += 1
-                print(f"[server] {time.strftime('%H:%M:%S')} 启动子图 "
-                      f"#{self.num_submaps_launched}, 缓冲 {len(self.keyframe_paths)} 帧",
-                      flush=True)
-                t = threading.Thread(
-                    target=self._process_submap,
-                    args=(list(self.keyframe_paths),),
-                    daemon=True,
-                )
-                t.start()
+            acquired = self.solver_lock.acquire(blocking=False)
+            if not acquired and len(self.keyframe_paths) >= self.target_size * 2:
+                # 后端持续落后时施加背压，避免旧实现截断队列后丢失桥接帧。
+                print(f"[server] {time.strftime('%H:%M:%S')} 关键帧积压 "
+                      f"{len(self.keyframe_paths)}，等待上一子图完成", flush=True)
+                self.solver_lock.acquire()
+                acquired = True
+            if acquired:
+                self._launch_buffered_submap()
                 launched = True
-                self.keyframe_paths = \
-                    self.keyframe_paths[-self.args.overlapping_window_size:]
-            else:
-                # SLAM 忙，限制积压
-                if len(self.keyframe_paths) > self.target_size * 2:
-                    self.keyframe_paths = self.keyframe_paths[-self.target_size:]
-                if self.num_frames % 20 == 0:
-                    print(f"[server] {time.strftime('%H:%M:%S')} 跳过启动(锁被持有), "
-                          f"缓冲 {len(self.keyframe_paths)}", flush=True)
+            elif self.num_frames % 20 == 0:
+                print(f"[server] {time.strftime('%H:%M:%S')} 后端忙，"
+                      f"缓冲 {len(self.keyframe_paths)} 帧", flush=True)
 
         return {
+            "frame_id": int(self.num_frames),
             "is_keyframe": bool(is_keyframe),
+            "keyframe_reason": keyframe_reason,
+            "frames_since_keyframe": (
+                self.keyframe_selector.frames_since_keyframe),
             "queued_keyframes": len(self.keyframe_paths),
             "submap_launched": launched,
             "busy": self.solver_lock.locked(),
         }
+
+    def _launch_buffered_submap(self):
+        """启动队首固定窗口；调用方必须已经取得 solver_lock。"""
+        image_paths, self.keyframe_paths = pop_submap_window(
+            self.keyframe_paths, self.target_size,
+            self.args.overlapping_window_size)
+        self.num_submaps_launched += 1
+        print(f"[server] {time.strftime('%H:%M:%S')} 启动子图 "
+              f"#{self.num_submaps_launched}, {len(image_paths)} 帧, "
+              f"待处理 {len(self.keyframe_paths)} 帧", flush=True)
+        thread = threading.Thread(
+            target=self._process_submap,
+            args=(image_paths,),
+            daemon=True,
+        )
+        thread.start()
 
     def _process_submap(self, image_paths, release_solver_lock=True):
         t_start = time.time()
@@ -307,12 +385,30 @@ class MappingServer:
             useful = len(self.keyframe_paths) - overlap
             if useful <= 0 or len(self.keyframe_paths) < 2:
                 return {"flushed": False, "queued_keyframes": useful}
-            paths = list(self.keyframe_paths)
-            self.num_submaps_launched += 1
+
+            # 先按固定窗口清空完整子图，避免 episode 结束时把积压帧一次性
+            # 送入 VGGT 导致显存峰值和配准退化。
+            while len(self.keyframe_paths) >= self.target_size:
+                paths, self.keyframe_paths = pop_submap_window(
+                    self.keyframe_paths, self.target_size,
+                    self.args.overlapping_window_size)
+                self.num_submaps_launched += 1
+                print(f"[server] 同步提交完整子图 "
+                      f"#{self.num_submaps_launched}, {len(paths)} 帧",
+                      flush=True)
+                self._process_submap(paths, release_solver_lock=False)
+
+            overlap = self.args.overlapping_window_size \
+                if self.num_submaps_launched > 0 else 0
+            useful = len(self.keyframe_paths) - overlap
+            if useful > 0 and len(self.keyframe_paths) >= 2:
+                paths = list(self.keyframe_paths)
+                self.num_submaps_launched += 1
+                print(f"[server] 同步提交尾部子图 "
+                      f"#{self.num_submaps_launched}, {len(paths)} 帧",
+                      flush=True)
+                self._process_submap(paths, release_solver_lock=False)
             self.keyframe_paths = []
-            print(f"[server] 同步提交尾部子图 #{self.num_submaps_launched}, "
-                  f"{len(paths)} 帧", flush=True)
-            self._process_submap(paths, release_solver_lock=False)
         return {"flushed": True, "queued_keyframes": 0}
 
     def reset_map(self):
@@ -322,6 +418,11 @@ class MappingServer:
                 self.solver.map = self._GraphMap()
                 self.solver.graph = self._PoseGraph()
                 self.solver.flow_tracker = self._FrameTracker()
+                self.keyframe_selector = AdaptiveKeyframeSelector(
+                    self.solver.flow_tracker,
+                    min_disparity=self.args.min_disparity,
+                    max_interval=self.args.max_keyframe_interval,
+                )
                 self.solver.current_working_submap = None
                 self.keyframe_paths = []
                 self.num_frames = 0
@@ -333,10 +434,24 @@ class MappingServer:
         if self.caption_store is not None:
             self.caption_store.save()
             self.caption_store.clear()
-        if os.path.isdir(self.args.keyframe_dir):
-            shutil.rmtree(self.args.keyframe_dir)
-        os.makedirs(self.args.keyframe_dir, exist_ok=True)
+        if self.vllm is not None:
+            self.vllm.clear_cache()
+        self._recreate_keyframe_dir()
         return {"reset": True}
+
+    def _recreate_keyframe_dir(self):
+        """只重建明确配置的关键帧临时目录，拒绝宽泛危险路径。"""
+        target = os.path.realpath(os.path.abspath(self.args.keyframe_dir))
+        forbidden = {
+            os.path.realpath(os.path.abspath(os.sep)),
+            os.path.realpath(os.path.expanduser("~")),
+            os.path.realpath(os.getcwd()),
+        }
+        if target in forbidden or not os.path.basename(target):
+            raise RuntimeError(f"拒绝清空不安全的 keyframe-dir: {target}")
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        os.makedirs(target, exist_ok=True)
 
     # ------------------------------------------------------------------
     # 查询接口
@@ -351,7 +466,22 @@ class MappingServer:
             "num_submaps": num_submaps,
             "num_loop_closures": num_loops,
             "loop_closure_enabled": self.use_loop_closure,
+            "keyframe_policy": {
+                "min_disparity": self.keyframe_selector.min_disparity,
+                "max_interval": self.keyframe_selector.max_interval,
+                "frames_since_keyframe": (
+                    self.keyframe_selector.frames_since_keyframe),
+                "forced_keyframes": self.keyframe_selector.num_forced,
+                "submap_overlap": self.args.overlapping_window_size,
+            },
             "busy": self.solver_lock.locked(),
+            "semantic": {
+                "caption_enabled": self.caption_worker is not None,
+                "embedding_enabled": self.embedder is not None,
+                "pointing_enabled": self.pointer is not None,
+                "caption_errors": (self.caption_worker.errors
+                                   if self.caption_worker is not None else 0),
+            },
             # 语义记忆进度：caption worker 尚未消化完的关键帧数 / 最新完成帧。
             # agent 检索前据此等待，避免漏掉刚入图的关键帧。
             "caption_pending": (self.caption_worker.pending()
@@ -359,6 +489,15 @@ class MappingServer:
             "caption_last_completed": (
                 self.caption_worker.last_completed_frame_id
                 if self.caption_worker is not None else None),
+        }
+
+    def get_captioned_frame_ids(self):
+        """返回当前 episode 已完成 caption 并写入语义库的关键帧。"""
+        if self.caption_store is None:
+            return {"enabled": False, "frame_ids": []}
+        return {
+            "enabled": self.caption_worker is not None,
+            "frame_ids": [int(fid) for fid in self.caption_store.frame_ids],
         }
 
     def _collect_poses(self):
@@ -422,6 +561,12 @@ class MappingServer:
         stride = max(int(stride), 1)
         with self.data_lock:
             metas, chunks = [], []
+            snapshot_revision = {
+                "num_frames": int(self.num_frames),
+                "num_submaps": int(self.solver.map.get_num_submaps()),
+                "num_loop_closures": int(
+                    self.solver.graph.get_num_loops()),
+            }
             for submap in self.solver.map.ordered_submaps_by_key():
                 if submap.get_lc_status():
                     continue
@@ -447,7 +592,8 @@ class MappingServer:
                             poses[index], dtype=np.float32).tolist(),
                     })
                     chunks.append(world.tobytes())
-        return {"frames": metas}, b"".join(chunks)
+        return {"frames": metas,
+                "snapshot_revision": snapshot_revision}, b"".join(chunks)
 
     def get_intrinsics(self):
         """返回 VGGT 预测的各子图首帧内参（预处理图像坐标系，518 宽）。"""
@@ -464,11 +610,16 @@ class MappingServer:
     # ------------------------------------------------------------------
     def _set_episode(self, episode_id):
         """记录当前 episode，并切换诊断 JSONL 输出。"""
-        episode_id = str(episode_id or "unknown").strip()
+        raw_episode_id = str(episode_id or "unknown").strip()
+        episode_id = "".join(
+            ch if ch.isalnum() or ch in "-_." else "_"
+            for ch in raw_episode_id)[:120] or "unknown"
         if episode_id == self._current_episode:
             return
         if self.caption_worker is not None:
             self.caption_worker.clear()
+        if self.vllm is not None:
+            self.vllm.clear_cache()
         if self.caption_store is not None:
             self.caption_store.set_episode(episode_id)
         with self.diag_lock:
@@ -478,12 +629,22 @@ class MappingServer:
                 except Exception:
                     pass
                 self._diag_fp = None
+            if self._frame_manifest_fp is not None:
+                try:
+                    self._frame_manifest_fp.close()
+                except Exception:
+                    pass
+                self._frame_manifest_fp = None
             self._current_episode = episode_id
             self._diag_frame_dir = os.path.join(
                 self.diag_dir, f"{episode_id}_frames")
             os.makedirs(self._diag_frame_dir, exist_ok=True)
             self._diag_fp = open(
                 os.path.join(self.diag_dir, f"{episode_id}_queries.jsonl"),
+                "a", encoding="utf-8")
+            self._frame_manifest_fp = open(
+                os.path.join(
+                    self.diag_dir, f"{episode_id}_frame_captions.jsonl"),
                 "a", encoding="utf-8")
             print(f"[server] 诊断 episode={episode_id} -> {self.diag_dir}",
                   flush=True)
@@ -499,8 +660,39 @@ class MappingServer:
             try:
                 self._diag_fp.write(json.dumps(record) + "\n")
                 self._diag_fp.flush()
-            except Exception:
-                pass
+            except OSError as exc:
+                if not self._diag_write_warned:
+                    print(f"[server] WARNING: 诊断查询日志写入失败: {exc}",
+                          flush=True)
+                    self._diag_write_warned = True
+
+    def _frame_manifest_write(self, record):
+        """Append frame/caption events joined by frame_id."""
+        item = dict(record)
+        item.setdefault("episode", self._current_episode)
+        item.setdefault("t", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        with self.diag_lock:
+            if self._frame_manifest_fp is None:
+                return
+            try:
+                self._frame_manifest_fp.write(json.dumps(
+                    item, ensure_ascii=False, default=str) + "\n")
+                self._frame_manifest_fp.flush()
+            except OSError as exc:
+                if not self._frame_manifest_warned:
+                    print(f"[server] WARNING: frame/caption 日志写入失败: {exc}",
+                          flush=True)
+                    self._frame_manifest_warned = True
+
+    def _caption_diag_result(self, record):
+        item = dict(record)
+        frame_id = int(item.get("frame_id"))
+        item.update({
+            "event": "caption_result",
+            "image": f"rgb_{frame_id:06d}.jpg",
+        })
+        self._frame_manifest_write(item)
+        self._diag_write({"cmd": "caption_result", **item})
 
     def _diag_dump_frame(self, frame, frame_id, tag):
         """把一帧图像转储到诊断目录，返回相对文件名。"""
@@ -590,7 +782,8 @@ class MappingServer:
                      "text": item["caption"]}
             frame_diag = {"frame_id": fid, "retrieve_score": item["score"],
                           "dump": dump_name, "points": []}
-            pts = self.pointer.point(pil, text, frame_key=f"frame_{fid}")
+            frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}"
+            pts = self.pointer.point(pil, text, frame_key=frame_key)
             if not pts:
                 entry["found"] = False
                 results.append(entry)
@@ -706,6 +899,20 @@ class MappingServer:
                 "num_points": resolved["num_points"],
                 "depth_std": resolved.get("depth_std")}
 
+    def resolve_candidates(self, candidate_ids):
+        """批量刷新候选坐标，避免 agent 为一张地图逐个建立 RPC。"""
+        ids = list(dict.fromkeys(str(cid) for cid in candidate_ids or []))[:64]
+        rows = {}
+        for candidate_id in ids:
+            try:
+                rows[candidate_id] = self.resolve_candidate(candidate_id)
+            except Exception as exc:
+                rows[candidate_id] = {
+                    "found": False,
+                    "error": f"resolve failed: {type(exc).__name__}",
+                }
+        return {"candidates": rows}
+
     def candidate_evidence(self, candidate_id):
         """生成紧凑的候选 crop + mask overlay JPEG。"""
         cand = self._ground_candidates.get(str(candidate_id))
@@ -804,8 +1011,7 @@ class MappingServer:
         if cmd == "ping":
             return {"ok": True}, b""
         if cmd == "feed":
-            shape = header["shape"]
-            rgb = np.frombuffer(payload, dtype=np.uint8).reshape(shape)
+            rgb = self._decode_rgb(header.get("shape"), payload)
             return {"ok": True, **self.feed_frame(rgb)}, b""
         if cmd == "reset_map":
             return {"ok": True, **self.reset_map()}, b""
@@ -813,6 +1019,8 @@ class MappingServer:
             return {"ok": True, **self.flush_map()}, b""
         if cmd == "get_state":
             return {"ok": True, **self.get_state()}, b""
+        if cmd == "get_captioned_frame_ids":
+            return {"ok": True, **self.get_captioned_frame_ids()}, b""
         if cmd == "set_episode":
             self._set_episode(header.get("episode_id"))
             return {"ok": True}, b""
@@ -841,12 +1049,14 @@ class MappingServer:
         if cmd == "resolve_candidate":
             return {"ok": True, **self.resolve_candidate(
                 header["candidate_id"])}, b""
+        if cmd == "resolve_candidates":
+            return {"ok": True, **self.resolve_candidates(
+                header.get("candidate_ids", []))}, b""
         if cmd == "candidate_evidence":
             resp, evidence = self.candidate_evidence(header["candidate_id"])
             return {"ok": True, **resp}, evidence
         if cmd == "ground_frame":
-            shape = header["shape"]
-            rgb = np.frombuffer(payload, dtype=np.uint8).reshape(shape)
+            rgb = self._decode_rgb(header.get("shape"), payload)
             return {"ok": True, **self.ground_frame(
                 rgb, header["text"])}, b""
         if cmd == "get_frame_points":
@@ -857,44 +1067,103 @@ class MappingServer:
             return {"ok": True, "shutdown": True}, b""
         return {"ok": False, "error": f"unknown cmd: {cmd}"}, b""
 
+    @staticmethod
+    def _decode_rgb(shape, payload):
+        """校验并解码协议中的 HxWx3 uint8 RGB，避免畸形请求终止服务。"""
+        if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+            raise ValueError("RGB shape 必须是 [H, W, 3]")
+        try:
+            h, w, channels = (int(v) for v in shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RGB shape 必须包含整数") from exc
+        if h <= 0 or w <= 0 or channels != 3:
+            raise ValueError("RGB shape 必须是正尺寸 [H, W, 3]")
+        expected = h * w * channels
+        if len(payload) != expected:
+            raise ValueError(
+                f"RGB payload 长度不匹配: {len(payload)} != {expected}")
+        return np.frombuffer(payload, dtype=np.uint8).reshape(h, w, channels)
+
     def serve(self):
         from mapping.protocol import recv_msg, send_msg
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_socket = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.args.host, self.args.port))
         sock.listen(1)
         print(f"[server] 监听 {self.args.host}:{self.args.port}")
-        while True:
-            conn, addr = sock.accept()
-            print(f"[server] 客户端接入: {addr}")
+        try:
+            while not self._closed:
+                conn, addr = sock.accept()
+                print(f"[server] 客户端接入: {addr}")
+                try:
+                    while True:
+                        header, payload = recv_msg(conn)
+                        request_id = header.get("request_id")
+                        cacheable = header.get("cmd") in {
+                            "feed", "reset_map", "flush_map", "ground_object",
+                            "ground_frame", "shutdown",
+                        }
+                        if cacheable and request_id in self._response_cache:
+                            resp, resp_payload = self._response_cache[request_id]
+                        else:
+                            try:
+                                resp, resp_payload = self.handle_message(
+                                    header, payload)
+                            except Exception as exc:  # 单个请求失败不拖垮服务
+                                print(f"[server] 请求 {header.get('cmd')!r} 失败: "
+                                      f"{exc}", flush=True)
+                                traceback.print_exc()
+                                resp = {"ok": False, "error": str(exc)}
+                                resp_payload = b""
+                            if cacheable and request_id:
+                                self._response_cache[request_id] = (
+                                    resp, resp_payload)
+                                while len(self._response_cache) > 16:
+                                    self._response_cache.pop(
+                                        next(iter(self._response_cache)))
+                        send_msg(conn, resp, resp_payload)
+                        if resp.get("shutdown"):
+                            print("[server] 收到 shutdown，退出")
+                            return
+                except (ConnectionError, OSError):
+                    print("[server] 客户端断开")
+                except Exception as exc:
+                    # 协议帧本身损坏时无法可靠回复，只关闭当前连接。
+                    print(f"[server] 客户端协议错误: {exc}", flush=True)
+                    traceback.print_exc()
+                finally:
+                    conn.close()
+        finally:
+            sock.close()
+            self._server_socket = None
+
+    def close(self):
+        """幂等释放后台 worker、诊断文件与监听 socket。"""
+        if self._closed:
+            return
+        self._closed = True
+        if self.caption_worker is not None:
+            self.caption_worker.close()
+        if self.caption_store is not None:
+            self.caption_store.save()
+        if self.vllm is not None:
+            self.vllm.close()
+        with self.diag_lock:
+            for fp_name in ("_diag_fp", "_frame_manifest_fp"):
+                fp = getattr(self, fp_name, None)
+                if fp is not None:
+                    try:
+                        fp.close()
+                    except OSError:
+                        pass
+                    setattr(self, fp_name, None)
+        if self._server_socket is not None:
             try:
-                while True:
-                    header, payload = recv_msg(conn)
-                    request_id = header.get("request_id")
-                    cacheable = header.get("cmd") in {
-                        "feed", "reset_map", "flush_map", "ground_object",
-                        "ground_frame", "shutdown",
-                    }
-                    if cacheable and request_id in self._response_cache:
-                        resp, resp_payload = self._response_cache[request_id]
-                    else:
-                        resp, resp_payload = self.handle_message(header, payload)
-                        if cacheable and request_id:
-                            self._response_cache[request_id] = (
-                                resp, resp_payload)
-                            while len(self._response_cache) > 16:
-                                self._response_cache.pop(
-                                    next(iter(self._response_cache)))
-                    send_msg(conn, resp, resp_payload)
-                    if resp.get("shutdown"):
-                        print("[server] 收到 shutdown，退出")
-                        conn.close()
-                        return
-            except (ConnectionError, OSError):
-                print("[server] 客户端断开")
-            finally:
-                conn.close()
+                self._server_socket.close()
+            except OSError:
+                pass
 
 
 class _NullRetrieval:
@@ -910,7 +1179,10 @@ class _NullRetrieval:
 def main():
     args = _parse_args()
     server = MappingServer(args)
-    server.serve()
+    try:
+        server.serve()
+    finally:
+        server.close()
 
 
 if __name__ == "__main__":

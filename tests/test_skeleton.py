@@ -129,6 +129,27 @@ def test_frontier_representative_is_free_and_reports_gain():
     assert clusters[0]["clearance_cells"] > 0
 
 
+def test_semantic_gap_creates_one_unified_frontier():
+    """几何已覆盖但 caption 视角不足时，仍应产生语义型统一 frontier。"""
+    free = np.zeros((20, 24), dtype=bool)
+    free[5:15, 3:20] = True
+    obstacle = np.zeros_like(free)
+    geometry = np.ones_like(free)
+    semantic = np.zeros_like(free)
+    semantic[5:15, 3:10] = True
+    grid = OccupancyGrid(
+        1.0, np.zeros(2), free, obstacle, observed=geometry,
+        semantic_inspected=semantic, semantic_coverage_enabled=True)
+    clusters, layers = sk.frontier_clusters(
+        grid, min_size=3, return_layers=True)
+    assert clusters
+    assert all(c["reason"] == "semantic" for c in clusters)
+    assert clusters[0]["semantic_gain"] > 0
+    assert clusters[0]["geometry_gain"] == 0
+    assert layers["semantic"].any() and layers["unified"].any()
+    assert not layers["geometry"].any()
+
+
 if __name__ == "__main__":
     test_cross_junction()
     test_t_junction()
@@ -137,4 +158,5 @@ if __name__ == "__main__":
     test_frontier_does_not_wrap_edges()
     test_observed_hole_is_not_frontier()
     test_frontier_representative_is_free_and_reports_gain()
+    test_semantic_gap_creates_one_unified_frontier()
     print("ALL SKELETON TESTS PASSED")

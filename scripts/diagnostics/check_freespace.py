@@ -2,8 +2,8 @@
 
 用法（habitat 环境，eval 跑完、server 仍持图时）::
 
-    PYTHONPATH=/path/to/vggt_nav_agent python scripts/check_freespace.py \
-        --port 5555 --out /tmp/freespace.png
+    PYTHONPATH=/path/to/vggt_nav_agent python scripts/diagnostics/check_freespace.py \
+        --port 5555
 
 配色：白=未知/不可达，绿=可行走（连通域内），红=膨胀障碍，
 蓝=相机轨迹，黄=最新相机位置。
@@ -16,6 +16,7 @@ import numpy as np
 
 from agents import navigator as nav
 from mapping.client import MappingClient
+from runtime_paths import run_debug_path
 
 
 def render(grid, cam_centers_aligned, out_png, size=1024):
@@ -49,7 +50,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--out", default="/tmp/freespace.png")
+    parser.add_argument(
+        "--out", default=run_debug_path("diagnostics", "freespace.png"))
     parser.add_argument("--max-points", type=int, default=800000)
     parser.add_argument("--stride", type=int, default=6)
     args = parser.parse_args()

@@ -14,7 +14,8 @@ from benchmark_api import Action
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents import navigator as nav
-from agents.decision_state import build_world_state
+from agents import skeleton as sk
+from agents.decision_state import _path_cost_m, build_world_state
 from agents.map_render import render_topdown
 from agents.nav_agent import NavAgent
 from decision import DecisionLoop, DecisionTraceLogger
@@ -34,6 +35,13 @@ def _state(mode="all", found=1, expected=None, instances=None, frontiers=None):
                         "unreported_instance_count": 1,
                         "frontier_count": 1},
     }
+
+
+def test_same_cell_path_cost_is_zero_not_unreachable():
+    grid = nav.OccupancyGrid(
+        1.0, np.zeros(2), np.ones((4, 4), dtype=bool),
+        np.zeros((4, 4), dtype=bool))
+    assert _path_cost_m(grid, (1.1, 1.1), (1.4, 1.4, 0.0), 1.0) == 0.0
 
 
 class _ScriptedChat:
@@ -62,6 +70,10 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert "query_memory" not in prompt
     assert "list_instances" not in prompt
     assert '"confidence"' not in prompt
+    assert "this is not\n  random wandering" in prompt
+    assert "short local active exploration" in prompt
+    assert "raw unified frontier boundary" in prompt
+    assert "reason=semantic" in prompt
 
 
 def test_search_captions_tool_call():
@@ -126,6 +138,46 @@ def test_arrival_actions_are_report_scan_or_explore():
         result = DecisionLoop(_ScriptedChat([
             {"action": action}])).decide("arrival", _state())
         assert result.action == action
+
+
+def test_arrival_can_choose_another_instance_or_frontier():
+    for action, target_id in (("GOTO_INSTANCE", "1"),
+                              ("GOTO_FRONTIER", "f0")):
+        result = DecisionLoop(_ScriptedChat([
+            {"action": action, "target_id": target_id}])).decide(
+                "arrival", _state())
+        assert result.action == action and result.target_id == target_id
+
+
+def test_vlm_explicitly_controls_adjustment_state_transitions():
+    for event in ("world_state_updated", "arrival", "scan_complete"):
+        result = DecisionLoop(_ScriptedChat([{
+            "action": "START_ADJUST"
+        }])).decide(event, _state())
+        assert result.action == "START_ADJUST"
+    for action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "END_ADJUST"):
+        result = DecisionLoop(_ScriptedChat([{
+            "action": action
+        }])).decide("adjustment", _state())
+        assert result.action == action
+
+
+def test_atomic_motion_is_rejected_outside_adjustment():
+    chat = _ScriptedChat([
+        {"action": "MOVE_FORWARD"},
+        {"action": "EXPLORE"},
+    ])
+    result = DecisionLoop(chat).decide("world_state_updated", _state())
+    assert result.action == "EXPLORE"
+
+
+def test_adjustment_rejects_high_level_actions_until_end_adjust():
+    chat = _ScriptedChat([
+        {"action": "REPORT_FOUND"},
+        {"action": "END_ADJUST"},
+    ])
+    result = DecisionLoop(chat).decide("adjustment", _state())
+    assert result.action == "END_ADJUST"
 
 
 def test_scan_complete_reselects_globally_instead_of_reporting():
@@ -212,6 +264,17 @@ def test_write_tool_refreshes_topdown_map_image():
     assert ("topdown_map", old_map) not in second_images
 
 
+def test_topdown_map_is_prioritized_after_current_rgb():
+    chat = _ScriptedChat([{"action": "END_ADJUST"}])
+    images = [("current_observation", b"fresh-rgb")] + [
+        (f"panorama_{i}", f"view-{i}".encode()) for i in range(4)]
+    result = DecisionLoop(chat).decide(
+        "adjustment", _state(), map_png=b"local-map", images=images)
+    assert result.action == "END_ADJUST"
+    labels = [name for name, _payload in chat.calls[0][1]]
+    assert labels[:2] == ["current_observation", "topdown_map"]
+
+
 def test_failed_write_tool_does_not_refresh_state():
     calls = []
 
@@ -284,7 +347,79 @@ def test_render_topdown_uses_single_instance_layer():
         instances=[{"id": 1, "xy": (25, 20), "reported": True}],
         frontiers=[{"id": "f0", "xy": (35, 25)}])
     assert png[:4] == b"\x89PNG"
-    assert Image.open(io.BytesIO(png)).size == (160, 120)
+    width, height = Image.open(io.BytesIO(png)).size
+    assert width >= 512 and height >= 512
+
+
+def test_render_topdown_local_crop_marks_pose_and_active_target():
+    png = render_topdown(
+        _grid(), pose=(20, 15, 0.0),
+        instances=[{"id": 1, "xy": (23, 15), "reported": False}],
+        active_target={"id": 1, "type": "instance", "xy": (23, 15)},
+        crop_center=(20, 15), crop_radius=5.0)
+    image = Image.open(io.BytesIO(png))
+    assert image.size[0] >= 512 and image.size[1] >= 512
+    colors = {tuple(pixel) for pixel in np.asarray(image).reshape(-1, 3)}
+    assert (40, 80, 220) in colors
+    assert (245, 145, 25) in colors
+
+
+def test_render_topdown_distinguishes_semantic_gap_and_raw_frontier():
+    grid = _grid()
+    grid.semantic_coverage_enabled = True
+    grid.semantic_inspected = np.zeros_like(grid.free)
+    grid.semantic_inspected[10:20, 10:20] = grid.free[10:20, 10:20]
+    layers = sk.frontier_layers(grid)
+    png = render_topdown(
+        grid, frontier_layers=layers, min_image_side=0,
+        pixels_per_cell=4, show_legend=False)
+    colors = {tuple(pixel) for pixel in np.asarray(
+        Image.open(io.BytesIO(png))).reshape(-1, 3)}
+    assert (250, 250, 250) in colors
+    assert (255, 232, 160) in colors
+    assert (35, 200, 210) in colors
+
+
+def test_render_topdown_caps_elongated_global_map():
+    png = render_topdown(
+        _grid(h=1800, w=80), pixels_per_cell=4,
+        min_image_side=512, max_image_side=1536)
+    width, height = Image.open(io.BytesIO(png)).size
+    assert min(width, height) >= 512
+    assert max(width, height) <= 1536
+
+
+def test_render_topdown_distinguishes_recent_trajectory_and_shows_status():
+    grid = _grid(h=100, w=100)
+    grid.unit_per_m = 1.0
+    trajectory = [(float(i), 20.0) for i in range(40)]
+    png = render_topdown(
+        grid, trajectory=trajectory, pose=(39.0, 20.0, 0.0),
+        frontier_stats={"raw_clusters": 7, "reachable": 2,
+                        "selectable": 1, "filtered_cooldown": 1},
+        recent_trajectory_points=10)
+    pixels = {tuple(pixel) for pixel in np.asarray(
+        Image.open(io.BytesIO(png))).reshape(-1, 3)}
+    assert (150, 105, 105) in pixels
+    assert (220, 40, 40) in pixels
+
+
+def test_explore_activates_highest_utility_frontier_instead_of_random_walk():
+    agent = _make_agent()
+    obs = SimpleNamespace(step_count=50)
+    best = {
+        "world": np.array([2.0, 0.0]),
+        "path": [np.array([0.0, 0.0]), np.array([2.0, 0.0])],
+        "key": (2, 0), "utility": 3.5, "scale": 0.5,
+    }
+    agent._last_frontier_step = obs.step_count
+    agent._last_frontier_clusters = [best]
+    action = agent._autonomous_explore_action(obs)
+    assert action == int(Action.MOVE_FORWARD)
+    assert agent.mode == "explore"
+    assert agent._explore_follower is not None
+    assert agent._explore_follower.scale == 0.5
+    assert agent._active_frontier_key == best["key"]
 
 
 def _make_agent():
@@ -307,7 +442,9 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
                           goal_text="Find all baskets")
     state = build_world_state(
         agent, obs, grid=_grid(),
-        frontiers=[{"world": np.array([10.0, 2.0]), "size": 7}])
+        frontiers=[{"world": np.array([10.0, 2.0]), "size": 7,
+                    "reason": "semantic", "geometry_gain": 2,
+                    "semantic_gain": 9}])
     row = state["instances"][0]
     assert row["id"] == node.iid
     assert row["text"] == "possible woven basket"
@@ -317,6 +454,22 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
     assert state["instances_total"] == 1
     assert state["instances_omitted_ids"] == []
     assert state["reported_instance_ids"] == []
+    assert state["frontiers"][0]["reason"] == "semantic"
+    assert state["frontiers"][0]["semantic_gain"] == 9
+    assert state["map_coverage"]["semantic_enabled"] is False
+
+
+def test_world_state_uses_explicit_map_snapshot_pose():
+    agent = _make_agent()
+    agent.memory.add([3.0, 4.0, 0.0], "basket")
+    agent._current_aligned_xy = lambda: (_ for _ in ()).throw(
+        AssertionError("live pose must not replace snapshot pose"))
+    agent._frontier_stats = {"raw_clusters": 3, "selectable": 1}
+    obs = SimpleNamespace(step_count=50, max_steps=500,
+                          goal_text="Find all baskets")
+    state = build_world_state(agent, obs, start_xy=(0.0, 0.0))
+    assert state["instances"][0]["dist_m"] == 5.0
+    assert state["termination"]["frontier_filters"]["raw_clusters"] == 3
 
 
 def _build_state(agent, step=50):
@@ -612,7 +765,12 @@ if __name__ == "__main__":
     test_finish_only_enforces_explicit_many_count()
     test_trace_log_written()
     test_render_topdown_uses_single_instance_layer()
+    test_render_topdown_local_crop_marks_pose_and_active_target()
+    test_render_topdown_distinguishes_semantic_gap_and_raw_frontier()
+    test_render_topdown_caps_elongated_global_map()
+    test_render_topdown_distinguishes_recent_trajectory_and_shows_status()
     test_world_state_contains_text_evidence_and_no_anchor_table()
+    test_world_state_uses_explicit_map_snapshot_pose()
     test_world_state_summarizes_instances_beyond_k()
     test_world_state_summary_prefers_nearest_newest_relevant()
     test_world_state_truncates_instance_text()

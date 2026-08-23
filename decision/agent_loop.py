@@ -1,8 +1,8 @@
 """事件驱动的具身 VLM harness。
 
 VLM 通过工具读取和编辑 3D instance memory，再选择实例、frontier、扫描、
-报告或结束。程序只校验 ID 和工具参数；底层跟随、避障与路径规划保持
-确定性。VLM 不直接输出坐标或电机动作。
+报告或结束。底层跟随、避障与路径规划保持确定性；VLM 只有在自己
+显式进入 adjustment 状态后，才能每轮输出一个白名单原子动作。
 
 chat_fn(user_text, images) -> dict|None 可注入（生产接
 VLMDecisionClient.agentic_chat，单测用 mock）。
@@ -13,118 +13,25 @@ import os
 import threading
 import time
 
+from decision.prompts import build_decision_prompt
+
 ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND", "SCAN",
-           "EXPLORE", "FINISH")
+           "EXPLORE", "FINISH", "START_ADJUST", "END_ADJUST",
+           "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
 
 # 写工具：成功执行后实例记忆已变化，动作校验前必须刷新 world-state。
 WRITE_TOOLS = ("update_instance", "merge_instances", "undo_merge")
 
 EVENT_ACTIONS = {
-    "world_state_updated": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE"},
-    "arrival": {"REPORT_FOUND", "SCAN", "EXPLORE"},
-    "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE"},
+    "world_state_updated": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE",
+                            "START_ADJUST"},
+    "arrival": {"REPORT_FOUND", "SCAN", "EXPLORE",
+                "GOTO_INSTANCE", "GOTO_FRONTIER", "START_ADJUST"},
+    "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE",
+                      "START_ADJUST"},
     "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE", "FINISH"},
+    "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "END_ADJUST"},
 }
-
-DECIDER_PROMPT = """You are the reasoning core of an embodied multi-object
-navigation harness. You receive a JSON world state (all distances and path
-costs are precomputed — never estimate geometry yourself) and an annotated
-top-down map image (white=free, black=obstacle, gray=unknown; green circles=
-3D instances, crossed green circles=reported instances, purple crosses=
-frontiers; numbers match ids in the state JSON).
-
-Every instance is created from a VLM-pointed image pixel and its VGGT 3D point.
-Its text is your editable working memory, not a fixed class label. Read evidence,
-revise instance text when useful, and reason about uncertainty yourself.
-
-The instance table is a bounded summary of unreported instances (nearest,
-newest, task-related; table text may be truncated). instances_omitted_ids are
-valid GOTO_INSTANCE targets not shown in the table; reported_instance_ids are
-already reported. Use search_instances to find instances beyond the table and
-inspect_instance for full text and evidence.
-
-Available actions:
-- GOTO_INSTANCE (target_id = an unreported instance id): the system resolves
-  that instance's stored 3D point, plans an A* path, follows it with collision
-  recovery, and triggers a new arrival decision near the point. This action
-  does not assert that the instance matches the task.
-- GOTO_FRONTIER (target_id = a frontier id): the system follows the precomputed
-  path to that geometric exploration frontier, feeds new RGB frames into SLAM,
-  and later refreshes instances and frontiers.
-- REPORT_FOUND (target_id = null): valid only at arrival. The system starts
-  target-centering/approach visual servo and emits the benchmark TARGET_FOUND
-  signal only when the visible object is close and centered. Servo failure
-  falls back to SCAN; it never reports from the stored coordinate alone.
-- SCAN (target_id = null): valid only at arrival. The system performs a general
-  360-degree panorama (12 left turns, four sampled views), keeps feeding SLAM,
-  refreshes task-relevant instances with caption retrieval + pointing, then
-  invokes scan_complete for a new global choice. It is not target verification.
-- EXPLORE (target_id = null): leave any active target and continue geometric
-  exploration. The instance remains in memory and can be selected again.
-- FINISH (target_id = null): irreversibly end the episode. For an explicit
-  many-count task, the system rejects FINISH until the required report count.
-
-You may call one tool per reply, at most {max_rounds} times:
-  {{"tool_call": {{"name": "search_captions", "text": "<search text>"}}}}
-    Use when current instances are insufficient and historical image captions
-    may reveal task-relevant places or objects. It searches image-caption memory,
-    not 3D instances. Returns a JSON array of {{frame_id, score, caption}} rows.
-  {{"tool_call": {{"name": "search_instances", "keywords": ["red", "cup"],
-                     "reported": false, "top_k": 5}}}}
-    Use to find existing 3D instances by concrete keywords you choose from the
-    task or your reasoning. Matching is case-insensitive substring search over
-    VLM-authored instance text; any keyword may match and more matches rank
-    first. reported may be true, false, or null. Returns compact rows
-    {{id, text, reported, matched_keywords, evidence_count, frame_ids}}.
-  {{"tool_call": {{"name": "look_instance", "instance_id": <id>}}}}
-    Use when an instance's text or metadata is insufficient for visual judgment.
-    Returns no JSON data; on success the best available image for that instance
-    is attached to your next input. The system prefers its pointing overlay and
-    falls back to an associated keyframe. A missing instance/image returns
-    {{"error": "instance image not found"}}. This is read-only.
-  {{"tool_call": {{"name": "inspect_instance", "instance_id": <id>}}}}
-    Use to examine the stored metadata and all evidence references before
-    navigation, editing, or merging. Returns the full object {{id, point, text,
-    reported, frame_id, candidate_id, evidence}}, or
-    {{"error": "instance ... not found"}}. This is read-only and returns no image.
-  {{"tool_call": {{"name": "update_instance", "instance_id": <id>,
-                     "text": "<your revised memory text>"}}}}
-    Use after interpreting new evidence to preserve your best current semantic
-    understanding and uncertainty. Replaces only the instance text and returns
-    the updated full instance. Geometry, evidence and reported state are fixed.
-  {{"tool_call": {{"name": "merge_instances", "instance_ids": [<id>, ...],
-                     "text": "<summary for the merged instance>"}}}}
-    Use only after judging from text, metadata, and preferably images that
-    two or more records are the same physical object. Merges them and
-    returns the surviving full instance (smallest id); its point is the
-    median, evidence is unioned, and reported is true if any input was
-    reported. Other merged ids are removed. Invalid input returns an error.
-    A merge can be reverted with undo_merge.
-  {{"tool_call": {{"name": "undo_merge"}}}}
-    Use when new evidence shows your most recent merge_instances was wrong.
-    Restores the pre-merge records exactly as they were (a report that
-    happened after the merge is never revoked). Returns {{"kept": ...,
-    "restored": [...]}} or {{"error": "no merge to undo"}}.
-All non-image tool failures return {{"error": "message"}}. Tool results are
-included in your next prompt; after a write tool (update_instance or
-merge_instances) the world state is regenerated and the refreshed version is
-included in your next prompt — rely on it, not on the pre-write state.
-
-Standard tool workflows:
-- Existing-instance reasoning: search_instances -> inspect_instance and/or
-  look_instance -> optionally update_instance or merge_instances -> final action.
-- Historical-context reasoning: search_captions -> use caption clues to choose
-  an instance, frontier, SCAN, or EXPLORE. search_captions does not create or
-  modify an instance by itself.
-- Do not call tools mechanically: stop as soon as supplied state and evidence
-  are sufficient for a final action.
-
-After tools (or immediately), reply with exactly one JSON object:
-  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|EXPLORE|FINISH",
-    "target_id": "<id from the state tables, or null>",
-    "reason": "short reason (log only)"}}
-No markdown, no extra text."""
-
 
 class DecisionResult:
     __slots__ = ("action", "target_id", "reason", "validation", "tool_calls")
@@ -154,6 +61,7 @@ class DecisionTraceLogger:
         self.path = str(path)
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._lock = threading.Lock()
+        self._warned = False
 
     def log(self, record):
         record = dict(record)
@@ -161,9 +69,13 @@ class DecisionTraceLogger:
         with self._lock:
             try:
                 with open(self.path, "a", encoding="utf-8") as fp:
-                    fp.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+                    fp.write(json.dumps(
+                        record, ensure_ascii=False, default=str) + "\n")
+            except OSError as exc:
+                if not self._warned:
+                    print(f"[DecisionTraceLogger] 无法写入 {self.path}: {exc}",
+                          flush=True)
+                    self._warned = True
 
 
 class DecisionLoop:
@@ -171,9 +83,8 @@ class DecisionLoop:
         self.chat_fn = chat_fn
         self.tools = dict(tools or {})
         self.logger = logger
-        self.max_tool_rounds = int(max_tool_rounds)
+        self.max_tool_rounds = max(0, int(max_tool_rounds))
 
-    # ------------------------------------------------------------------
     def decide(self, event, world_state, map_png=None, images=None,
                state_fn=None):
         """一次事件驱动决策。返回 DecisionResult；最终非法/模型不可用
@@ -185,7 +96,7 @@ class DecisionLoop:
         prompt = self._build_prompt(event, state)
         images = list(images or [])
         if map_png:
-            images.append(("topdown_map", map_png))
+            images = self._with_topdown_map(images, map_png)
         tool_calls = 0
         for _round in range(self.max_tool_rounds + 2):
             data = self._chat(prompt, images)
@@ -207,10 +118,8 @@ class DecisionLoop:
                     state, refreshed_map, has_map = self._refresh_context(
                         state_fn, state)
                     if has_map:
-                        images = [(name, value) for name, value in images
-                                  if name != "topdown_map"]
-                        if refreshed_map:
-                            images.append(("topdown_map", refreshed_map))
+                        images = self._with_topdown_map(
+                            images, refreshed_map)
                     prompt += ("\n\nWorld state after your write:\n"
                                + json.dumps(state, ensure_ascii=False))
                 continue
@@ -239,6 +148,22 @@ class DecisionLoop:
         return None
 
     @staticmethod
+    def _with_topdown_map(images, map_png):
+        """Keep the map inside the VLM image budget.
+
+        Current RGB remains first; the map is inserted immediately after it so
+        panorama or tool evidence cannot push spatial context past
+        NAV_VLM_MAX_IMAGES. Passing an empty map removes the previous map.
+        """
+        images = [(name, value) for name, value in images
+                  if name != "topdown_map"]
+        if not map_png:
+            return images
+        insert_at = 1 if images and images[0][0] == "current_observation" else 0
+        images.insert(insert_at, ("topdown_map", map_png))
+        return images
+
+    @staticmethod
     def _refresh_context(state_fn, fallback):
         """写工具后刷新状态及可选地图；失败时保留调用前上下文。"""
         try:
@@ -254,44 +179,9 @@ class DecisionLoop:
             return refreshed, None, False
         return fallback, None, False
 
-    # ------------------------------------------------------------------
     def _build_prompt(self, event, world_state):
-        parts = [DECIDER_PROMPT.format(max_rounds=self.max_tool_rounds),
-                 "\nEvent: " + str(event),
-                 "\nWorld state:\n"
-                 + json.dumps(world_state, ensure_ascii=False)]
-        event_guidance = {
-            "world_state_updated": (
-                "\nInstances and reachable frontiers were refreshed together. "
-                "Read and, when useful, update instance texts. Choose globally "
-                "among GOTO_INSTANCE, GOTO_FRONTIER and EXPLORE."),
-            "arrival": (
-                "\nThe first extra image is current RGB; later images are "
-                "historical evidence. Update the current instance text if your "
-                "understanding changed. Use REPORT_FOUND when it satisfies the "
-                "task, SCAN to gather broader environmental information, or "
-                "EXPLORE to leave it unresolved."),
-            "scan_complete": (
-                "\nA general panoramic scan is complete. The images show the "
-                "surrounding environment rather than a target verification "
-                "sequence. Reconsider all refreshed instances and frontiers; "
-                "choose GOTO_INSTANCE, GOTO_FRONTIER, or EXPLORE."),
-            "finish_check": (
-                "\nFINISH is irreversible. Inspect instance memory and task "
-                "progress before deciding."),
-        }
-        if str(event) in event_guidance:
-            parts.append(event_guidance[str(event)])
-        task = world_state.get("task", {})
-        # many 的明确数量是任务事实，提示 VLM 自行规划剩余工作。
-        if task.get("mode") == "many" and task.get("expected") is not None \
-                and task.get("found", 0) < task["expected"]:
-            parts.append(
-                "\nCounting hint: only "
-                f"{task.get('found', 0)}/{task['expected']} required "
-                "instances found. Inspect available instances and evidence, "
-                "then choose where to navigate or explore.")
-        return "".join(parts)
+        return build_decision_prompt(
+            event, world_state, max_tool_rounds=self.max_tool_rounds)
 
     def _chat(self, prompt, images):
         try:
@@ -323,7 +213,6 @@ class DecisionLoop:
         except Exception as exc:
             return json.dumps({"error": str(exc)[:200]}), None, False
 
-    # ------------------------------------------------------------------
     def _validate(self, data, world_state, tool_calls, event=None):
         """schema + id 存在性校验。返回 (DecisionResult|None, error)。"""
         if not isinstance(data, dict):

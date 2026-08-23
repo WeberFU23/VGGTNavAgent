@@ -25,10 +25,17 @@ ENV/
 decision_trace*.jsonl
 .decision_trace*.jsonl
 
-# ===== 调试输出 =====
-mapping_debug/
+# ===== 调试输出（统一根目录） =====
+/debug_output/
+/remote_episode_*/
+/remote_runs/
+/*_diagnostics_*.tar
+/diag_code_sync_*.tar
 
 # ===== 数据文件 / 权重 =====
+/_benchmark_*/
+/_benchmark_master.zip
+/_dataset_semantic_*.tar.gz
 VGGT-SLAM/office_loop.zip
 *.pt
 *.pth
@@ -40,6 +47,7 @@ VGGT-SLAM/ckpts/
 VGGT-SLAM/*.egg-info/
 
 # ===== IDE / 系统 =====
+.env
 .claude/
 .idea/
 .vscode/

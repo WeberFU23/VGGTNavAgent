@@ -2,8 +2,8 @@
 
 用法（在 habitat 环境，需 numpy + pillow）::
 
-    PYTHONPATH=/path/to/vggt_nav_agent python scripts/dump_pointcloud.py \
-        --port 5555 --out /tmp/pcd_dump --max-points 500000
+    PYTHONPATH=/path/to/vggt_nav_agent python scripts/diagnostics/dump_pointcloud.py \
+        --port 5555 --max-points 500000
 
 输出:
     <out>.ply          点云（可用 MeshLab/CloudCompare 打开）
@@ -16,7 +16,9 @@ import os
 
 import numpy as np
 
+from agents import navigator as nav
 from mapping.client import MappingClient
+from runtime_paths import run_debug_path
 
 
 def save_ply(path, points, colors):
@@ -81,32 +83,12 @@ def render_density(points, colors, out_png, size=1024):
     Image.fromarray(img).save(out_png)
 
 
-def gravity_alignment(poses):
-    """用相机位置拟合平面估计重力方向，返回 3x3 旋转矩阵。
-
-    机器人近似在同一高度平面行走，相机中心轨迹的最小主成分即竖直轴。
-    返回 R 使得 R @ p 把点旋转到 z=up 的对齐坐标系。
-    """
-    centers = poses[:, :3, 3]
-    cov = np.cov((centers - centers.mean(0)).T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    up = eigvecs[:, 0]  # 最小特征值方向 = 平面法向
-    # 符号：与相机"上"方向一致（OpenCV 相机 y 轴朝下，取反）
-    cam_up = -(poses[:, :3, 1].mean(0))
-    if np.dot(up, cam_up) < 0:
-        up = -up
-    fwd = poses[:, :3, 2].mean(0)  # 相机朝向前方
-    x = np.cross(up, fwd)
-    x /= np.linalg.norm(x) + 1e-9
-    y = np.cross(up, x)
-    return np.stack([x, y, up], axis=0)  # 行向量为新坐标轴: z' = up·p 即高度
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5555)
-    ap.add_argument("--out", default="/tmp/pcd_dump")
+    ap.add_argument(
+        "--out", default=run_debug_path("diagnostics", "pointcloud"))
     ap.add_argument("--max-points", type=int, default=500000)
     ap.add_argument("--radius", type=float, default=15.0,
                     help="距离过滤半径(米, 相对任一相机中心)")
@@ -125,8 +107,9 @@ def main():
     save_ply(args.out + ".ply", points, colors)
 
     if poses is not None and len(poses) >= 5:
-        # 重力对齐：相机轨迹拟合竖直轴，得到真正的俯视图
-        R = gravity_alignment(poses)
+        # 复用导航链路的安装角补偿和 PCA 修正，诊断图与规划坐标一致。
+        R = nav.gravity_alignment(
+            poses, cam_up=nav.mount_compensated_cam_up())
         points_a = points @ R.T
         render_projection(points_a, colors, (0, 1), args.out + "_top.png")
         render_projection(points_a, colors, (0, 2), args.out + "_front.png")

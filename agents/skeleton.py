@@ -5,10 +5,10 @@
 连接段（度2，被压缩为边）-> 拓扑图。岔口像素先按 8 连通聚成节点，
 连接段按 8 连通聚成边并挂到相邻节点。短毛刺（细化伪影）剪除。
 
-另提供 frontier 检测：自由格与未知格的边界，8 连通聚类为候选探索区。
+另提供统一 frontier 检测：几何未知边界与语义未检查边界共用一套候选，
+但保留来源和两类信息增益供排序、日志与鸟瞰图解释。
 """
 
-import math
 from collections import deque
 
 import numpy as np
@@ -170,29 +170,62 @@ def build_skeleton_graph(grid, min_spur_cells=8):
     return SkeletonGraph(nodes, edges)
 
 
-def frontier_clusters(grid, min_size=5, info_radius=5):
-    """frontier = 自由格中与未知格 4 相邻者，8 连通聚类。
-
-    返回 [{cell, world, size}]，按 size 降序。
-    """
-    # 只有真正未被传感器覆盖的区域才是 unknown；稀疏点云内部的分类
-    # 孔洞已经由 OccupancyGrid.observed 排除，不再制造假 frontier。
-    observed = getattr(grid, "observed", grid.free | grid.obstacle)
-    unknown = ~np.asarray(observed, dtype=bool)
-    # 未知区域膨胀一格，与自由空间取交。显式 pad，避免 np.roll 把地图
-    # 左右/上下边界首尾相连而制造假 frontier。
-    padded = np.pad(unknown, 1, constant_values=False)
-    ring = unknown.copy()
+def _neighbor_ring(mask):
+    """返回 mask 本身及其 8 邻域；显式 pad，禁止地图边缘首尾相连。"""
+    mask = np.asarray(mask, dtype=bool)
+    padded = np.pad(mask, 1, constant_values=False)
+    ring = mask.copy()
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if (dy, dx) != (0, 0):
                 y0 = 1 + dy
                 x0 = 1 + dx
-                ring |= padded[y0:y0 + unknown.shape[0],
-                               x0:x0 + unknown.shape[1]]
-    frontier = ring & grid.free
+                ring |= padded[y0:y0 + mask.shape[0],
+                               x0:x0 + mask.shape[1]]
+    return ring
+
+
+def frontier_layers(grid):
+    """构造同一栅格快照上的几何、语义和统一 frontier 像素层。
+
+    候选始终落在可达自由格上。几何 frontier 位于自由区朝向未重建区的
+    边缘；语义 frontier 位于已检查自由区朝向未检查自由区的边缘。这样
+    “需要探索”由两层的 OR 决定，又不会把整片未检查区域都画成目标。
+    """
+    free = np.asarray(grid.free, dtype=bool)
+    geometry_observed = np.asarray(getattr(
+        grid, "geometry_observed",
+        getattr(grid, "observed", free | grid.obstacle)), dtype=bool)
+    geometry_unknown = ~geometry_observed
+    geometry_frontier = free & _neighbor_ring(geometry_unknown)
+
+    semantic_enabled = bool(getattr(
+        grid, "semantic_coverage_enabled", False))
+    semantic_inspected = np.asarray(getattr(
+        grid, "semantic_inspected", geometry_observed), dtype=bool)
+    semantic_gap = free & ~semantic_inspected if semantic_enabled \
+        else np.zeros_like(free)
+    # 代表点选在边界的已检查侧，便于到达后面向未检查区域继续取景。
+    semantic_frontier = (free & semantic_inspected &
+                         _neighbor_ring(semantic_gap)) if semantic_enabled \
+        else np.zeros_like(free)
+    unified = geometry_frontier | semantic_frontier
+    return {
+        "geometry_unknown": geometry_unknown,
+        "semantic_gap": semantic_gap,
+        "geometry": geometry_frontier,
+        "semantic": semantic_frontier,
+        "unified": unified,
+    }
+
+
+def frontier_clusters(grid, min_size=5, info_radius=5,
+                      return_layers=False):
+    """聚类统一 frontier，返回一套候选及其几何/语义来源。"""
+    layers = frontier_layers(grid)
+    frontier = layers["unified"]
     if not frontier.any():
-        return []
+        return ([], layers) if return_layers else []
     labels, n = _label8(frontier)
     clusters = []
     for cid in range(1, n + 1):
@@ -212,19 +245,29 @@ def frontier_clusters(grid, min_size=5, info_radius=5):
             key = (clearance, -center_d2)
             if best_key is None or key > best_key:
                 best_key, best_cell = key, (int(x), int(y))
-        # 近邻未知面积作为预期信息增益，比边界长度更贴近探索价值。
+        # 分开记录几何与语义增益，统一 utility 可再按任务需要加权。
         y0 = max(0, int(ys.min()) - info_radius)
-        y1 = min(unknown.shape[0], int(ys.max()) + info_radius + 1)
+        y1 = min(frontier.shape[0], int(ys.max()) + info_radius + 1)
         x0 = max(0, int(xs.min()) - info_radius)
-        x1 = min(unknown.shape[1], int(xs.max()) + info_radius + 1)
-        information_gain = int(unknown[y0:y1, x0:x1].sum())
+        x1 = min(frontier.shape[1], int(xs.max()) + info_radius + 1)
+        geometry_gain = int(
+            layers["geometry_unknown"][y0:y1, x0:x1].sum())
+        semantic_gain = int(
+            layers["semantic_gap"][y0:y1, x0:x1].sum())
+        has_geometry = bool(layers["geometry"][ys, xs].any())
+        has_semantic = bool(layers["semantic"][ys, xs].any())
+        reason = "both" if has_geometry and has_semantic else \
+            ("geometry" if has_geometry else "semantic")
         clusters.append({
             "cell": best_cell,
             "centroid_cell": centroid,
             "world": grid.cell_to_world(best_cell),
             "size": int(len(ys)),
-            "information_gain": information_gain,
+            "reason": reason,
+            "geometry_gain": geometry_gain,
+            "semantic_gain": semantic_gain,
+            "information_gain": geometry_gain + semantic_gain,
             "clearance_cells": int(best_key[0]),
         })
     clusters.sort(key=lambda c: -c["size"])
-    return clusters
+    return (clusters, layers) if return_layers else clusters

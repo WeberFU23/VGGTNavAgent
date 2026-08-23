@@ -61,6 +61,20 @@ def test_cache_hit_skips_http():
     assert len(calls) == 1
 
 
+def test_trace_records_raw_output_and_cache_hit():
+    traces = []
+    gw = _gateway(lambda *a, **k: _FakeResponse("raw caption"),
+                  trace_fn=traces.append)
+    assert gw.chat("caption-model", "describe", kind="caption",
+                   cache_key="frame_7") == "raw caption"
+    assert gw.chat("caption-model", "describe", kind="caption",
+                   cache_key="frame_7") == "raw caption"
+    assert len(traces) == 2
+    assert traces[0]["raw_output"] == "raw caption"
+    assert traces[0]["kind"] == "caption" and not traces[0]["cache_hit"]
+    assert traces[1]["cache_hit"] is True
+
+
 def test_cache_key_distinguishes_kind_and_frame():
     calls = []
 
@@ -73,6 +87,20 @@ def test_cache_key_distinguishes_kind_and_frame():
     gw.chat("m", "p", kind="pointing", cache_key="frame_1")
     gw.chat("m", "p", kind="caption", cache_key="frame_2")
     assert len(calls) == 3
+
+
+def test_clear_cache_forces_new_http_request():
+    calls = []
+
+    def post(*a, **k):
+        calls.append(a)
+        return _FakeResponse("x")
+
+    gw = _gateway(post)
+    gw.chat("m", "p", cache_key="frame_1")
+    gw.clear_cache()
+    gw.chat("m", "p", cache_key="frame_1")
+    assert len(calls) == 2
 
 
 def test_retry_then_success():
@@ -111,6 +139,19 @@ def test_404_model_not_found_no_retry():
     assert len(calls) == 1
 
 
+def test_other_4xx_does_not_retry():
+    calls = []
+
+    def post(*a, **k):
+        calls.append(a)
+        return _FakeResponse(status_code=400)
+
+    gw = _gateway(post, max_retries=3)
+    with pytest.raises(VLLMError, match="400"):
+        gw.chat("m", "p")
+    assert len(calls) == 1
+
+
 def test_empty_model_raises():
     gw = _gateway(lambda *a, **k: _FakeResponse())
     with pytest.raises(VLLMError):
@@ -129,6 +170,14 @@ def test_async_result():
     handle = gw.chat_async("m", "p")
     assert handle.result(timeout=10) == "async-ok"
     assert handle.done()
+
+
+def test_closed_gateway_rejects_new_requests():
+    gw = _gateway(lambda *a, **k: _FakeResponse())
+    gw.close()
+    gw.close()  # 幂等
+    with pytest.raises(VLLMError, match="已关闭"):
+        gw.chat_async("m", "p")
 
 
 def test_image_payload_encoding():

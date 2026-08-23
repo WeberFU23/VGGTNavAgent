@@ -34,15 +34,18 @@ def _truncate(text):
         else text[:STATE_TEXT_CHARS - 3] + "..."
 
 
-def build_world_state(agent, observation, grid=None, frontiers=None):
+def build_world_state(agent, observation, grid=None, frontiers=None,
+                      start_xy=None, scale=None):
     """组装决策用世界状态 JSON。
 
     agent: NavAgent（访问 memory/calibrator/_events）；
     grid: 当前占据栅格（有则预计算 A* path_cost）；
     frontiers: 当前 frontier clusters（与地图上的编号顺序一致）。
+    start_xy: 与该栅格快照一致的当前二维位置；未提供时兼容旧调用。
     """
-    scale = agent.calibrator.current_scale() or 1.0
-    start = agent._current_aligned_xy()
+    scale = scale or agent.calibrator.current_scale() or 1.0
+    start = (np.asarray(start_xy, dtype=np.float64)[:2]
+             if start_xy is not None else agent._current_aligned_xy())
     goal_text = str(getattr(observation, "goal_text", "") or "")
 
     # 实例表：未报告实例的 top-K 摘要 + 折叠列表。A* 路径代价只对入选
@@ -78,7 +81,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
         })
     omitted_ids = [nd.iid for nd in unreported if nd.iid not in selected_ids]
 
-    # frontier 是纯几何探索候选；VLM 结合实例文本自行推理。
+    # 对外只有一套 frontier；reason/gain 解释它主要补几何还是语义信息。
     frontier_rows = []
     for i, c in enumerate(frontiers or []):
         dist_m = None
@@ -89,6 +92,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
             "id": f"f{i}",
             "dist_m": round(dist_m, 2) if dist_m is not None else None,
             "size": int(c.get("size", 0)),
+            "reason": c.get("reason", "geometry"),
+            "geometry_gain": int(c.get("geometry_gain", 0)),
+            "semantic_gain": int(c.get("semantic_gain", 0)),
             "information_gain": int(c.get("information_gain", 0)),
             "path_cost_m": (round(float(c["path_cost_m"]), 2)
                             if c.get("path_cost_m") is not None else None),
@@ -103,11 +109,33 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
 
     # 终止账本
     unexplored_ratio = None
+    coverage = None
     if grid is not None:
-        observed = getattr(grid, "observed",
-                           np.asarray(grid.free) | np.asarray(grid.obstacle))
-        unknown = ~np.asarray(observed, dtype=bool)
-        unexplored_ratio = float(unknown.sum()) / float(unknown.size)
+        geometry = np.asarray(getattr(
+            grid, "geometry_observed",
+            getattr(grid, "observed",
+                    np.asarray(grid.free) | np.asarray(grid.obstacle))),
+            dtype=bool)
+        free = np.asarray(grid.free, dtype=bool)
+        semantic_enabled = bool(getattr(
+            grid, "semantic_coverage_enabled", False))
+        semantic = np.asarray(getattr(
+            grid, "semantic_inspected", geometry), dtype=bool)
+        geometry_missing = ~geometry
+        semantic_missing = free & ~semantic if semantic_enabled \
+            else np.zeros_like(free)
+        incomplete = geometry_missing | semantic_missing
+        unexplored_ratio = float(incomplete.sum()) / float(incomplete.size)
+        free_count = max(int(free.sum()), 1)
+        coverage = {
+            "semantic_enabled": semantic_enabled,
+            "geometry_unobserved_ratio": round(
+                float(geometry_missing.sum()) / float(geometry.size), 4),
+            "semantic_uninspected_free_ratio": (
+                round(float(semantic_missing.sum()) / free_count, 4)
+                if semantic_enabled else None),
+            "incomplete_ratio": round(unexplored_ratio, 4),
+        }
 
     return {
         "task": {
@@ -124,6 +152,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
         "instances_omitted_ids": omitted_ids,
         "reported_instance_ids": reported_ids,
         "frontiers": frontier_rows,
+        "map_coverage": coverage,
         "recent_events": recent,
         "older_events_total": max(0, len(events) - len(recent)),
         "termination": {
@@ -132,6 +161,8 @@ def build_world_state(agent, observation, grid=None, frontiers=None):
             "frontier_count": len(frontiers or []),
             "reachable_frontier_count": getattr(
                 agent, "_last_reachable_frontier_count", len(frontiers or [])),
+            "frontier_filters": dict(getattr(
+                agent, "_frontier_stats", {}) or {}),
             "unreported_instance_count": len(agent.memory.available()),
             "recent_queries_without_new_candidate": agent._no_hit_queries,
         },
@@ -183,8 +214,10 @@ def _path_cost_m(grid, start, point, scale):
         return None
     try:
         path = grid.astar(start, tuple(np.asarray(point)[:2]))
-        if not path or len(path) < 2:
+        if not path:
             return None
+        if len(path) == 1:
+            return 0.0
         length = sum(float(np.linalg.norm(
             np.asarray(path[i + 1]) - np.asarray(path[i])))
             for i in range(len(path) - 1))

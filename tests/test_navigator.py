@@ -253,9 +253,6 @@ def test_grid_and_astar():
     obs_cells = np.argwhere(grid.obstacle)
     assert len(obs_cells) > 0, "墙没有被标记为障碍"
     print(f"障碍格数量 {len(obs_cells)} (膨胀后)")
-    return grid, path, R, cams_a
-
-
 def test_path_follower():
     _, _, poses_q, points_q = make_scene()
     R = nav.gravity_alignment(poses_q)
@@ -401,6 +398,61 @@ def test_frame_points_freespace():
     print("frame_points freespace OK: rooms free, wall blocked, door open")
 
 
+def test_binary_dilation_does_not_wrap_at_map_edges():
+    mask = np.zeros((5, 5), dtype=bool)
+    mask[2, 0] = True
+    grown = nav._binary_dilate(mask)
+    assert grown[1:4, 0:2].all()
+    assert not grown[:, -1].any(), "左边界不能环绕膨胀到右边界"
+
+
+def test_oracle_scale_uses_both_keyframe_endpoint_positions():
+    agent = object.__new__(NavAgent)
+    agent._oracle_gt = [np.array([0.0, 0.0]), np.array([0.25, 0.0])]
+    agent.calibrator = SimpleNamespace(
+        min_samples=1, window=10, actions=[int(Action.MOVE_FORWARD)],
+        scale_history=[], current_scale=lambda: None)
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], 2, axis=0)
+    poses[1, 0, 3] = 1.0
+    assert agent._oracle_scale_update(poses, [1, 2]) == 0.25
+
+
+def test_semantic_coverage_requires_close_or_two_completed_views():
+    free = np.ones((10, 10), dtype=bool)
+    grid = nav.OccupancyGrid(
+        1.0, np.zeros(2), free, np.zeros_like(free),
+        observed=np.ones_like(free))
+    grid.unit_per_m = 1.0
+
+    def frame(fid, points, camera=(0.5, 0.5, 0.0)):
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, 3] = camera
+        return {"frame_id": fid, "pose": pose,
+                "points": np.asarray(points, dtype=np.float32)}
+
+    frames = [
+        frame(1, [[1.5, 1.5, 0.0], [4.5, 4.5, 0.0]]),
+        frame(2, [[4.5, 4.5, 0.0]], camera=(8.5, 0.5, 0.0)),
+        frame(3, [[7.5, 7.5, 0.0]]),
+    ]
+    inspected = grid.update_semantic_coverage(
+        frames, [1, 2], np.eye(3), max_range_m=10.0,
+        close_range_m=2.0, min_views=2, camera_disk_m=0.0)
+    assert inspected[1, 1], "近距离的一次 caption 观察应足够"
+    assert inspected[4, 4], "两个有基线和角度差的 caption 视角应足够"
+    assert not inspected[7, 7], "未完成 caption 的帧不能贡献语义覆盖"
+
+    same_view = [
+        frame(4, [[6.5, 6.5, 0.0]]),
+        frame(5, [[6.5, 6.5, 0.0]], camera=(0.6, 0.5, 0.0)),
+    ]
+    inspected = grid.update_semantic_coverage(
+        same_view, [4, 5], np.eye(3), max_range_m=10.0,
+        close_range_m=1.0, min_views=2, camera_disk_m=0.0,
+        min_view_angle_deg=25.0, min_view_baseline_m=0.5)
+    assert not inspected[6, 6], "连续同向 caption 帧不能伪装成多视角"
+
+
 if __name__ == "__main__":
     test_gravity_alignment()
     test_gravity_alignment_straight_trajectory()
@@ -414,4 +466,7 @@ if __name__ == "__main__":
     test_nearest_traversable()
     test_freespace_connectivity()
     test_frame_points_freespace()
+    test_binary_dilation_does_not_wrap_at_map_edges()
+    test_oracle_scale_uses_both_keyframe_endpoint_positions()
+    test_semantic_coverage_requires_close_or_two_completed_views()
     print("ALL TESTS PASSED")

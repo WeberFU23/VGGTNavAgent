@@ -3,11 +3,12 @@
 架构：
 1. CaptionWorker：挂在子图处理完成后的挂点上，异步为每个关键帧生成
    查询无关的详细 caption（场景类型/房间 + 可见物体清单含颜色材质 +
-   物体间空间关系）。经 VLLMGateway 调 Qwen2.5-VL-3B，优先级最低，
-   GPU 忙（子图处理/pointing 在途）时让路。
+   物体间空间关系）。请求经 VLLMGateway 发给本地多模态 VLM，优先级
+   最低；GPU 忙（子图处理/pointing 在途）时让路。
 2. CaptionStore：{frame_id, 位姿, caption, embedding(BGE-M3)} 记忆库，
    落盘持久化，支持按 episode 清空。检索使用 BGE-M3 文本向量和余弦
-   相似度 top-K，以支持较长 caption 和完整任务描述。
+   相似度 top-K，以支持较长 caption 和完整任务描述。具体本地 VLM 由
+   NAV_CAPTION_MODEL_PATH 配置。
 
 CaptionStore 只用 numpy，可脱离 GPU/网络单测；Embedder/Gateway 均可
 mock 替换（权重缺失时 BGEM3Embedder 构造抛清晰错误，由上层降级）。
@@ -34,6 +35,13 @@ brevity. Cover:
 Output plain prose, 3-6 sentences, no markdown, no bullet markers."""
 
 
+def _safe_episode_component(value):
+    text = str(value or "unknown").strip()
+    return "".join(
+        ch if ch.isalnum() or ch in "-_." else "_" for ch in text
+    )[:120] or "unknown"
+
+
 class CaptionStore:
     """{frame_id, pose, caption, embedding} 记忆库，numpy 实现。"""
 
@@ -42,11 +50,11 @@ class CaptionStore:
         self.episode_id = None
         self.records = []            # [{frame_id, pose, caption}]
         self._embeddings = []        # list of (D,) float32
+        self._embedding_dim = None
         self._lock = threading.RLock()
         if self.persist_dir:
             os.makedirs(self.persist_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
     def __len__(self):
         with self._lock:
             return len(self.records)
@@ -58,6 +66,8 @@ class CaptionStore:
 
     def add(self, frame_id, pose, caption, embedding):
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if emb.size == 0:
+            raise ValueError("caption embedding 不能为空")
         norm = float(np.linalg.norm(emb))
         if norm > 0:
             emb = emb / norm
@@ -65,6 +75,11 @@ class CaptionStore:
         if pose is not None:
             pose_arr = np.asarray(pose, dtype=np.float32).reshape(4, 4)
         with self._lock:
+            if self._embedding_dim is not None and emb.size != self._embedding_dim:
+                raise ValueError(
+                    f"caption embedding 维度不一致: {emb.size} != "
+                    f"{self._embedding_dim}")
+            self._embedding_dim = int(emb.size)
             self.records.append({
                 "frame_id": int(frame_id),
                 "pose": pose_arr,
@@ -77,7 +92,6 @@ class CaptionStore:
         with self._lock:
             return any(r["frame_id"] == frame_id for r in self.records)
 
-    # ------------------------------------------------------------------
     def retrieve(self, query_embedding, k=10):
         """余弦 top-K，返回 [{frame_id, caption, score, pose}]（score 降序）。"""
         with self._lock:
@@ -86,6 +100,10 @@ class CaptionStore:
             records = list(self.records)
             embeddings = list(self._embeddings)
         q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        expected_dim = embeddings[0].size
+        if q.size != expected_dim:
+            raise ValueError(
+                f"query embedding 维度不一致: {q.size} != {expected_dim}")
         qn = float(np.linalg.norm(q))
         if qn > 0:
             q = q / qn
@@ -104,7 +122,6 @@ class CaptionStore:
             })
         return out
 
-    # ------------------------------------------------------------------
     # 持久化：每 episode 一个目录（captions.jsonl + embeddings.npy）
     # ------------------------------------------------------------------
     def set_episode(self, episode_id):
@@ -121,9 +138,10 @@ class CaptionStore:
         with self._lock:
             self.records = []
             self._embeddings = []
+            self._embedding_dim = None
 
     def _episode_dir(self, episode_id=None):
-        ep = episode_id or self.episode_id or "unknown"
+        ep = _safe_episode_component(episode_id or self.episode_id)
         return os.path.join(self.persist_dir, ep)
 
     def save(self, episode_id=None):
@@ -159,10 +177,14 @@ class CaptionStore:
                 return 0
             embs = np.load(npy)
             with open(jsonl, encoding="utf-8") as fp:
-                for i, line in enumerate(fp):
-                    item = json.loads(line)
-                    self.add(item["frame_id"], item.get("pose"),
-                             item["caption"], embs[i])
+                items = [json.loads(line) for line in fp if line.strip()]
+            if len(items) != len(embs):
+                raise ValueError(
+                    "caption 持久化文件不一致: "
+                    f"{len(items)} 条记录但有 {len(embs)} 个 embedding")
+            for item, emb in zip(items, embs):
+                self.add(item["frame_id"], item.get("pose"),
+                         item["caption"], emb)
             self.episode_id = str(episode_id)
             return len(self.records)
 
@@ -210,7 +232,8 @@ class CaptionWorker:
     """
 
     def __init__(self, gateway, embedder, store, model,
-                 busy_fn=None, max_tokens=512, prompt=CAPTION_PROMPT):
+                 busy_fn=None, max_tokens=512, prompt=CAPTION_PROMPT,
+                 result_fn=None):
         self.gateway = gateway
         self.embedder = embedder
         self.store = store
@@ -218,6 +241,7 @@ class CaptionWorker:
         self.busy_fn = busy_fn
         self.max_tokens = int(max_tokens)
         self.prompt = prompt
+        self.result_fn = result_fn
         self._queue = queue.Queue()
         self._closed = False
         self._state_lock = threading.RLock()
@@ -231,7 +255,6 @@ class CaptionWorker:
             target=self._consume, name="caption-worker", daemon=True)
         self._thread.start()
 
-    # ------------------------------------------------------------------
     def enqueue(self, frame_id, pil_img, pose=None):
         if self._closed or not self.model:
             return
@@ -267,11 +290,21 @@ class CaptionWorker:
                           if gen == self._generation)
 
     def close(self):
-        self._closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            # 使可能仍在 HTTP 推理中的任务失效，关闭后不得再写 store。
+            self._generation += 1
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._pending.clear()
         self._queue.put(None)
         self._thread.join(timeout=2.0)
 
-    # ------------------------------------------------------------------
     def _consume(self):
         while True:
             item = self._queue.get()
@@ -292,7 +325,7 @@ class CaptionWorker:
             try:
                 caption = self.gateway.chat(
                     self.model, self.prompt, [pil_img], kind="caption",
-                    cache_key=f"frame_{frame_id}",
+                    cache_key=f"generation_{generation}_frame_{frame_id}",
                     priority=Priority.CAPTION, max_tokens=self.max_tokens)
                 caption = str(caption).strip()
                 if not caption:
@@ -306,10 +339,27 @@ class CaptionWorker:
                     if self.last_completed_frame_id is None or \
                             frame_id > self.last_completed_frame_id:
                         self.last_completed_frame_id = frame_id
+                self._emit_result({
+                    "frame_id": frame_id, "caption": caption,
+                    "model": self.model, "status": "completed",
+                })
             except Exception as exc:  # noqa: BLE001 - 单帧失败不拖垮线程
                 self.errors += 1
                 print(f"[CaptionWorker] frame {frame_id} caption 失败: {exc}",
                       flush=True)
+                self._emit_result({
+                    "frame_id": frame_id, "caption": None,
+                    "model": self.model, "status": "failed",
+                    "error": str(exc),
+                })
             finally:
                 with self._state_lock:
                     self._pending.discard((generation, frame_id))
+
+    def _emit_result(self, record):
+        if self.result_fn is None:
+            return
+        try:
+            self.result_fn(dict(record))
+        except Exception:
+            pass

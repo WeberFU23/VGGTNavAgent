@@ -30,7 +30,7 @@ TURN_STEP_RAD = math.radians(30.0)
 
 
 # 相机安装下俯角。配置标称 30°（hm3d_config.yaml orientation [-pi/6,0,0]），
-# 但实测（scripts/check_gravity.py，238 关键帧）散布最小值在 40°——
+# 但实测（scripts/diagnostics/check_gravity.py，238 关键帧）散布最小值在 40°——
 # 标称值与 VGGT 位姿链的合成有效角有 ~10° 偏差，以实测为准。
 MOUNT_PITCH_DOWN_RAD = math.radians(40.0)
 
@@ -123,18 +123,180 @@ def _flood_component(mask, start):
     return seen
 
 
+def _binary_dilate(mask, iterations=1):
+    """用 3x3 邻域膨胀布尔栅格，边界外恒为 False。
+
+    显式 padding 很重要：``np.roll`` 会让左边界的障碍出现在右边界，
+    从而在地图两侧制造并不存在的障碍或自由空间。
+    """
+    result = np.asarray(mask, dtype=bool).copy()
+    h, w = result.shape
+    for _ in range(max(int(iterations), 0)):
+        padded = np.pad(result, 1, constant_values=False)
+        grown = np.zeros_like(result)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                grown |= padded[1 + dy:1 + dy + h,
+                                1 + dx:1 + dx + w]
+        result = grown
+    return result
+
+
 class OccupancyGrid:
     """2D 占据栅格（对齐坐标系），单位与输入点云一致（地图单位）。"""
 
-    def __init__(self, res, origin, free, obstacle, observed=None):
-        self.res = res                  # 地图单位/格
-        self.origin = np.asarray(origin, dtype=np.float64)  # 格子(0,0)的xy
-        self.free = np.asarray(free, dtype=bool)       # (H,W) bool 可行走
-        self.obstacle = np.asarray(obstacle, dtype=bool)  # 膨胀后障碍
-        # 显式观测覆盖层。未提供时保持旧构造器语义，便于合成测试和调用方。
-        self.observed = np.asarray(
+    def __init__(self, res, origin, free, obstacle, observed=None,
+                 semantic_inspected=None, semantic_coverage_enabled=False):
+        self.res = float(res)           # 地图单位/格
+        if not math.isfinite(self.res) or self.res <= 0:
+            raise ValueError(f"grid resolution must be positive: {res!r}")
+        self.origin = np.asarray(origin, dtype=np.float64).reshape(-1)
+        if self.origin.size != 2:
+            raise ValueError("grid origin must contain exactly two coordinates")
+        self.free = np.asarray(free, dtype=bool)
+        self.obstacle = np.asarray(obstacle, dtype=bool)
+        if self.free.ndim != 2 or self.free.shape != self.obstacle.shape:
+            raise ValueError("free and obstacle must be same-shaped 2D arrays")
+        # 几何覆盖只回答“该格是否进入过可靠的 3D 重建”，不表示目标已被
+        # 语义模型看清。observed 保留为兼容别名，避免旧调用混淆 occupancy。
+        self.geometry_observed = np.asarray(
             self.free | self.obstacle if observed is None else observed,
             dtype=bool)
+        if self.geometry_observed.shape != self.free.shape:
+            raise ValueError("observed must match the occupancy grid shape")
+        self.observed = self.geometry_observed
+        # 未显式提供语义层时沿用几何层，保持历史合成测试的行为；真实 agent
+        # 会在拿到 caption 完成帧后覆盖此值并打开 semantic_coverage_enabled。
+        self.semantic_inspected = np.asarray(
+            self.geometry_observed if semantic_inspected is None
+            else semantic_inspected, dtype=bool)
+        if self.semantic_inspected.shape != self.free.shape:
+            raise ValueError(
+                "semantic_inspected must match the occupancy grid shape")
+        self.semantic_coverage_enabled = bool(semantic_coverage_enabled)
+        self.semantic_view_count = np.zeros(self.free.shape, dtype=np.uint16)
+
+    def update_semantic_coverage(self, frames, captioned_frame_ids, align_R,
+                                 max_range_m=4.0, close_range_m=2.0,
+                                 min_views=2, camera_disk_m=0.4,
+                                 min_view_angle_deg=25.0,
+                                 min_view_baseline_m=0.5):
+        """从已完成 caption 的关键帧建立语义检查层。
+
+        每个有效 VGGT 点本身就是未被遮挡的可见表面。一个可通行格满足
+        “一次近距离观察”，或至少 ``min_views`` 个 caption 帧且视点之间
+        同时具有足够基线和方位角差，才算完成语义检查。连续同向关键帧
+        不再被误当作多视角证据。
+        """
+        completed = {int(fid) for fid in captioned_frame_ids or []}
+        counts = np.zeros(self.free.shape, dtype=np.uint16)
+        close = np.zeros(self.free.shape, dtype=bool)
+        diverse = np.zeros(self.free.shape, dtype=bool)
+        first_angle = np.full(self.free.shape, np.nan, dtype=np.float32)
+        first_camera_x = np.full(self.free.shape, np.nan, dtype=np.float32)
+        first_camera_y = np.full(self.free.shape, np.nan, dtype=np.float32)
+        if not completed:
+            self.semantic_inspected = np.zeros_like(self.free)
+            self.semantic_view_count = counts
+            self.semantic_coverage_enabled = True
+            return self.semantic_inspected
+
+        # 子图重叠可能重复返回同一 frame；按 frame_id 去重，防止把一次
+        # 观察误算成多视角证据。
+        unique_frames = {}
+        for frame in frames or []:
+            fid = int(frame.get("frame_id", -1))
+            if fid in completed:
+                unique_frames[fid] = frame
+
+        units_per_m = max(float(getattr(self, "unit_per_m", 1.0)), 1e-9)
+        max_range = max(float(max_range_m), 0.0) * units_per_m
+        close_range = max(float(close_range_m), 0.0) * units_per_m
+        min_baseline = max(float(min_view_baseline_m), 0.0) * units_per_m
+        min_angle = math.radians(max(float(min_view_angle_deg), 0.0))
+        h, w = self.free.shape
+        for frame in unique_frames.values():
+            points = np.asarray(frame["points"], dtype=np.float64)
+            finite = np.isfinite(points).all(axis=1)
+            if not finite.any():
+                continue
+            aligned = points[finite] @ align_R.T
+            camera = (np.asarray(frame["pose"], dtype=np.float64)[:3, 3]
+                      @ align_R.T)
+            distances = np.linalg.norm(aligned[:, :2] - camera[:2], axis=1)
+            valid = distances <= max_range
+            if valid.any():
+                cells = np.floor(
+                    (aligned[valid, :2] - self.origin) / self.res
+                ).astype(np.int64)
+                inside = ((cells[:, 0] >= 0) & (cells[:, 0] < w) &
+                          (cells[:, 1] >= 0) & (cells[:, 1] < h))
+                cells = cells[inside]
+                if len(cells):
+                    linear, first_indices = np.unique(
+                        cells[:, 1] * w + cells[:, 0], return_index=True)
+                    ys, xs = np.divmod(linear, w)
+                    counts[ys, xs] += 1
+                    # 从格子中心指向相机的方位角。以该格第一次有效观察为
+                    # 基准，后续观察必须既有视角差又有空间基线。
+                    sample_cells = cells[first_indices]
+                    cell_xy = self.origin + (
+                        sample_cells.astype(np.float64) + 0.5) * self.res
+                    angles = np.arctan2(
+                        camera[1] - cell_xy[:, 1],
+                        camera[0] - cell_xy[:, 0])
+                    previous = first_angle[ys, xs]
+                    seen = np.isfinite(previous)
+                    if seen.any():
+                        delta = np.abs(np.arctan2(
+                            np.sin(angles[seen] - previous[seen]),
+                            np.cos(angles[seen] - previous[seen])))
+                        baseline = np.hypot(
+                            camera[0] - first_camera_x[ys[seen], xs[seen]],
+                            camera[1] - first_camera_y[ys[seen], xs[seen]])
+                        diverse[ys[seen], xs[seen]] |= (
+                            (delta >= min_angle) &
+                            (baseline >= min_baseline))
+                    fresh = ~seen
+                    if fresh.any():
+                        first_angle[ys[fresh], xs[fresh]] = angles[fresh]
+                        first_camera_x[ys[fresh], xs[fresh]] = camera[0]
+                        first_camera_y[ys[fresh], xs[fresh]] = camera[1]
+
+                near = valid & (distances <= close_range)
+                near_cells = np.floor(
+                    (aligned[near, :2] - self.origin) / self.res
+                ).astype(np.int64)
+                near_inside = ((near_cells[:, 0] >= 0) &
+                               (near_cells[:, 0] < w) &
+                               (near_cells[:, 1] >= 0) &
+                               (near_cells[:, 1] < h))
+                near_cells = near_cells[near_inside]
+                if len(near_cells):
+                    linear = np.unique(
+                        near_cells[:, 1] * w + near_cells[:, 0])
+                    ys, xs = np.divmod(linear, w)
+                    close[ys, xs] = True
+
+            # 相机脚下通常没有可回投影地面点，但显然属于近距离检查区。
+            cx, cy = self.world_to_cell(camera[:2])
+            radius = max(0, int(math.ceil(
+                float(camera_disk_m) * units_per_m / self.res)))
+            for yy in range(max(0, cy - radius), min(h, cy + radius + 1)):
+                for xx in range(max(0, cx - radius), min(w, cx + radius + 1)):
+                    if (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2:
+                        close[yy, xx] = True
+
+        required_views = max(int(min_views), 1)
+        multi_view = counts >= required_views
+        if required_views > 1:
+            multi_view &= diverse
+        inspected = multi_view | close
+        # 语义层只解释已有几何表面；不能越过未重建区域或障碍膨胀边界。
+        self.semantic_inspected = inspected & self.geometry_observed & self.free
+        self.semantic_view_count = counts
+        self.semantic_coverage_enabled = True
+        return self.semantic_inspected
 
     @classmethod
     def from_trajectory(cls, cam_centers_aligned, stamp=3):
@@ -302,15 +464,7 @@ class OccupancyGrid:
         h, w = free.shape
         # 障碍物按机器人半径膨胀（3x3 最大滤波迭代）
         iters = max(int(math.ceil(robot_radius_m / res_m)), 1)
-        inflated = obstacle.copy()
-        for _ in range(iters):
-            grown = inflated.copy()
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    grown |= np.roll(np.roll(inflated, dy, axis=0), dx, axis=1)
-            # np.roll 会回绕，把回绕带清掉（边界外本来就视为障碍，无影响）
-            inflated = grown
-        obstacle = inflated
+        obstacle = _binary_dilate(obstacle, iterations=iters)
 
         # 被膨胀障碍覆盖的自由格不再可行走
         free &= ~obstacle
@@ -445,11 +599,7 @@ class OccupancyGrid:
 
         free = (gv >= min_ground_votes) & (ov < obs_votes)
         # 地面点间距 > 格距时自由空间碎裂，膨胀一格桥接（随后障碍会盖回）
-        grown = free.copy()
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                grown |= np.roll(np.roll(free, dy, axis=0), dx, axis=1)
-        free = grown
+        free = _binary_dilate(free)
         # 3x3 闭运算：填补稀疏采样小孔，同时基本保持真实观测外边界；
         # 不能只做膨胀，否则 free 与 unknown 会被隔开而丢失 frontier。
         padded = np.pad(observed, 1, constant_values=False)
@@ -590,6 +740,17 @@ class PathFollower:
         self.path = None                  # 世界坐标(地图单位)路径
         self.anchor_frame = -1            # 锚点关键帧 frame_id
         self.x = self.y = self.yaw = 0.0  # 当前估计（对齐坐标系）
+
+    @property
+    def scale(self):
+        return self._scale
+
+    @scale.setter
+    def scale(self, value):
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"path follower scale must be positive: {value!r}")
+        self._scale = value
 
     @property
     def reach(self):

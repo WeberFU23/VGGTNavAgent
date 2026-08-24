@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agents import navigator as nav
 from agents import skeleton as sk
 from agents.decision_state import _path_cost_m, build_world_state
-from agents.map_render import render_topdown
+from agents.map_render import render_pointcloud_topdown, render_topdown
 from agents.nav_agent import NavAgent
 from decision import DecisionLoop, DecisionTraceLogger
 
@@ -72,7 +72,9 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert '"confidence"' not in prompt
     assert "this is not\n  random wandering" in prompt
     assert "short local active exploration" in prompt
-    assert "raw unified frontier boundary" in prompt
+    assert "RGB point-cloud" in prompt
+    assert "contains no trajectory" in prompt
+    assert "raw unified frontier boundary" not in prompt
     assert "reason=semantic" in prompt
 
 
@@ -351,6 +353,56 @@ def test_render_topdown_uses_single_instance_layer():
     assert width >= 512 and height >= 512
 
 
+def test_decision_pointcloud_map_has_markers_without_region_or_trajectory_layers():
+    points = np.array([
+        [0.0, 0.0, 0.0], [0.5, 0.0, 0.2], [0.0, 0.5, 1.0],
+        [1.0, 1.0, 1.5], [2.0, 1.0, 0.0],
+    ])
+    colors = np.tile(np.array([[12, 34, 56]], dtype=np.uint8), (5, 1))
+    png = render_pointcloud_topdown(
+        points, colors, pose=(0.2, 0.2, 0.0),
+        instances=[{"id": 3, "xy": (1.0, 1.0), "reported": False}],
+        frontiers=[{"id": "f0", "xy": (2.0, 1.0)}],
+        active_target={"id": 3, "xy": (1.0, 1.0)},
+        floor_z=0.0, unit_per_m=1.0, max_plot_points=100)
+    image = Image.open(io.BytesIO(png))
+    pixels = {tuple(pixel) for pixel in np.asarray(image).reshape(-1, 3)}
+    assert (12, 34, 56) in pixels             # reconstructed RGB base
+    assert (40, 80, 220) in pixels            # agent
+    assert (150, 60, 200) in pixels           # frontier
+    assert (245, 145, 25) in pixels           # active target
+    assert (255, 232, 160) not in pixels       # old semantic region
+    assert (220, 40, 40) not in pixels         # old trajectory
+
+
+def test_decision_pointcloud_map_is_strict_xy_orthographic():
+    """Changing height must not move a point in the decision image."""
+    kwargs = dict(crop_center=(0.0, 0.0), crop_radius=2.0,
+                  floor_z=0.0, unit_per_m=1.0,
+                  min_image_side=128, max_image_side=128)
+    colors = np.array([[20, 80, 140]], dtype=np.uint8)
+    low = render_pointcloud_topdown(
+        np.array([[0.6, -0.4, 0.1]]), colors, **kwargs)
+    high = render_pointcloud_topdown(
+        np.array([[0.6, -0.4, 2.0]]), colors, **kwargs)
+    assert np.array_equal(
+        np.asarray(Image.open(io.BytesIO(low))),
+        np.asarray(Image.open(io.BytesIO(high))))
+
+
+def test_decision_pointcloud_pixel_fusion_is_order_independent():
+    points = np.array([[0.1, 0.1, 0.2], [0.1, 0.1, 1.2]])
+    colors = np.array([[220, 40, 20], [20, 80, 220]], dtype=np.uint8)
+    kwargs = dict(crop_center=(0.0, 0.0), crop_radius=1.0,
+                  floor_z=0.0, unit_per_m=1.0,
+                  min_image_side=128, max_image_side=128)
+    forward = render_pointcloud_topdown(points, colors, **kwargs)
+    reverse = render_pointcloud_topdown(points[::-1], colors[::-1], **kwargs)
+    assert np.array_equal(
+        np.asarray(Image.open(io.BytesIO(forward))),
+        np.asarray(Image.open(io.BytesIO(reverse))))
+
+
 def test_render_topdown_local_crop_marks_pose_and_active_target():
     png = render_topdown(
         _grid(), pose=(20, 15, 0.0),
@@ -402,6 +454,26 @@ def test_render_topdown_distinguishes_recent_trajectory_and_shows_status():
         Image.open(io.BytesIO(png))).reshape(-1, 3)}
     assert (150, 105, 105) in pixels
     assert (220, 40, 40) in pixels
+
+
+def test_render_topdown_exposes_traversed_occupancy_conflicts():
+    free = np.zeros((12, 12), dtype=bool)
+    free[3:9, 3:9] = True
+    obstacle = np.zeros_like(free)
+    obstacle[1, 1] = True
+    traversed = np.zeros_like(free)
+    traversed[1, 1] = True       # obstacle conflict
+    traversed[1, 2] = True       # geometry unknown
+    grid = nav.OccupancyGrid(
+        1.0, np.zeros(2), free, obstacle,
+        observed=free | obstacle, traversed=traversed)
+    png = render_topdown(
+        grid, pixels_per_cell=8, min_image_side=0,
+        max_image_side=0, show_legend=False)
+    pixels = {tuple(pixel) for pixel in np.asarray(
+        Image.open(io.BytesIO(png))).reshape(-1, 3)}
+    assert (145, 205, 225) in pixels
+    assert (235, 65, 165) in pixels
 
 
 def test_explore_activates_highest_utility_frontier_instead_of_random_walk():
@@ -765,10 +837,14 @@ if __name__ == "__main__":
     test_finish_only_enforces_explicit_many_count()
     test_trace_log_written()
     test_render_topdown_uses_single_instance_layer()
+    test_decision_pointcloud_map_has_markers_without_region_or_trajectory_layers()
+    test_decision_pointcloud_map_is_strict_xy_orthographic()
+    test_decision_pointcloud_pixel_fusion_is_order_independent()
     test_render_topdown_local_crop_marks_pose_and_active_target()
     test_render_topdown_distinguishes_semantic_gap_and_raw_frontier()
     test_render_topdown_caps_elongated_global_map()
     test_render_topdown_distinguishes_recent_trajectory_and_shows_status()
+    test_render_topdown_exposes_traversed_occupancy_conflicts()
     test_world_state_contains_text_evidence_and_no_anchor_table()
     test_world_state_uses_explicit_map_snapshot_pose()
     test_world_state_summarizes_instances_beyond_k()

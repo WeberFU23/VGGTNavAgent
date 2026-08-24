@@ -26,7 +26,12 @@ import cv2
 import numpy as np
 import torch
 
-from mapping.keyframes import AdaptiveKeyframeSelector, pop_submap_window
+from mapping.keyframes import (
+    SUPPORTED_SUBMAP_OVERLAP,
+    AdaptiveKeyframeSelector,
+    pop_submap_window,
+    validate_supported_overlap,
+)
 from runtime_paths import run_debug_path
 
 
@@ -36,8 +41,9 @@ def _parse_args():
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--submap-size", type=int, default=16)
     parser.add_argument(
-        "--overlapping-window-size", type=int, default=3,
-        help="相邻子图共享的关键帧数；室内导航默认 3 以增强子图配准")
+        "--overlapping-window-size", type=int,
+        default=SUPPORTED_SUBMAP_OVERLAP,
+        help="相邻子图共享帧数；当前上游 add_edge 仅正确支持 1")
     parser.add_argument("--max-loops", type=int, default=1,
                         help="0 关闭回环检测（SALAD ckpt 缺失时也会自动关闭）")
     parser.add_argument(
@@ -84,9 +90,7 @@ class MappingServer:
             raise RuntimeError("mapping server 需要可用的 CUDA GPU")
         if args.submap_size < 2:
             raise ValueError("submap-size 必须至少为 2")
-        if not 1 <= args.overlapping_window_size < args.submap_size:
-            raise ValueError(
-                "overlapping-window-size 必须在 [1, submap-size) 范围内")
+        validate_supported_overlap(args.overlapping_window_size)
 
         if not args.vis:
             import vggt_slam.solver as solver_module
@@ -551,12 +555,12 @@ class MappingServer:
         return {"num_points": len(points)}, payload
 
     def get_frame_points(self, stride):
-        """逐帧返回世界系稠密点（NaN=低置信无效点）+ 位姿，用于客户端
-        做逐帧局部地板锚定的自由空间投票（全局点云在子图边界有重影，
-        直接分层不可靠）。
+        """原子返回逐帧世界点、RGB 和位姿。
 
-        返回 ({"frames": [{frame_id, h, w, stride, pose}]}, payload)，
-        payload 按 frames 顺序拼接每帧 (h*w, 3) float32 点。
+        occupancy、frontier 和决策 VLM 鸟瞰图必须建立在同一次图优化
+        快照上。每帧 payload 依次存放 ``N*3 float32`` 点和 ``N*3
+        uint8`` RGB；低置信点保留为 NaN，方便客户端用同一 mask 同时
+        过滤点和颜色。
         """
         stride = max(int(stride), 1)
         with self.data_lock:
@@ -576,6 +580,13 @@ class MappingServer:
                     hom = self.solver.graph.get_homography(
                         index + submap.get_id())
                     pts = submap.pointclouds[index][::stride, ::stride, :]
+                    colors = np.asarray(
+                        submap.colors[index][::stride, ::stride, :],
+                        dtype=np.uint8)
+                    if colors.shape != pts.shape:
+                        raise RuntimeError(
+                            "VGGT point/color grid shape mismatch: "
+                            f"{pts.shape} != {colors.shape}")
                     conf = submap.conf_masks[index][::stride, ::stride] \
                         > submap.conf_threshold
                     hh, ww = pts.shape[:2]
@@ -588,10 +599,12 @@ class MappingServer:
                     metas.append({
                         "frame_id": int(fids[index]) if fids else index,
                         "h": hh, "w": ww, "stride": stride,
+                        "has_colors": True,
                         "pose": np.asarray(
                             poses[index], dtype=np.float32).tolist(),
                     })
-                    chunks.append(world.tobytes())
+                    chunks.extend((world.tobytes(),
+                                   colors.reshape(-1, 3).tobytes()))
         return {"frames": metas,
                 "snapshot_revision": snapshot_revision}, b"".join(chunks)
 

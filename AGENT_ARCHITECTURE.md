@@ -19,7 +19,7 @@ flowchart LR
     POINT --> P3D
     P3D --> MEM["single InstanceMemory"]
     MEM --> STATE["world-state JSON"]
-    MAP --> TOP["annotated top-down map"]
+    MAP --> TOP["RGB point-cloud bird's-eye map"]
     STATE --> VLM["decision VLM + memory tools"]
     TOP --> VLM
     RGB --> VLM
@@ -86,6 +86,11 @@ world-state，决定报告、离开、扫描或进入微调。
   方位角差的有效 3D 可见观察才标记完成。连续同向关键帧、caption pending
   和单次远距离弱观察仍属于待探索。
 
+另有独立的 `traversed` 诊断层，只表示机器人真实执行轨迹。它不能增加
+`free`、清除 `obstacle`、扩大 `geometry_observed`，也不参与 A* 或 frontier。
+当前位置附近缺少地面证据时，系统保留冲突并报告，而不是沿历史轨迹补出
+可通行走廊；点云栅格完全不可用时也拒绝回退为“面包屑地图”。
+
 对决策层只暴露一套 frontier。几何 frontier 位于可达自由区与
 `geometry_observed=false` 的边界；语义 frontier 位于已检查自由区与
 `semantic_inspected=false` 自由区的边界；两者取并集后统一聚类、A* 可达性
@@ -131,17 +136,18 @@ attach_node        可选骨架节点
   未报告实例折叠为 `instances_omitted_ids`（仍是合法导航目标），已报告
   实例折叠为 `reported_instance_ids`，全文与证据经 `search_instances` /
   `inspect_instance` 按需查询；A* 路径代价只对入选摘要的实例预计算；
-- 标注俯视图：白色为可达且已语义检查的自由区，淡黄色为仍需语义检查的
-  可达自由区，蓝灰色为几何已见但 occupancy 不确定，浅灰色为几何未知，
-  黑色为障碍/膨胀障碍；青色是一整条原始统一 frontier 边界，紫色菱形
-  `fN:G/S/B` 是经过可达性和冷却过滤后可选择的候选；蓝色 `YOU` 箭头和
-  视野线表示当前位置与朝向，暗红色为历史轨迹、亮红色为近期轨迹，橙色
-  `TARGET` 星形为 active target。图头同时给出 raw/reachable/selectable/cooldown
-  frontier 数量、坐标轴和比例尺；地图最多显示 world-state 中最相关的 12 个
-  实例，并做标签避让。图例、step 和 map revision 直接写入图中；点云、位姿、
-  轨迹和 frontier 来自 mapping server 一次锁内 frame snapshot，决策前按服务端
+- RGB 点云鸟瞰图：先将 VGGT-SLAM 点云重力对齐，再严格沿 Z 轴正投影到 XY
+  平面；默认以 `NAV_DECISION_MAP_POINT_STRIDE=3` 提取点，并将同一输出像素内
+  的 RGB 按高度加权融合（高度只影响颜色，不影响投影位置），最多保留
+  `NAV_DECISION_MAP_MAX_POINTS=600000` 个点。底图不再用颜色编码
+  free、obstacle、geometry/semantic coverage 等区域，也不显示历史轨迹或原始
+  frontier 边界。蓝色箭头是 Agent 位置和朝向，紫色菱形 `fN` 是经过可达性与
+  冷却过滤后可选择的 frontier，绿色圆圈 `tN` 是实例目标，橙色星形是 active
+  target。图中 ID 与 world-state 完全一致；occupancy 和语义覆盖仍由确定性模块
+  用于 A*、frontier 生成和结束判断，只是不再作为 VLM 图像底色。点、颜色、位姿
+  和 frontier 来自 mapping server 同一次锁内 frame snapshot，并按
   frame/submap/loop revision 刷新；即将显示的实例按 candidate_id 批量重投影，
-  避免回环后把新轨迹或旧实例叠加到不同坐标系；
+  避免回环后叠加到不同坐标系；
 - 事件图像：普通决策与微调时的当前 RGB，到达时的候选历史证据，
   或一圈扫描的多视角图像。
 
@@ -252,6 +258,12 @@ VLM 必须输出一个 JSON 对象：
 | `<episode>_frame_captions.jsonl` | 全部图像的 `frame_saved` 记录和关键帧的 `caption_result`；非关键帧不做 caption |
 | `<episode>_queries.jsonl` | 本地 caption/pointing VLM 原始输出、caption 检索、pointing 和 3D 候选诊断 |
 | `vlm_inputs/` | 实际进入决策 API payload 的 RGB、鸟瞰图和候选证据；与 `vlm_calls.jsonl` 中 SHA-1 一致 |
+
+`scripts/diagnostics/dump_mapping_snapshot.py` 可将一次 VGGT frame snapshot 保存为
+无 pickle 的 NPZ；`render_occupancy_snapshot.py` 可在不重跑 Habitat 或 VGGT-SLAM
+的情况下反复重建 occupancy、渲染鸟瞰图并统计 traversed/unknown 与
+traversed/obstacle 冲突；`replay_rgb_sequence.py` 用固定 RGB 比较关键帧和 SLAM
+参数，只有显式 `--reset-map` 才会清空测试专用 mapping server。
 
 ## 10. 确定性降级
 

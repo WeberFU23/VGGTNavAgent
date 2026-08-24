@@ -52,7 +52,26 @@ def test_frame_points_keeps_atomic_snapshot_revision():
     client._request = lambda _header: (response, payload)
     frames = client.get_frame_points()
     assert frames[0]["frame_id"] == 7
+    assert frames[0]["colors"] is None
     assert client.last_frame_snapshot_revision == response["snapshot_revision"]
+
+
+def test_frame_points_decodes_atomic_rgb_payload():
+    client = MappingClient(port=1)
+    points = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                      dtype=np.float32)
+    colors = np.array([[10, 20, 30], [200, 210, 220]], dtype=np.uint8)
+    response = {
+        "frames": [{"frame_id": 9, "h": 1, "w": 2, "stride": 6,
+                    "has_colors": True, "pose": np.eye(4).tolist()}],
+        "snapshot_revision": {"num_frames": 10, "num_submaps": 2,
+                              "num_loop_closures": 1},
+    }
+    client._request = lambda _header: (
+        response, points.tobytes() + colors.tobytes())
+    frame = client.get_frame_points()[0]
+    assert np.array_equal(frame["points"], points)
+    assert np.array_equal(frame["colors"], colors)
 
 
 def test_client_batches_candidate_resolution():

@@ -6,6 +6,24 @@ VGGT-SLAM 自带的 FrameTracker 根据相对上一关键帧的光流视差取�
 """
 
 
+# Upstream Solver.add_edge() aligns current[0] with previous[-1].  Supporting
+# a wider overlap requires changing the graph constraints, not only retaining
+# more paths in the window.  Keep the production server on the one-frame mode
+# that upstream explicitly supports until that multi-frame alignment exists.
+SUPPORTED_SUBMAP_OVERLAP = 1
+
+
+def validate_supported_overlap(overlap):
+    """Reject graph layouts that stock ``Solver.add_edge`` cannot align."""
+    overlap = int(overlap)
+    if overlap != SUPPORTED_SUBMAP_OVERLAP:
+        raise ValueError(
+            "当前 VGGT-SLAM add_edge 仅支持 "
+            f"overlapping-window-size={SUPPORTED_SUBMAP_OVERLAP}；"
+            "更大的 overlap 需要先实现对应帧的多因子约束")
+    return overlap
+
+
 class AdaptiveKeyframeSelector:
     """组合光流触发与最大间隔约束，并维护可诊断的选择状态。"""
 

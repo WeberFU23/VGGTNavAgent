@@ -70,7 +70,7 @@ class NavAgent(MappingAgent):
         self.vlm.set_trace_path(env_debug_path(
             "NAV_VLM_TRACE", os.path.join(self.output_dir, "vlm_calls.jsonl")))
         # Save the byte-identical images sent to the decision API beside its
-        # JSONL trace. This includes the current RGB and annotated top-down map.
+        # JSONL trace. This includes current RGB and the RGB point-cloud map.
         self.vlm.image_dir = env_debug_path(
             "NAV_VLM_IMAGE_DIR", os.path.join(self.output_dir, "vlm_inputs"))
         print(f"[NavAgent] VLM 战略层: "
@@ -139,9 +139,16 @@ class NavAgent(MappingAgent):
         self._events = []
         self._last_frontier_clusters = []
         self._explore_grid = None
-        # frontier 候选、原始边界与鸟瞰图必须来自同一栅格快照。
+        # frontier 候选、彩色点云与鸟瞰图必须来自同一原子快照。
         self._frontier_grid = None
         self._frontier_layers = None
+        # RGB point cloud captured atomically with the grid/pose snapshot.  It
+        # is the only base layer sent to the decision VLM.
+        self._frontier_pointcloud = None
+        self.decision_map_max_points = max(10000, int(os.environ.get(
+            "NAV_DECISION_MAP_MAX_POINTS", "600000")))
+        self.decision_map_point_stride = max(1, int(os.environ.get(
+            "NAV_DECISION_MAP_POINT_STRIDE", "3")))
         self._frontier_revision = 0
         self._frontier_trajectory = []
         self._frontier_pose = None
@@ -292,7 +299,11 @@ class NavAgent(MappingAgent):
             # 点云、位姿和 frame_id 必须来自同一个服务端锁内快照。过去
             # 先拉 poses 再拉 frame points，回环可能在两次 RPC 中间改写
             # 坐标系，导致轨迹穿墙、当前位置落在 unknown。
-            frames = self.client.get_frame_points(stride=6)
+            # Stride 3 preserves four times as many image-grid samples as the
+            # previous stride 6. The renderer bins them into an orthographic
+            # RGB image, while this same atomic snapshot still drives geometry.
+            frames = self.client.get_frame_points(
+                stride=self.decision_map_point_stride)
             if not frames:
                 return False
             pose_by_frame = {}
@@ -310,6 +321,32 @@ class NavAgent(MappingAgent):
                 frames, self.align_R)
             if grid is None:
                 return False
+            # Deduplicate overlap frames exactly as OccupancyGrid does, then
+            # retain a bounded, color-aligned point snapshot for VLM rendering.
+            colored_frames = {}
+            for frame in frames:
+                if frame.get("colors") is not None:
+                    colored_frames[int(frame.get("frame_id", -1))] = frame
+            point_parts, color_parts = [], []
+            for fid in sorted(colored_frames):
+                frame = colored_frames[fid]
+                points = np.asarray(frame["points"], dtype=np.float64)
+                colors = np.asarray(frame["colors"])
+                finite = np.isfinite(points).all(axis=1)
+                if len(colors) == len(points) and finite.any():
+                    point_parts.append(points[finite] @ self.align_R.T)
+                    color_parts.append(colors[finite])
+            if point_parts:
+                map_points = np.concatenate(point_parts)
+                map_colors = np.concatenate(color_parts)
+                if len(map_points) > self.decision_map_max_points:
+                    keep = np.linspace(
+                        0, len(map_points) - 1,
+                        self.decision_map_max_points, dtype=np.int64)
+                    map_points, map_colors = map_points[keep], map_colors[keep]
+                self._frontier_pointcloud = (map_points, map_colors)
+            else:
+                self._frontier_pointcloud = None
             try:
                 semantic_enabled, captioned_ids = \
                     self.client.get_captioned_frame_ids()
@@ -974,7 +1011,7 @@ class NavAgent(MappingAgent):
         return info, render_info
 
     def _build_decider_input(self, observation, local_map=False):
-        """组装决策输入：世界状态 JSON + 俯视标注地图 PNG（编号一致）。"""
+        """组装世界状态和带候选标记的 RGB 点云鸟瞰图。"""
         from agents.decision_state import build_world_state
         self._ensure_decision_map_snapshot(observation, force=local_map)
         # 底图、轨迹和 frontier 都来自 _plan_exploration 的同一原子 frame
@@ -1024,8 +1061,7 @@ class NavAgent(MappingAgent):
         map_png = None
         if grid is not None:
             try:
-                from agents.map_render import render_topdown
-                trajectory = list(self._frontier_trajectory)
+                from agents.map_render import render_pointcloud_topdown
                 crop_radius = None
                 if local_map and pose is not None:
                     crop_radius = self.adjust_map_radius_m / scale
@@ -1036,8 +1072,12 @@ class NavAgent(MappingAgent):
                         self.target_instance_id not in visible_ids:
                     visible_ids.append(self.target_instance_id)
                 visible_ids = set(visible_ids)
-                map_png = render_topdown(
-                    grid, trajectory=trajectory, pose=pose,
+                pointcloud = self._frontier_pointcloud
+                if pointcloud is None:
+                    raise RuntimeError(
+                        "mapping snapshot has no RGB point-cloud colors")
+                map_png = render_pointcloud_topdown(
+                    pointcloud[0], pointcloud[1], pose=pose,
                     instances=[{"id": nd.iid, "xy": tuple(nd.point[:2]),
                                 "reported": nd.reported}
                                for nd in self.memory.nodes
@@ -1045,14 +1085,13 @@ class NavAgent(MappingAgent):
                     frontiers=[{"id": f"f{i}", "xy": tuple(c["world"][:2]),
                                 "reason": c.get("reason", "geometry")}
                                for i, c in enumerate(frontiers)],
-                    frontier_layers=self._frontier_layers,
-                    frontier_stats=self._frontier_stats,
                     active_target=render_target,
                     crop_center=(pose[:2] if local_map and pose is not None
                                  else None),
                     crop_radius=crop_radius,
-                    step=observation.step_count,
-                    map_revision=self._frontier_revision)
+                    floor_z=getattr(grid, "floor_z", None),
+                    unit_per_m=getattr(grid, "unit_per_m", None),
+                    max_plot_points=self.decision_map_max_points)
             except Exception as exc:
                 print(f"[NavAgent] 俯视地图渲染失败: {exc}")
                 map_png = None
@@ -1259,8 +1298,11 @@ class NavAgent(MappingAgent):
             "local_topdown_map": {
                 "attached": map_png is not None,
                 "radius_m": self.adjust_map_radius_m,
-                "robot_marker": "blue arrow labeled YOU",
-                "active_target_marker": "orange star labeled TARGET <id>",
+                "base_layer": "RGB point-cloud projection; no occupancy colors or trajectory",
+                "robot_marker": "blue arrow labeled AGENT",
+                "frontier_marker": "purple diamond labeled fN",
+                "target_marker": "green circle labeled tN",
+                "active_target_marker": "orange star labeled ACTIVE <id>",
             },
         }
         return state, map_png
@@ -1795,8 +1837,8 @@ class NavAgent(MappingAgent):
 
         cam_centers = np.asarray(poses, dtype=np.float64)[:, :3, 3] \
             @ self.align_R.T
-        # 自由空间栅格：优先逐帧局部地板锚定投票（对抗子图间漂移），
-        # 其次全局点云双切片，最后回退面包屑走廊（保底）。
+        # 自由空间栅格：合并去重后的关键帧点云，用一个全局地板峰分层。
+        # 轨迹只是执行历史，不能回退成占据地图。
         self.grid = None
         try:
             frames = self.client.get_frame_points(stride=6)
@@ -1804,7 +1846,7 @@ class NavAgent(MappingAgent):
                 self.grid = nav.OccupancyGrid.from_frame_points(
                     frames, self.align_R)
         except Exception as e:
-            print(f"[NavAgent] 逐帧栅格构建异常: {e}")
+            print(f"[NavAgent] 全局点云栅格构建异常: {e}")
             self.grid = None
         if self.grid is None:
             try:
@@ -1818,17 +1860,12 @@ class NavAgent(MappingAgent):
                 print(f"[NavAgent] 点云栅格构建异常: {e}")
                 self.grid = None
         if self.grid is None:
-            print("[NavAgent] 点云栅格不可用，回退轨迹走廊")
-            self.grid = nav.OccupancyGrid.from_trajectory(cam_centers)
-        if self.grid is None:
-            print("[NavAgent] 栅格构建失败（点数不足）")
+            print("[NavAgent] 几何栅格构建失败（点数或地面证据不足）；"
+                  "拒绝用轨迹伪造自由空间")
             return False
 
         goal_xy = (self.align_R @ self.target_point)[:2]
-        # 起点投影回走廊：机器人物理上一定在自己走过的轨迹附近，
-        # 只有跟随器估计会被撞墙/尺度误差带偏。直接把估计位置吸附到
-        # 走廊上，消除"强制自由产生的孤岛起点"导致的 A* 失败。
-        # 吸附不动（估计漂出 60 格）则硬重置到最新已定位关键帧。
+        # 起点只能吸附到几何确认的 free；traversed 层不参与规划。
         sc = self.grid.nearest_traversable(
             self.grid.world_to_cell((self.follower.x, self.follower.y)), 60)
         if sc is None:

@@ -74,7 +74,7 @@ class PoseGraph:
         """
         homography = self.get_homography(node_id)
         projection_matrix = np.linalg.inv(homography)
-        return projection_matri
+        return projection_matrix
 
     
     def optimize(self, verbose=False):

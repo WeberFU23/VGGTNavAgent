@@ -34,6 +34,7 @@ decision_trace*.jsonl
 
 # ===== 数据文件 / 权重 =====
 /_benchmark_*/
+/dataset/
 /_benchmark_master.zip
 /_dataset_semantic_*.tar.gz
 VGGT-SLAM/office_loop.zip

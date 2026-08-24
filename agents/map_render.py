@@ -1,8 +1,9 @@
-"""决策 VLM 使用的俯视地图渲染器。
+"""Bird's-eye renderers for VLM input and occupancy diagnostics.
 
-底图同时表达几何重建和语义检查状态；叠加层显示统一 frontier 的原始
-边界、经过可达性/冷却过滤的候选、实例、轨迹、当前位姿和活动目标。
-调用方应传入生成 frontier 时的同一 OccupancyGrid 快照。
+``render_pointcloud_topdown`` is the production decision image: reconstructed
+RGB points plus agent/frontier/target markers only. ``render_topdown`` retains
+the richer occupancy-layer visualization for offline debugging and tests; the
+decision path must not send that diagnostic coloring or trajectory to the VLM.
 """
 
 import io
@@ -16,6 +17,8 @@ _COLOR_GEOMETRY_UNCERTAIN = (105, 120, 132)
 _COLOR_FREE_INSPECTED = (250, 250, 250)
 _COLOR_FREE_UNINSPECTED = (255, 232, 160)
 _COLOR_OBSTACLE = (20, 20, 20)
+_COLOR_TRAVERSED_UNKNOWN = (145, 205, 225)
+_COLOR_TRAVERSED_CONFLICT = (235, 65, 165)
 _COLOR_RAW_FRONTIER = (35, 200, 210)
 _COLOR_TRAJECTORY = (220, 40, 40)
 _COLOR_TRAJECTORY_HISTORY = (150, 105, 105)
@@ -24,6 +27,7 @@ _COLOR_VIEW = (95, 155, 235)
 _COLOR_INSTANCE = (30, 160, 60)
 _COLOR_FRONTIER = (150, 60, 200)
 _COLOR_ACTIVE_TARGET = (245, 145, 25)
+_COLOR_POINTCLOUD_BACKGROUND = (248, 248, 248)
 
 
 def _font(size):
@@ -36,6 +40,222 @@ def _font(size):
 def _reason_code(reason):
     return {"geometry": "G", "semantic": "S", "both": "B"}.get(
         str(reason or "").lower(), "?")
+
+
+def _rasterize_orthographic_rgb(image, points, colors, px, py, floor_z=None,
+                                units_per_m=0.0):
+    """Aggregate gravity-aligned 3D evidence into a strict XY orthographic view.
+
+    Every output location depends only on X/Y. Height is used solely to weight
+    RGB samples that land in the same pixel, so it can never introduce camera
+    perspective or move geometry in the image. A one-pixel dilation makes thin
+    sampled surfaces legible without filling unsupported free space.
+    """
+    if len(points) == 0:
+        return
+    height, width = image.shape[:2]
+    flat = py * width + px
+    if floor_z is not None and units_per_m > 0:
+        height_m = (points[:, 2] - float(floor_z)) / float(units_per_m)
+        # Prefer object/wall evidence over floor samples when they share a
+        # top-down pixel, while preventing high ceiling points from dominating.
+        weights = 1.0 + 2.0 * np.clip(height_m, 0.0, 2.2) / 2.2
+    else:
+        weights = np.ones(len(points), dtype=np.float64)
+
+    size = height * width
+    weight_sum = np.bincount(flat, weights=weights, minlength=size)
+    occupied_flat = weight_sum > 0
+    raster = np.zeros((size, 3), dtype=np.float64)
+    for channel in range(3):
+        raster[:, channel] = np.bincount(
+            flat, weights=colors[:, channel] * weights, minlength=size)
+    raster[occupied_flat] /= weight_sum[occupied_flat, None]
+    raster = np.clip(np.rint(raster), 0, 255).astype(np.uint8).reshape(
+        height, width, 3)
+    occupied = occupied_flat.reshape(height, width)
+    image[occupied] = raster[occupied]
+
+    # Expand only into an immediately adjacent blank pixel. Use the original
+    # occupancy mask for every offset so dilation cannot grow recursively.
+    source_mask = occupied.copy()
+    source_rgb = raster.copy()
+    for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                   (1, 0), (-1, 1), (0, 1), (1, 1)):
+        src_y0, src_y1 = max(0, -dy), min(height, height - dy)
+        src_x0, src_x1 = max(0, -dx), min(width, width - dx)
+        dst_y0, dst_y1 = src_y0 + dy, src_y1 + dy
+        dst_x0, dst_x1 = src_x0 + dx, src_x1 + dx
+        source = source_mask[src_y0:src_y1, src_x0:src_x1]
+        destination = occupied[dst_y0:dst_y1, dst_x0:dst_x1]
+        fill = source & ~destination
+        if fill.any():
+            target_rgb = image[dst_y0:dst_y1, dst_x0:dst_x1]
+            candidate_rgb = source_rgb[src_y0:src_y1, src_x0:src_x1]
+            target_rgb[fill] = candidate_rgb[fill]
+            destination[fill] = True
+
+
+def render_pointcloud_topdown(points, colors, pose=None, instances=None,
+                              frontiers=None, active_target=None,
+                              crop_center=None, crop_radius=None,
+                              floor_z=None, unit_per_m=None,
+                              min_image_side=512, max_image_side=1024,
+                              max_plot_points=600000):
+    """Render the decision VLM's compact RGB point-cloud bird's-eye view.
+
+    The base layer is only reconstructed RGB geometry.  It deliberately has no
+    occupancy/semantic region colors and no trajectory: the VLM sees the map
+    evidence itself plus selectable frontier IDs, target-instance IDs, the
+    active target and the current directed pose.  All coordinates must already
+    be in the same gravity-aligned SLAM frame.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    colors = np.asarray(colors).reshape(-1, 3)
+    if len(points) != len(colors):
+        raise ValueError("point-cloud colors must match points")
+    valid = np.isfinite(points).all(axis=1)
+    if np.issubdtype(colors.dtype, np.floating):
+        finite_colors = np.isfinite(colors).all(axis=1)
+        colors = np.nan_to_num(colors, nan=0.0)
+        if colors.size and float(np.max(colors)) <= 1.0:
+            colors = colors * 255.0
+        valid &= finite_colors
+    colors = np.clip(colors, 0, 255).astype(np.uint8)
+
+    units_per_m = float(unit_per_m or 0.0)
+    if floor_z is not None and units_per_m > 0:
+        z = points[:, 2]
+        valid &= (z >= float(floor_z) - 0.20 * units_per_m) & \
+                 (z <= float(floor_z) + 2.70 * units_per_m)
+    points, colors = points[valid], colors[valid]
+    if len(points) == 0:
+        return None
+
+    # Deterministic sampling bounds render cost while retaining evidence from
+    # the complete map rather than favoring recent frames.
+    limit = max(int(max_plot_points), 1)
+    if len(points) > limit:
+        indices = np.linspace(0, len(points) - 1, limit, dtype=np.int64)
+        points, colors = points[indices], colors[indices]
+
+    marker_xy = []
+    if pose is not None:
+        marker_xy.append(np.asarray(pose[:2], dtype=np.float64))
+    for item in list(instances or []) + list(frontiers or []):
+        if item.get("xy") is not None:
+            marker_xy.append(np.asarray(item["xy"], dtype=np.float64)[:2])
+    if active_target is not None and active_target.get("xy") is not None:
+        marker_xy.append(np.asarray(active_target["xy"], dtype=np.float64)[:2])
+
+    if crop_center is not None and crop_radius is not None:
+        center = np.asarray(crop_center, dtype=np.float64)[:2]
+        radius = max(float(crop_radius), 1e-6)
+        lo, hi = center - radius, center + radius
+    else:
+        lo, hi = np.percentile(points[:, :2], [0.5, 99.5], axis=0)
+        if marker_xy:
+            marker_array = np.stack(marker_xy)
+            lo = np.minimum(lo, marker_array.min(axis=0))
+            hi = np.maximum(hi, marker_array.max(axis=0))
+        span = np.maximum(hi - lo, 1e-6)
+        margin = max(0.05 * float(max(span)),
+                     0.25 * units_per_m if units_per_m > 0 else 0.25)
+        lo, hi = lo - margin, hi + margin
+
+    in_view = ((points[:, 0] >= lo[0]) & (points[:, 0] <= hi[0]) &
+               (points[:, 1] >= lo[1]) & (points[:, 1] <= hi[1]))
+    points, colors = points[in_view], colors[in_view]
+    span = np.maximum(hi - lo, 1e-6)
+    content_limit = max(64, int(max_image_side) - 24)
+    scale = content_limit / float(max(span))
+    content_w = max(32, int(math.ceil(span[0] * scale)))
+    content_h = max(32, int(math.ceil(span[1] * scale)))
+    canvas_w = max(int(min_image_side), content_w + 24)
+    canvas_h = max(int(min_image_side), content_h + 24)
+    ox = (canvas_w - content_w) // 2
+    oy = (canvas_h - content_h) // 2
+    image = np.full((canvas_h, canvas_w, 3),
+                    _COLOR_POINTCLOUD_BACKGROUND, dtype=np.uint8)
+
+    def to_px(xy):
+        xy = np.asarray(xy, dtype=np.float64)[:2]
+        x = int(round(ox + (xy[0] - lo[0]) * scale))
+        # Image rows grow downward; map +Y is shown upward.
+        y = int(round(oy + (hi[1] - xy[1]) * scale))
+        return x, y
+
+    if len(points):
+        px = np.rint(ox + (points[:, 0] - lo[0]) * scale).astype(np.int64)
+        py = np.rint(oy + (hi[1] - points[:, 1]) * scale).astype(np.int64)
+        inside = ((px >= 0) & (px < canvas_w) &
+                  (py >= 0) & (py < canvas_h))
+        _rasterize_orthographic_rgb(
+            image, points[inside], colors[inside], px[inside], py[inside],
+            floor_z=floor_z, units_per_m=units_per_m)
+
+    pil = Image.fromarray(image, mode="RGB")
+    draw = ImageDraw.Draw(pil)
+    font = _font(14)
+    marker = 9
+
+    def label(xy, text, color):
+        draw.text(xy, str(text), fill=color, font=font,
+                  stroke_width=2, stroke_fill=(255, 255, 255))
+
+    # Target evidence points are green circles; reported targets are crossed.
+    for instance in instances or []:
+        x, y = to_px(instance["xy"])
+        draw.ellipse([x - marker, y - marker, x + marker, y + marker],
+                     outline=_COLOR_INSTANCE, width=3)
+        if instance.get("reported"):
+            draw.line([(x - marker, y - marker),
+                       (x + marker, y + marker)], fill=_COLOR_INSTANCE, width=2)
+            draw.line([(x - marker, y + marker),
+                       (x + marker, y - marker)], fill=_COLOR_INSTANCE, width=2)
+        label((x + marker + 3, y - marker), f"t{instance['id']}",
+              _COLOR_INSTANCE)
+
+    # Only selectable frontiers are drawn; raw frontier boundaries are omitted.
+    for frontier in frontiers or []:
+        x, y = to_px(frontier["xy"])
+        draw.polygon([(x, y - marker), (x + marker, y),
+                      (x, y + marker), (x - marker, y)],
+                     fill=_COLOR_FRONTIER, outline=(80, 25, 120))
+        label((x + marker + 3, y - marker), frontier["id"], _COLOR_FRONTIER)
+
+    if active_target is not None and active_target.get("xy") is not None:
+        x, y = to_px(active_target["xy"])
+        radius = marker + 4
+        star = []
+        for index in range(10):
+            angle = -math.pi / 2 + index * math.pi / 5
+            rr = radius if index % 2 == 0 else radius * 0.45
+            star.append((x + rr * math.cos(angle),
+                         y + rr * math.sin(angle)))
+        draw.polygon(star, fill=_COLOR_ACTIVE_TARGET, outline=(160, 80, 0))
+        label((x + radius + 3, y - radius),
+              f"ACTIVE {active_target.get('id', '')}".strip(),
+              _COLOR_ACTIVE_TARGET)
+
+    if pose is not None:
+        x, y = to_px(pose[:2])
+        yaw = float(pose[2]) if len(pose) > 2 else 0.0
+        length = 28
+        tip = (x + length * math.cos(yaw),
+               y - length * math.sin(yaw))
+        draw.line([(x, y), tip], fill=_COLOR_POSE, width=4)
+        draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill=_COLOR_POSE,
+                     outline=(255, 255, 255), width=1)
+        label((x + 9, y + 2), "AGENT", _COLOR_POSE)
+
+    # Marker-only legend; there is intentionally no region/occupancy legend.
+    legend = "blue=agent   purple=fN frontier   green=tN target   orange=active"
+    draw.text((8, 6), legend, fill=(25, 25, 25), font=_font(12),
+              stroke_width=2, stroke_fill=(255, 255, 255))
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def render_topdown(grid, trajectory=None, pose=None, instances=None,
@@ -61,6 +281,8 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
         grid, "semantic_coverage_enabled", False))
     semantic = np.asarray(getattr(
         grid, "semantic_inspected", geometry), dtype=bool)
+    traversed = np.asarray(getattr(
+        grid, "traversed", np.zeros_like(free)), dtype=bool)
     h, w = free.shape
 
     x0, y0, x1, y1 = 0, 0, w, h
@@ -92,6 +314,7 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
         local_obstacle = obstacle[sy0:sy1, sx0:sx1]
         local_geometry = geometry[sy0:sy1, sx0:sx1]
         local_semantic = semantic[sy0:sy1, sx0:sx1]
+        local_traversed = traversed[sy0:sy1, sx0:sx1]
         patch = img[dy0:dy1, dx0:dx1]
         patch[local_geometry] = _COLOR_GEOMETRY_UNCERTAIN
         if semantic_enabled:
@@ -100,6 +323,12 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
         else:
             patch[local_free] = _COLOR_FREE_INSPECTED
         patch[local_obstacle] = _COLOR_OBSTACLE
+        # Traversed is deliberately visualized only where it disagrees with
+        # occupancy. It never changes free/obstacle/frontier computation.
+        patch[local_traversed & ~local_free & ~local_obstacle] = \
+            _COLOR_TRAVERSED_UNKNOWN
+        patch[local_traversed & local_obstacle] = \
+            _COLOR_TRAVERSED_CONFLICT
 
         raw = None if frontier_layers is None else frontier_layers.get(
             "unified")
@@ -231,12 +460,29 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
                       stroke_fill=(255, 255, 255))
 
     if show_legend:
+        pose_status = "n/a"
+        if pose is not None:
+            pose_cell = grid.world_to_cell(pose[:2])
+            if not grid.in_bounds(pose_cell):
+                pose_status = "outside"
+            else:
+                px, py = pose_cell
+                if obstacle[py, px]:
+                    pose_status = "OBSTACLE"
+                elif free[py, px]:
+                    pose_status = "free"
+                elif geometry[py, px]:
+                    pose_status = "uncertain"
+                else:
+                    pose_status = "unknown"
         entries = [
             (_COLOR_FREE_INSPECTED, "free + semantically inspected"),
             (_COLOR_FREE_UNINSPECTED, "free + semantic inspection needed"),
             (_COLOR_GEOMETRY_UNCERTAIN, "geometry seen, occupancy uncertain"),
             (_COLOR_GEOMETRY_UNKNOWN, "geometry unseen"),
             (_COLOR_OBSTACLE, "obstacle / inflated obstacle"),
+            (_COLOR_TRAVERSED_UNKNOWN, "traversed but geometry not free"),
+            (_COLOR_TRAVERSED_CONFLICT, "traversed / obstacle CONFLICT"),
             (_COLOR_RAW_FRONTIER, "raw unified frontier boundary"),
             (_COLOR_FRONTIER, "selectable frontier fN:G/S/B"),
         ]
@@ -252,7 +498,8 @@ def render_topdown(grid, trajectory=None, pose=None, instances=None,
                   fill=(80, 80, 80), width=1)
         title = f"step={step if step is not None else '?'}  " \
                 f"map_rev={map_revision if map_revision is not None else '?'}  " \
-                f"view={'local' if crop_center is not None else 'global'}"
+                f"view={'local' if crop_center is not None else 'global'}  " \
+                f"pose_cell={pose_status}"
         draw.text((10, 8), title, fill=(20, 20, 20), font=small_font)
         stats = dict(frontier_stats or {})
         status = (

@@ -2,9 +2,9 @@
 
 架构：
 1. CaptionWorker：挂在子图处理完成后的挂点上，异步为每个关键帧生成
-   查询无关的详细 caption（场景类型/房间 + 可见物体清单含颜色材质 +
-   物体间空间关系）。请求经 VLLMGateway 发给本地多模态 VLM，优先级
-   最低；GPU 忙（子图处理/pointing 在途）时让路。
+   查询无关的详细 caption（可见物体清单及颜色/材质等属性）。请求经
+   VLLMGateway 发给本地多模态 VLM，优先级最低；GPU 忙（子图处理/
+   pointing 在途）时让路。
 2. CaptionStore：{frame_id, 位姿, caption, embedding(BGE-M3)} 记忆库，
    落盘持久化，支持按 episode 清空。检索使用 BGE-M3 文本向量和余弦
    相似度 top-K，以支持较长 caption 和完整任务描述。具体本地 VLM 由
@@ -24,15 +24,7 @@ import numpy as np
 
 from mapping.vllm_client import Priority, VLLMError
 
-CAPTION_PROMPT = """Describe this indoor RGB image in detail for later text-based
-retrieval. This description is query-independent, so prefer completeness over
-brevity. Cover:
-1. Scene/room type and overall layout.
-2. A list of visible objects, each with fine-grained attributes (color,
-   material, shape, size relative to surroundings, texture).
-3. Spatial relations between objects (on/under/next to/behind/inside, left
-   and right from the camera's perspective).
-Output plain prose, 3-6 sentences, no markdown, no bullet markers."""
+CAPTION_PROMPT = """Output a list of all visible objects with their attributes in this indoor RGB image. This description is for later text-based retrieval and is query-independent, so prefer completeness over brevity."""
 
 
 def _safe_episode_component(value):

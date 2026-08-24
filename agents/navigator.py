@@ -5,7 +5,8 @@
 1. 重力对齐：相机旋转（经安装俯仰角补偿）的稳健中位数估计竖直轴，
    得到 z'=up 的 2D 规划平面。
 2. 占据栅格：点云按高度分层——近地面层为可行走面，腰部高度层为障碍；
-   相机中心投影强制标记为自由（机器人确实走过），障碍物按机器人半径膨胀。
+   障碍物按机器人半径膨胀。相机轨迹仅记录在独立 ``traversed`` 层，
+   不参与自由空间和障碍物分类。
 3. A* 寻路 + 视线捷径简化。
 4. 路径跟随：最新关键帧位姿为锚点，动作序列做航位推算（turn=±30°，
    forward=0.25m/scale），输出 benchmark 离散动作。
@@ -142,11 +143,74 @@ def _binary_dilate(mask, iterations=1):
     return result
 
 
+def _trajectory_mask(shape, origin, res, cam_centers, radius_cells=0):
+    """Rasterize a camera polyline without changing occupancy evidence."""
+    mask = np.zeros(shape, dtype=bool)
+    centers = np.asarray(cam_centers, dtype=np.float64)
+    if centers.size == 0:
+        return mask
+    centers = centers.reshape(-1, centers.shape[-1])
+    cells = np.floor((centers[:, :2] - origin) / res).astype(np.int64)
+    line_cells = []
+    for index, cell in enumerate(cells):
+        x0, y0 = int(cell[0]), int(cell[1])
+        if index:
+            x1, y1 = (int(cells[index - 1, 0]),
+                      int(cells[index - 1, 1]))
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx - dy
+            while (x0, y0) != (x1, y1):
+                line_cells.append((x0, y0))
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    x0 += sx
+                if e2 < dx:
+                    err += dx
+                    y0 += sy
+        line_cells.append((int(cell[0]), int(cell[1])))
+
+    h, w = mask.shape
+    radius = max(int(radius_cells), 0)
+    for cx, cy in line_cells:
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy > radius * radius:
+                    continue
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < h:
+                    mask[y, x] = True
+    return mask
+
+
+def _nearest_mask_cell(mask, start, max_radius):
+    """Return the nearest True cell around ``start`` without mutating ``mask``."""
+    h, w = mask.shape
+    sx, sy = int(start[0]), int(start[1])
+    for radius in range(max(int(max_radius), 0) + 1):
+        candidates = []
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if radius and max(abs(dx), abs(dy)) != radius:
+                    continue
+                x, y = sx + dx, sy + dy
+                if 0 <= x < w and 0 <= y < h and mask[y, x]:
+                    candidates.append((dx * dx + dy * dy, x, y))
+        if candidates:
+            _, x, y = min(candidates)
+            return x, y
+    return None
+
+
 class OccupancyGrid:
     """2D 占据栅格（对齐坐标系），单位与输入点云一致（地图单位）。"""
 
     def __init__(self, res, origin, free, obstacle, observed=None,
-                 semantic_inspected=None, semantic_coverage_enabled=False):
+                 semantic_inspected=None, semantic_coverage_enabled=False,
+                 traversed=None, ground_votes=None, obstacle_votes=None,
+                 raw_obstacle=None):
         self.res = float(res)           # 地图单位/格
         if not math.isfinite(self.res) or self.res <= 0:
             raise ValueError(f"grid resolution must be positive: {res!r}")
@@ -175,6 +239,29 @@ class OccupancyGrid:
                 "semantic_inspected must match the occupancy grid shape")
         self.semantic_coverage_enabled = bool(semantic_coverage_enabled)
         self.semantic_view_count = np.zeros(self.free.shape, dtype=np.uint16)
+        # ``traversed`` is physical execution evidence, not geometric free-space
+        # evidence. Keeping it separate prevents the robot path from painting a
+        # corridor into the occupancy map.
+        self.traversed = self._layer(
+            traversed, bool, "traversed", default=False)
+        self.ground_votes = self._layer(
+            ground_votes, np.uint32, "ground_votes", default=0)
+        self.obstacle_votes = self._layer(
+            obstacle_votes, np.uint32, "obstacle_votes", default=0)
+        self.raw_obstacle = self._layer(
+            raw_obstacle, bool, "raw_obstacle", default=False)
+        self.start_cell = None
+        self.start_seed_cell = None
+        self.start_seed_distance_cells = None
+        self.connectivity_filtered = False
+
+    def _layer(self, value, dtype, name, default):
+        if value is None:
+            return np.full(self.free.shape, default, dtype=dtype)
+        layer = np.asarray(value, dtype=dtype)
+        if layer.shape != self.free.shape:
+            raise ValueError(f"{name} must match the occupancy grid shape")
+        return layer
 
     def update_semantic_coverage(self, frames, captioned_frame_ids, align_R,
                                  max_range_m=4.0, close_range_m=2.0,
@@ -300,13 +387,12 @@ class OccupancyGrid:
 
     @classmethod
     def from_trajectory(cls, cam_centers_aligned, stamp=3):
-        """只从相机轨迹构建可行走网络（"面包屑"导航）。
+        """Build a diagnostic trajectory-only grid with no inferred free cells.
 
-        语义层定位的目标必然在机器人曾经到达过的地方附近（它就是从
-        历史关键帧里检出的），因此沿走过的路线规划既不需要地板/障碍
-        高度分层（实测在稀疏点云+尺度误差下极不可靠），也天然避障
-        ——这条路机器人真的走过。栅格分辨率用关键帧间距自适应，
-        同样不依赖在线尺度标定。
+        This compatibility constructor intentionally produces only the
+        ``traversed`` layer. A robot path proves that motion occurred, but it
+        does not prove that nearby cells are currently geometrically free.
+        Navigation must not use this grid as an occupancy fallback.
         """
         xy = np.asarray(cam_centers_aligned, dtype=np.float64)[:, :2]
         if len(xy) < 2:
@@ -321,34 +407,13 @@ class OccupancyGrid:
         w = max(int(np.ceil((qhi[0] - qlo[0]) / res)), 8)
         h = max(int(np.ceil((qhi[1] - qlo[1]) / res)), 8)
         free = np.zeros((h, w), dtype=bool)
-
-        cc = np.floor((xy - qlo) / res).astype(np.int64)
-        cells = []
-        for i in range(len(cc)):
-            x0, y0 = int(cc[i][0]), int(cc[i][1])
-            if i > 0:  # 与上一相机 Bresenham 连线，覆盖大步长间隙
-                x1, y1 = int(cc[i - 1][0]), int(cc[i - 1][1])
-                dx, dy = abs(x1 - x0), abs(y1 - y0)
-                sx = 1 if x0 < x1 else -1
-                sy = 1 if y0 < y1 else -1
-                err = dx - dy
-                while (x0, y0) != (x1, y1):
-                    cells.append((x0, y0))
-                    e2 = 2 * err
-                    if e2 > -dy:
-                        err -= dy
-                        x0 += sx
-                    if e2 < dx:
-                        err += dx
-                        y0 += sy
-            cells.append((x0, y0))
-        for cx, cy in cells:
-            for dx in range(-stamp, stamp + 1):
-                for dy in range(-stamp, stamp + 1):
-                    nx, ny = cx + dx, cy + dy
-                    if 0 <= nx < w and 0 <= ny < h:
-                        free[ny, nx] = True
-        grid = cls(res, qlo, free, np.zeros_like(free))
+        traversed = _trajectory_mask(
+            free.shape, qlo, res, cam_centers_aligned,
+            radius_cells=max(int(stamp), 0))
+        grid = cls(
+            res, qlo, free, np.zeros_like(free),
+            observed=np.zeros_like(free),
+            semantic_inspected=np.zeros_like(free), traversed=traversed)
         grid.floor_z = None
         grid.unit_per_m = 1.0 / (spacing * 1.5) if spacing else 0.0  # 调试估算
         return grid
@@ -356,14 +421,27 @@ class OccupancyGrid:
     @classmethod
     def build(cls, points_aligned, cam_centers_aligned,
               res_m=0.10, floor_band_m=0.12, obs_low_m=0.15, obs_high_m=1.8,
-              robot_radius_m=0.25, margin_m=0.5, cam_height_m=1.5):
+              robot_radius_m=0.25, margin_m=0.5, cam_height_m=1.5,
+              unit_per_m=None, point_frame_ids=None,
+              voxel_size_m=0.05, min_voxel_views=3):
         """从对齐点云构建栅格。
 
-        所有米制参数都通过"尺规"换算成地图单位：尺规 = 相机中位高度 -
-        地面高度（habitat 中相机离地约 1.5m，是地图内生的参照，不受
-        在线尺度标定误差影响——实测标定误差可达 40%+，直接用它会
-        同时压窄地板带宽、戳破溅射连通性，导致自由空间消失）。
+        有动作尺度时，地板峰只在“相机下方约 1.5m”的范围内搜索；没有
+        动作尺度时，才从全局高度峰和水平覆盖反推地图单位。两种路径都
+        只使用融合后的 3D 点与相机中心，不使用图像底部行。
         """
+        points_aligned = np.asarray(points_aligned, dtype=np.float64)
+        finite = np.isfinite(points_aligned).all(axis=1)
+        if point_frame_ids is not None:
+            point_frame_ids = np.asarray(point_frame_ids).reshape(-1)
+            if len(point_frame_ids) != len(points_aligned):
+                raise ValueError("point_frame_ids must match points_aligned")
+            point_frame_ids = point_frame_ids[finite]
+        points_aligned = points_aligned[finite]
+        cam_centers_aligned = np.asarray(
+            cam_centers_aligned, dtype=np.float64)
+        finite_cameras = np.isfinite(cam_centers_aligned).all(axis=1)
+        cam_centers_aligned = cam_centers_aligned[finite_cameras]
         if len(points_aligned) == 0:
             return None
         xy = points_aligned[:, :2]
@@ -375,12 +453,45 @@ class OccupancyGrid:
         cam_h = float(np.median(cam_centers_aligned[:, 2])) \
             if len(cam_centers_aligned) else float(np.median(z))
         z_min = float(np.percentile(z, 1))
-        ruler_est = max(cam_h - z_min, 1e-6)
+        supplied_units = unit_per_m is not None and \
+            math.isfinite(float(unit_per_m)) and float(unit_per_m) > 0
+        ruler_est = (cam_height_m * float(unit_per_m)) if supplied_units else \
+            max(cam_h - z_min, 1e-6)
+
+        # 融合点云仍包含每个关键帧各自预测的稠密点。先量化为 3D 体素，
+        # 每帧对同一体素最多贡献一次支持，只保留至少两个独立视角重建的
+        # 表面。输出体素中心后，后续高度统计不再受单帧点密度支配。
+        voxel_size = max(float(voxel_size_m) * (
+            float(unit_per_m) if supplied_units else ruler_est / cam_height_m),
+            1e-6)
+        source_point_count = len(points_aligned)
+        retained_voxel_count = source_point_count
+        if point_frame_ids is not None and min_voxel_views > 1 and \
+                np.unique(point_frame_ids).size >= min_voxel_views:
+            cells = np.floor(points_aligned / voxel_size).astype(np.int64)
+            frame_cells = np.column_stack([point_frame_ids, cells])
+            frame_cells = np.unique(frame_cells, axis=0)
+            voxels, view_counts = np.unique(
+                frame_cells[:, 1:], axis=0, return_counts=True)
+            keep = view_counts >= int(min_voxel_views)
+            if keep.any():
+                points_aligned = (voxels[keep].astype(np.float64) + 0.5) \
+                    * voxel_size
+                xy = points_aligned[:, :2]
+                z = points_aligned[:, 2]
+                retained_voxel_count = int(keep.sum())
         lo, hi = np.percentile(z, [1, 99])
         nbins = max(int((hi - lo) / (0.033 * ruler_est)), 10)
         hist, edges = np.histogram(z, bins=nbins, range=(lo, hi))
         centers = 0.5 * (edges[:-1] + edges[1:])
         below = centers < cam_h - 0.15 * ruler_est
+        if supplied_units:
+            # 动作里程计已经给出地图尺度时，地板应位于相机下方约一个
+            # cam_height。只在 ±0.35m 的窄带内找峰，避免桌面/床面凭更高
+            # 点密度或水平覆盖被选成地板。
+            expected_floor = cam_h - cam_height_m * float(unit_per_m)
+            search_radius = 0.35 * float(unit_per_m)
+            below &= np.abs(centers - expected_floor) <= search_radius
         if not below.any():
             return None
         # 平滑后找局部峰，取高度最低且计数 >= 最大峰 30% 的峰
@@ -394,7 +505,11 @@ class OccupancyGrid:
             return None
         strong = [i for i in peaks
                   if h_smooth[i] >= 0.3 * h_smooth[below].max()]
-        candidates = strong if strong else [int(np.argmax(h_smooth[below]))]
+        if strong:
+            candidates = strong
+        else:
+            valid_bins = np.flatnonzero(below)
+            candidates = [int(valid_bins[np.argmax(h_smooth[valid_bins])])]
         # 候选峰中选水平覆盖最广的：地板铺满整个可行走区域，
         # 桌/床面计数可以超过地板，但水平 footprint 永远有限。
         # （尺度无关，替代之前"取最低强峰"——实测会锁到床面，
@@ -413,10 +528,19 @@ class OccupancyGrid:
             if cov_count > best_cov:
                 best_i, best_cov = i, cov_count
         floor_z = float(centers[best_i])
+        # 三格平滑可能把尖锐地板峰的局部最大值推到相邻 bin。回到原始点
+        # 上取窄带中位数，避免半个 bin 的高度偏差吞掉低矮障碍。
+        refine_radius = max(0.10 * ruler_est,
+                            float(edges[1] - edges[0]) * 1.5)
+        refine = np.abs(z - floor_z) <= refine_radius
+        if refine.any():
+            floor_z = float(np.median(z[refine]))
 
         # 尺规：相机离地高度（地图单位）≈ cam_height_m 米
         ruler = max(cam_h - floor_z, 1e-6)
-        u = ruler / cam_height_m          # 1 米对应的地图单位数
+        # 有可靠动作尺度时保持米制分辨率固定；地板峰仅负责 floor_z，不能
+        # 反过来用少量高度误差改写整张地图的尺度。
+        u = float(unit_per_m) if supplied_units else ruler / cam_height_m
         res = res_m * u
 
         # 分层
@@ -451,17 +575,34 @@ class OccupancyGrid:
         free = raster(is_floor, splat=1)
         obstacle = raster(is_obs, splat=0)
         observed = raster(np.ones(len(xy), dtype=bool), splat=1)
-        return cls._finalize(free, obstacle, res, qlo, cam_centers_aligned,
-                             floor_z=floor_z, unit_per_m=u,
-                             robot_radius_m=robot_radius_m, res_m=res_m,
-                             observed=observed)
+        grid = cls._finalize(
+            free, obstacle, res, qlo, cam_centers_aligned,
+            floor_z=floor_z, unit_per_m=u,
+            robot_radius_m=robot_radius_m, res_m=res_m,
+            observed=observed, ground_votes=free.astype(np.uint32),
+            obstacle_votes=obstacle.astype(np.uint32))
+        grid.source_point_count = int(source_point_count)
+        grid.retained_voxel_count = int(retained_voxel_count)
+        grid.voxel_size_m = float(voxel_size_m)
+        grid.min_voxel_views = int(min_voxel_views)
+        return grid
 
     @classmethod
     def _finalize(cls, free, obstacle, res, qlo, cam_centers_aligned,
                   floor_z, unit_per_m, robot_radius_m=0.25, res_m=0.10,
-                  observed=None):
-        """公共收尾：障碍膨胀 -> 走廊覆盖 -> 连通域约束 -> 建栅格。"""
-        h, w = free.shape
+                  observed=None, ground_votes=None, obstacle_votes=None,
+                  max_seed_distance_m=0.75):
+        """Inflate obstacles and select a connected geometric free component.
+
+        Camera motion is rasterized into a separate ``traversed`` layer. It is
+        never allowed to add free cells, erase obstacles, or mark geometry as
+        observed. Connectivity filtering is applied only when the latest pose
+        has nearby ground-supported free space; otherwise the raw geometric
+        classification is retained and the missing seed is exposed in metadata.
+        """
+        free = np.asarray(free, dtype=bool).copy()
+        raw_obstacle = np.asarray(obstacle, dtype=bool).copy()
+        obstacle = raw_obstacle.copy()
         # 障碍物按机器人半径膨胀（3x3 最大滤波迭代）
         iters = max(int(math.ceil(robot_radius_m / res_m)), 1)
         obstacle = _binary_dilate(obstacle, iterations=iters)
@@ -469,158 +610,91 @@ class OccupancyGrid:
         # 被膨胀障碍覆盖的自由格不再可行走
         free &= ~obstacle
 
-        # 相机轨迹走廊 = 机器人走过的路线，最后强制自由并清障
-        # （必须在膨胀之后，否则膨胀会把走廊重新盖掉）。
-        # 地板点稀疏/有洞时自由空间会碎裂，走廊保证起点沿走过的
-        # 路线到目标附近的连通性（目标总是曾入镜的位置）。
+        traversed = _trajectory_mask(
+            free.shape, qlo, res, cam_centers_aligned,
+            radius_cells=max(int(math.ceil(robot_radius_m / res_m)), 0))
+        start = None
+        seed = None
         if len(cam_centers_aligned):
-            cc = np.floor((cam_centers_aligned[:, :2] - qlo) / res).astype(np.int64)
-            cells = []
-            for i in range(len(cc)):
-                x0, y0 = int(cc[i][0]), int(cc[i][1])
-                if i > 0:  # 与上一相机连线（Bresenham），覆盖大步长间隙
-                    x1, y1 = int(cc[i - 1][0]), int(cc[i - 1][1])
-                    dx, dy = abs(x1 - x0), abs(y1 - y0)
-                    sx = 1 if x0 < x1 else -1
-                    sy = 1 if y0 < y1 else -1
-                    err = dx - dy
-                    while (x0, y0) != (x1, y1):
-                        cells.append((x0, y0))
-                        e2 = 2 * err
-                        if e2 > -dy:
-                            err -= dy
-                            x0 += sx
-                        if e2 < dx:
-                            err += dx
-                            y0 += sy
-                cells.append((int(cc[i][0]), int(cc[i][1])))
-            for cx, cy in cells:
-                for dx in (-2, -1, 0, 1, 2):
-                    for dy in (-2, -1, 0, 1, 2):
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < w and 0 <= ny < h:
-                            free[ny, nx] = True
-                            obstacle[ny, nx] = False
-            # 连通域约束：只有与机器人当前位置连通的自由空间才可行走。
-            # 镜面/玻璃的假深度会在墙另一侧造出"鬼自由空间"，
-            # 不连通的区域一律剔除（探索时也不会把它当目标）。
-            start = (int(cc[-1][0]), int(cc[-1][1]))
-            free = _flood_component(free, start)
+            latest = np.asarray(cam_centers_aligned, dtype=np.float64)[-1, :2]
+            cell = np.floor((latest - qlo) / res).astype(np.int64)
+            start = (int(cell[0]), int(cell[1]))
+            max_radius = max(
+                int(math.ceil(max_seed_distance_m / max(res_m, 1e-9))), 0)
+            seed = _nearest_mask_cell(free, start, max_radius)
+            if seed is not None:
+                free = _flood_component(free, seed)
         # free/obstacle 之外，被点云覆盖但因高度分类不确定的格子仍是
-        # "已观测"，不能作为 frontier。轨迹走廊也明确属于已观测区域。
+        # "已观测"，不能作为 frontier。障碍膨胀和 traversed 都不是新的
+        # 3D 观测，因此不得扩大 geometry_observed。
         if observed is None or observed.shape != free.shape:
-            observed = free | obstacle
-        observed = np.asarray(observed, dtype=bool) | free | obstacle
-        grid = cls(res, qlo, free, obstacle, observed=observed)
+            observed = np.asarray(free | raw_obstacle, dtype=bool)
+        else:
+            observed = np.asarray(observed, dtype=bool).copy()
+        grid = cls(
+            res, qlo, free, obstacle, observed=observed,
+            traversed=traversed, ground_votes=ground_votes,
+            obstacle_votes=obstacle_votes, raw_obstacle=raw_obstacle)
         grid.floor_z = floor_z
         grid.unit_per_m = unit_per_m  # 调试用：1 米对应的地图单位数
+        grid.start_cell = start
+        grid.start_seed_cell = seed
+        grid.start_seed_distance_cells = (
+            None if start is None or seed is None else
+            float(math.hypot(seed[0] - start[0], seed[1] - start[1])))
+        grid.connectivity_filtered = seed is not None
         return grid
 
     @classmethod
     def from_frame_points(cls, frames, align_R, cam_height_m=1.5,
-                          res_m=0.10, bottom_frac=0.25, min_floor_pts=50,
-                          ground_band=0.2, obs_low=0.2, obs_high=1.2,
-                          min_ground_votes=1, obs_votes=2,
-                          robot_radius_m=0.25, margin_m=0.5):
-        """逐帧局部地板锚定的投票式自由空间（对抗子图间漂移/分层污损）。
+                          res_m=0.10, floor_band_m=0.12,
+                          obs_low_m=0.15, obs_high_m=1.8,
+                          robot_radius_m=0.25, margin_m=0.5,
+                          unit_per_m=None, voxel_size_m=0.05,
+                          min_voxel_views=3):
+        """Merge unique VGGT frames and build one global-floor occupancy map.
 
-        全局点云在子图边界处有重影，全局高度直方图会被抹平（实测地板
-        峰消失、桌床峰胜出）。改为逐帧处理：相机下俯 40°，图像底部
-        bottom_frac 行的点即脚下地板，取其中位高度为该帧局部地板，
-        尺规 = 相机高 - 局部地板（≈1.5m，构造上尺度无关）；再以
-        尺规的相对带宽投地面票/障碍票到公共栅格。每帧几何内部一致，
-        子图错位只模糊格子边界而不破坏分层。
-
-        frames: iterable of dict，含 keys:
-            points (N,3) 世界系（NaN 表示无效）, rows (N,) 原始图像行号,
-            pose (4,4) cam2world。
+        ``rows`` are deliberately ignored: after SLAM has produced a common 3D
+        map, floor classification should depend on global height rather than on
+        where a point appeared in an individual image.  Overlapping submaps may
+        return the same physical frame repeatedly, so ``frame_id`` is deduplicated
+        before point clouds and camera poses are merged.
         """
-        per_frame = []
-        cam_centers = []
-        rulers = []
-        for fr in frames:
-            pts = np.asarray(fr["points"], dtype=np.float64)
-            rows = np.asarray(fr["rows"]).ravel()
-            finite = np.isfinite(pts).all(axis=1)
-            pts, rows = pts[finite], rows[finite]
-            if len(pts) < min_floor_pts:
-                continue
-            pa = pts @ align_R.T
-            cam = np.asarray(fr["pose"], dtype=np.float64)[:3, 3] @ align_R.T
-            img_h = rows.max() + 1
-            bottom = rows >= img_h * (1.0 - bottom_frac)
-            floor_sel = bottom & (pa[:, 2] < cam[2])
-            if floor_sel.sum() < min_floor_pts:
-                continue
-            floor_z = float(np.median(pa[floor_sel, 2]))
-            ruler = cam[2] - floor_z
-            if ruler <= 1e-6:
-                continue
-            z = pa[:, 2]
-            ground = np.abs(z - floor_z) < ground_band * ruler
-            obs = (z > floor_z + obs_low * ruler) & \
-                  (z < floor_z + obs_high * ruler)
-            per_frame.append((pa[:, :2], ground, obs))
-            cam_centers.append(cam)
-            rulers.append(ruler)
-        if not per_frame:
+        unique_frames = {}
+        for index, frame in enumerate(frames or []):
+            fid = int(frame.get("frame_id", index))
+            unique_frames[fid] = frame
+
+        point_parts = []
+        point_frame_parts = []
+        camera_parts = []
+        for fid in sorted(unique_frames):
+            frame = unique_frames[fid]
+            points = np.asarray(frame["points"], dtype=np.float64)
+            finite = np.isfinite(points).all(axis=1)
+            if finite.any():
+                point_parts.append(points[finite] @ align_R.T)
+                point_frame_parts.append(np.full(
+                    int(finite.sum()), fid, dtype=np.int64))
+            pose = np.asarray(frame["pose"], dtype=np.float64)
+            if pose.shape == (4, 4) and np.isfinite(pose).all():
+                camera_parts.append(pose[:3, 3] @ align_R.T)
+        if not point_parts or not camera_parts:
             return None
-        cam_centers = np.stack(cam_centers)
-        ruler_med = float(np.median(rulers))
-        u = ruler_med / cam_height_m
-        res = res_m * u
 
-        all_xy = np.concatenate([pf[0] for pf in per_frame])
-        qlo = np.percentile(all_xy, 0.5, axis=0) - margin_m * u
-        qhi = np.percentile(all_xy, 99.5, axis=0) + margin_m * u
-        qlo = np.minimum(qlo, cam_centers[:, :2].min(0) - res)
-        qhi = np.maximum(qhi, cam_centers[:, :2].max(0) + res)
-        w = max(int(np.ceil((qhi[0] - qlo[0]) / res)), 8)
-        h = max(int(np.ceil((qhi[1] - qlo[1]) / res)), 8)
-
-        gv = np.zeros((h, w), dtype=np.int32)
-        ov = np.zeros((h, w), dtype=np.int32)
-        observed = np.zeros((h, w), dtype=bool)
-        for xy2, ground, obs in per_frame:
-            # 任意有效 VGGT 3D 回投影均贡献观测覆盖；一格膨胀填补稀疏
-            # 点采样的小孔，但不会把视野外区域误标为已观测。
-            cell_all = np.floor((xy2 - qlo) / res).astype(np.int64)
-            ok_all = (cell_all[:, 0] >= 0) & (cell_all[:, 0] < w) & \
-                     (cell_all[:, 1] >= 0) & (cell_all[:, 1] < h)
-            observed[cell_all[ok_all, 1], cell_all[ok_all, 0]] = True
-            for mask, acc in ((ground, gv), (obs, ov)):
-                sel = xy2[mask]
-                if not len(sel):
-                    continue
-                cell = np.floor((sel - qlo) / res).astype(np.int64)
-                ok = (cell[:, 0] >= 0) & (cell[:, 0] < w) & \
-                     (cell[:, 1] >= 0) & (cell[:, 1] < h)
-                np.add.at(acc, (cell[ok, 1], cell[ok, 0]), 1)
-
-        free = (gv >= min_ground_votes) & (ov < obs_votes)
-        # 地面点间距 > 格距时自由空间碎裂，膨胀一格桥接（随后障碍会盖回）
-        free = _binary_dilate(free)
-        # 3x3 闭运算：填补稀疏采样小孔，同时基本保持真实观测外边界；
-        # 不能只做膨胀，否则 free 与 unknown 会被隔开而丢失 frontier。
-        padded = np.pad(observed, 1, constant_values=False)
-        dilated = observed.copy()
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                dilated |= padded[1 + dy:1 + dy + h,
-                                   1 + dx:1 + dx + w]
-        padded_d = np.pad(dilated, 1, constant_values=False)
-        covered = np.ones_like(observed)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                covered &= padded_d[1 + dy:1 + dy + h,
-                                    1 + dx:1 + dx + w]
-        obstacle = ov >= obs_votes
-        floor_z_med = float(np.median(
-            [c[2] for c in cam_centers])) - ruler_med
-        return cls._finalize(free, obstacle, res, qlo, cam_centers,
-                             floor_z=floor_z_med, unit_per_m=u,
-                             robot_radius_m=robot_radius_m, res_m=res_m,
-                             observed=covered)
+        grid = cls.build(
+            np.concatenate(point_parts), np.stack(camera_parts),
+            res_m=res_m, floor_band_m=floor_band_m,
+            obs_low_m=obs_low_m, obs_high_m=obs_high_m,
+            robot_radius_m=robot_radius_m, margin_m=margin_m,
+            cam_height_m=cam_height_m, unit_per_m=unit_per_m,
+            point_frame_ids=np.concatenate(point_frame_parts),
+            voxel_size_m=voxel_size_m,
+            min_voxel_views=min_voxel_views)
+        if grid is not None:
+            grid.floor_model = "global_height_peak"
+            grid.source_frame_count = len(unique_frames)
+        return grid
 
     # ------------------------------------------------------------------
     def world_to_cell(self, p):

@@ -10,18 +10,15 @@ import json
 
 DECIDER_PROMPT = """You are the reasoning core of an embodied multi-object
 navigation harness. You receive a JSON world state (all distances and path
-costs are precomputed — never estimate geometry yourself) and an annotated
-top-down map image. Its legend is authoritative: white=reachable free space that
-has also been semantically inspected, pale yellow=reachable free space that
-still needs semantic inspection, blue-gray=geometry observed but occupancy
-uncertain, light gray=geometry unseen, black=obstacle/inflated obstacle,
-cyan=raw unified frontier boundary, purple diamonds=selectable frontiers,
-green circles=the bounded instance subset listed in JSON, blue YOU arrow=current
-pose, muted red=older trajectory, bright red=recent trajectory, and orange
-TARGET star=active target. The header reports raw/reachable/selectable frontier
-counts and map axes; use it to distinguish exhausted exploration from filtered
-or unreachable candidates. Frontier suffix G/S/B means geometry, semantic, or
-both; ids match the state JSON.
+costs are precomputed — never estimate geometry yourself) and an RGB point-cloud
+bird's-eye image. The image directly projects reconstructed 3D colors; it does
+not color-code free, obstacle, observed, or semantically inspected regions and
+it contains no trajectory. Blank pixels mean only "no rendered 3D point", not
+known free space. Blue AGENT arrow=current pose and heading, purple diamonds
+fN=selectable frontiers, green circles tN=target instances, and orange
+ACTIVE star=the active navigation target. Marker ids match the state JSON.
+Use JSON frontier_status and precomputed path costs—not image color—to determine
+reachability, filtering, semantic/geometric gain, or exploration exhaustion.
 
 Every instance is created from a VLM-pointed image pixel and its VGGT 3D point.
 Its text is your editable working memory, not a fixed class label. Read evidence,
@@ -165,10 +162,10 @@ EVENT_GUIDANCE = {
     "adjustment": (
         "\nYou are inside the bounded adjustment state. The first extra image is "
         "the latest RGB after the previously executed action; the image labeled "
-        "topdown_map is a current local map centered on the blue YOU marker with "
-        "the active target shown as an orange TARGET star. Pale-yellow nearby "
-        "free space still needs semantic inspection; cyan is the raw unified "
-        "frontier boundary. Read "
+        "topdown_map is a current local RGB point-cloud bird's-eye view centered "
+        "on the blue AGENT marker, with the active target shown as an orange "
+        "ACTIVE star. It has no trajectory or occupancy-region coloring; blank "
+        "pixels are not proof of free space. Read "
         "world_state.adjustment, especially current_pose, active_target, "
         "previous_action, collision, and remaining-step information. A detected "
         "collision means the previous forward action produced no motion; do not "

@@ -2,7 +2,12 @@
 
 import pytest
 
-from mapping.keyframes import AdaptiveKeyframeSelector, pop_submap_window
+from mapping.keyframes import (
+    SUPPORTED_SUBMAP_OVERLAP,
+    AdaptiveKeyframeSelector,
+    pop_submap_window,
+    validate_supported_overlap,
+)
 
 
 class FakeTracker:
@@ -58,3 +63,20 @@ def test_submap_window_preserves_overlap_and_pending_frames():
 def test_submap_window_never_accepts_zero_overlap():
     with pytest.raises(ValueError):
         pop_submap_window(list(range(19)), 19, 0)
+
+
+def test_supported_overlap_reuses_the_previous_last_frame():
+    """The stock add_edge bridge is valid only for this exact identity."""
+    assert SUPPORTED_SUBMAP_OVERLAP == 1
+    target_size = 16 + SUPPORTED_SUBMAP_OVERLAP
+    first, pending = pop_submap_window(
+        list(range(40)), target_size, SUPPORTED_SUBMAP_OVERLAP)
+    second, _pending = pop_submap_window(
+        pending, target_size, SUPPORTED_SUBMAP_OVERLAP)
+
+    assert first[-1] == second[0]
+
+
+def test_unsupported_multi_frame_overlap_is_rejected():
+    with pytest.raises(ValueError, match="add_edge"):
+        validate_supported_overlap(3)

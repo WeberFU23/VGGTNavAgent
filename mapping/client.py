@@ -148,8 +148,11 @@ class MappingClient:
         return points.copy(), colors.copy()
 
     def get_frame_points(self, stride=6):
-        """逐帧世界系稠密点。返回 [{frame_id, pose (4,4), points (N,3)
-        float32（NaN=无效）, rows (N,) int32 原始图像行号}]。"""
+        """返回同一服务端快照中的逐帧世界点、RGB 与位姿。
+
+        ``colors`` 对旧服务端为 ``None``，使客户端可以在滚动部署期间
+        继续建图；新版服务端则保证颜色与 points 逐点对应。
+        """
         resp, payload = self._request(
             {"cmd": "get_frame_points", "stride": stride})
         revision = resp.get("snapshot_revision")
@@ -168,6 +171,14 @@ class MappingClient:
             pts = np.frombuffer(payload[offset:end],
                                 dtype=np.float32).reshape(n, 3)
             offset = end
+            colors = None
+            if meta.get("has_colors"):
+                color_end = offset + n * 3
+                if color_end > len(payload):
+                    raise RuntimeError("mapping frame RGB payload 截断")
+                colors = np.frombuffer(
+                    payload[offset:color_end], dtype=np.uint8).reshape(n, 3)
+                offset = color_end
             rows = np.repeat(
                 np.arange(h, dtype=np.int32) * meta["stride"], w)
             frames.append({
@@ -175,6 +186,7 @@ class MappingClient:
                 "pose": np.asarray(meta["pose"], dtype=np.float32)
                 .reshape(4, 4),
                 "points": pts.copy(),
+                "colors": None if colors is None else colors.copy(),
                 "rows": rows,
             })
         if offset != len(payload):

@@ -353,7 +353,7 @@ def test_freespace_connectivity():
 
 
 def test_frame_points_freespace():
-    """逐帧投票自由空间：底部行锚定地板，房间连通、墙成障碍、门洞可穿。"""
+    """融合点云全局地板：房间连通、墙成障碍、门洞可穿。"""
     rng = np.random.default_rng(3)
     # 地板 10x6 z=0
     xs = np.arange(0, 10.001, 0.15)
@@ -398,12 +398,79 @@ def test_frame_points_freespace():
     print("frame_points freespace OK: rooms free, wall blocked, door open")
 
 
+def test_global_floor_ignores_duplicate_overlap_frames():
+    """Repeated overlap frames must not change the global occupancy result."""
+    floor = np.array([
+        [x, y, 0.0] for x in np.linspace(0, 4, 41)
+        for y in np.linspace(0, 3, 31)], dtype=np.float32)
+    wall = np.array([
+        [4.0, y, z] for y in np.linspace(0, 3, 31)
+        for z in np.linspace(0.2, 1.6, 15)], dtype=np.float32)
+    points = np.concatenate([floor, wall])
+    rows = np.zeros(len(points), dtype=np.int32)
+
+    def frame(fid, x):
+        pose = np.eye(4)
+        pose[:3, 3] = [x, 1.5, 1.5]
+        return {"frame_id": fid, "pose": pose, "points": points,
+                "rows": rows}
+
+    frames = [frame(1, 1.0), frame(2, 2.0), frame(3, 3.0)]
+    duplicate = dict(frames[1])
+    grid = nav.OccupancyGrid.from_frame_points(
+        frames, np.eye(3), unit_per_m=1.0)
+    repeated = nav.OccupancyGrid.from_frame_points(
+        frames + [duplicate], np.eye(3), unit_per_m=1.0)
+    assert grid is not None and repeated is not None
+    assert grid.source_frame_count == 3
+    assert repeated.source_frame_count == 3
+    assert np.array_equal(grid.free, repeated.free)
+    assert np.array_equal(grid.obstacle, repeated.obstacle)
+
+
 def test_binary_dilation_does_not_wrap_at_map_edges():
     mask = np.zeros((5, 5), dtype=bool)
     mask[2, 0] = True
     grown = nav._binary_dilate(mask)
     assert grown[1:4, 0:2].all()
     assert not grown[:, -1].any(), "左边界不能环绕膨胀到右边界"
+
+
+def test_trajectory_is_diagnostic_evidence_not_free_space():
+    free = np.zeros((24, 24), dtype=bool)
+    free[2:6, 2:6] = True
+    obstacle = np.zeros_like(free)
+    obstacle[10:13, 10:13] = True
+    cameras = np.array([
+        [1.0, 11.0, 1.5],
+        [20.0, 11.0, 1.5],
+    ])
+    grid = nav.OccupancyGrid._finalize(
+        free, obstacle, 1.0, np.zeros(2), cameras,
+        floor_z=0.0, unit_per_m=1.0,
+        robot_radius_m=0.0, res_m=1.0,
+        observed=free | obstacle)
+    assert np.array_equal(grid.free, free)
+    assert grid.obstacle[11, 11], "轨迹不能清除真实或膨胀障碍"
+    assert grid.traversed[11, 11], "轨迹应保留在独立 traversed 层"
+    assert not grid.geometry_observed[11, 15], \
+        "traversed 不应伪造几何观测"
+    assert grid.start_seed_cell is None, \
+        "当前位置附近无地面证据时不得用远处 free 伪造连通起点"
+
+
+def test_trajectory_only_grid_contains_no_traversable_cells():
+    cameras = np.array([
+        [0.0, 0.0, 1.5],
+        [1.0, 0.0, 1.5],
+        [2.0, 1.0, 1.5],
+    ])
+    grid = nav.OccupancyGrid.from_trajectory(cameras)
+    assert grid is not None
+    assert not grid.free.any()
+    assert not grid.obstacle.any()
+    assert not grid.geometry_observed.any()
+    assert grid.traversed.any()
 
 
 def test_oracle_scale_uses_both_keyframe_endpoint_positions():
@@ -466,7 +533,10 @@ if __name__ == "__main__":
     test_nearest_traversable()
     test_freespace_connectivity()
     test_frame_points_freespace()
+    test_global_floor_ignores_duplicate_overlap_frames()
     test_binary_dilation_does_not_wrap_at_map_edges()
+    test_trajectory_is_diagnostic_evidence_not_free_space()
+    test_trajectory_only_grid_contains_no_traversable_cells()
     test_oracle_scale_uses_both_keyframe_endpoint_positions()
     test_semantic_coverage_requires_close_or_two_completed_views()
     print("ALL TESTS PASSED")

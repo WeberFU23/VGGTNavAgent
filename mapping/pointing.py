@@ -34,13 +34,17 @@ Return exactly one JSON object:
   "reason": "one short sentence"
 }}"""
 
-POINT_PROMPT = """You are localizing target objects for a robot. Target
-description: {goal_text}
+POINT_PROMPT = """You are localizing target objects for a robot. Target description is: {goal_text}
 
 The image is {width}x{height} pixels. Point at every visible object instance
-matching the FULL description (including color/material attributes). For
-each instance return one pixel point on the object body (not the
-background), and optionally a tight bounding box for cross-checking.
+matching the FULL description. For each instance you should:
+- Return one pixel at the center of the object's visible region, on the
+  object surface, away from edges and occluders. This pixel will be used to
+  sample the object's depth, so it must lie on the object itself, not on the
+  background or a nearby object.
+- Optionally add a tight bounding box for cross-checking.
+- Use absolute pixel coordinates: x is horizontal (0 at left), y is vertical
+  (0 at top).
 If nothing matches, return an empty instances list.
 
 Return exactly one JSON object:
@@ -133,15 +137,20 @@ class PointingGrounder:
 
 
 # ----------------------------------------------------------------------
-# 深度采样（纯 numpy，供单测与 server._resolve_point_patch 复用）
+# 深度采样（纯 numpy，供单测与 server._resolve_point 复用）
 # ----------------------------------------------------------------------
 def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
-                       min_points=5, cam_origin=None):
+                       min_points=5, cam_origin=None, bbox=None,
+                       bbox_margin=0.15):
     """point 像素周围 patch 采样 3D 点。
 
     points_hw3: (H, W, 3) 世界系点（NaN = 无效）；
     conf_mask_hw: (H, W) bool，VGGT confidence 过滤掩码（True=可信）；
     pixel: (x, y) 点云网格坐标；patch: 采样窗口边长。
+
+    bbox 非空时把采样窗口约束在 bbox 内部（四边各内缩 bbox_margin，
+    避开边缘）：point 有像素级误差时 bbox 通常更可靠。point 远离
+    bbox 导致窗口交集为空时，退化为在 bbox 内区中心开小窗采样。
 
     先按 conf 过滤低分点再取中位数。返回 {found, point, num_points,
     depth_std, spread}；depth_std 是 patch 内点到相机原点距离的标准差
@@ -154,8 +163,30 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
         conf = np.ones((h, w), dtype=bool)
     half = max(int(patch), 1) // 2
     x, y = int(round(pixel[0])), int(round(pixel[1]))
-    x0, x1 = max(0, x - half), min(w, x + half + 1)
-    y0, y1 = max(0, y - half), min(h, y + half + 1)
+
+    def _window(cx, cy):
+        return (max(0, cx - half), min(w, cx + half + 1),
+                max(0, cy - half), min(h, cy + half + 1))
+
+    x0, x1, y0, y1 = _window(x, y)
+    if bbox is not None:
+        bx0, by0, bx1, by1 = (float(v) for v in bbox)
+        mx = (bx1 - bx0) * float(bbox_margin)
+        my = (by1 - by0) * float(bbox_margin)
+        ix0, iy0 = bx0 + mx, by0 + my
+        ix1, iy1 = max(bx1 - mx, ix0 + 1), max(by1 - my, iy0 + 1)
+        cx0 = max(x0, int(math.ceil(min(ix0, w))))
+        cy0 = max(y0, int(math.ceil(min(iy0, h))))
+        cx1 = min(x1, int(math.floor(max(ix1, 0))) + 1)
+        cy1 = min(y1, int(math.floor(max(iy1, 0))) + 1)
+        if cx1 > cx0 and cy1 > cy0:
+            x0, x1, y0, y1 = cx0, cx1, cy0, cy1
+        else:
+            # point 不在 bbox 附近：以 bbox 内区中心为准重新开窗
+            bx = int(round((ix0 + ix1) / 2))
+            by = int(round((iy0 + iy1) / 2))
+            x0, x1, y0, y1 = _window(
+                min(max(bx, 0), w - 1), min(max(by, 0), h - 1))
     patch_pts = points[y0:y1, x0:x1, :].reshape(-1, 3)
     patch_ok = conf[y0:y1, x0:x1].reshape(-1) & np.isfinite(patch_pts).all(axis=1)
     valid = patch_pts[patch_ok]

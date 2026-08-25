@@ -57,9 +57,11 @@ def _rasterize_orthographic_rgb(image, points, colors, px, py, floor_z=None,
     flat = py * width + px
     if floor_z is not None and units_per_m > 0:
         height_m = (points[:, 2] - float(floor_z)) / float(units_per_m)
-        # Prefer object/wall evidence over floor samples when they share a
-        # top-down pixel, while preventing high ceiling points from dominating.
-        weights = 1.0 + 2.0 * np.clip(height_m, 0.0, 2.2) / 2.2
+        # Furniture band (~1.0-1.8 m) outweighs the floor; near-ceiling points
+        # taper below floor weight so they cannot dominate a shared pixel.
+        band = np.clip(height_m / 1.0, 0.0, 1.0)
+        taper = np.clip((2.2 - height_m) / 0.4, 0.0, 1.0)
+        weights = (1.0 + 2.0 * band) * (0.3 + 0.7 * taper)
     else:
         weights = np.ones(len(points), dtype=np.float64)
 
@@ -126,8 +128,9 @@ def render_pointcloud_topdown(points, colors, pose=None, instances=None,
     units_per_m = float(unit_per_m or 0.0)
     if floor_z is not None and units_per_m > 0:
         z = points[:, 2]
+        # 上限 2.2 m：室内家具/门框都低于此，天花板点直接排除。
         valid &= (z >= float(floor_z) - 0.20 * units_per_m) & \
-                 (z <= float(floor_z) + 2.70 * units_per_m)
+                 (z <= float(floor_z) + 2.20 * units_per_m)
     points, colors = points[valid], colors[valid]
     if len(points) == 0:
         return None

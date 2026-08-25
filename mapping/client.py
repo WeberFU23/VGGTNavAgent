@@ -225,7 +225,7 @@ class MappingClient:
             {"cmd": "get_frame_image", "frame_id": int(frame_id)})
         return resp, payload
 
-    def ground_object(self, text, top_k=3):
+    def ground_object(self, text, top_k=2):
         """caption 召回和 pointing 定位（不在探索阶段确认类别）。
         返回 [{found, point, point_score, frame_id, ...}]。"""
         resp, _ = self._request({"cmd": "ground_object", "text": text,

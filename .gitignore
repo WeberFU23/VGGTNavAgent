@@ -12,6 +12,7 @@ __pycache__/
 htmlcov/
 .coverage
 .coverage.*
+extracted_images/
 
 # ===== 虚拟环境 =====
 .venv/

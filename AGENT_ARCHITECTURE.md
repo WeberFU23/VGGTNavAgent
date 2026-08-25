@@ -13,14 +13,14 @@
 ```mermaid
 flowchart LR
     RGB["RGB + instruction"] --> MAP["VGGT-SLAM / 3D map"]
-    RGB --> CAP["caption + BGE retrieval"]
-    CAP --> POINT["VLM pointing"]
+    RGB --> CAP["caption (API VLM) + BGE retrieval"]
+    CAP --> POINT["VLM pointing (local Qwen2.5-VL)"]
     MAP --> P3D["pixel to VGGT 3D point"]
     POINT --> P3D
     P3D --> MEM["single InstanceMemory"]
     MEM --> STATE["world-state JSON"]
     MAP --> TOP["RGB point-cloud bird's-eye map"]
-    STATE --> VLM["decision VLM + memory tools"]
+    STATE --> VLM["decision VLM (API) + memory tools"]
     TOP --> VLM
     RGB --> VLM
     VLM --> HIGH["high-level action / START_ADJUST"]
@@ -36,7 +36,9 @@ flowchart LR
 |---|---|---|
 | SLAM 与语义服务 | `mapping/server.py` | VGGT 子图、caption 检索、pointing、像素到 3D、语义与图像诊断记录 |
 | 关键帧策略 | `mapping/keyframes.py` | 组合光流阈值与最大观测间隔，保证弱纹理直行时仍定期刷新关键帧 |
-| 语义模型接口 | `mapping/pointing.py` | 历史候选图像上的 VLM pointing 与 JSON 校验 |
+| caption 语义记忆 | `mapping/caption_store.py` | 异步 caption worker、BGE-M3 向量索引与检索、落盘持久化 |
+| VLM 网关 | `mapping/vllm_client.py` | OpenAI 兼容客户端：优先级队列、同帧缓存、重试；caption 与 pointing 各持一个实例 |
+| 语义模型接口 | `mapping/pointing.py` | 历史候选图像上的 VLM pointing、JSON 校验、bbox 约束的 patch 深度采样 |
 | 唯一实例记忆 | `agents/memory.py` | 3D 坐标、VLM 文本、证据引用、reported 标记 |
 | 决策状态 | `agents/decision_state.py` | 将实例、frontier、任务进度和几何代价组织成 JSON |
 | 决策 harness | `decision/agent_loop.py` | 工具循环、动作 schema、ID 校验与 trace |
@@ -46,15 +48,26 @@ flowchart LR
 | 探索 | `agents/skeleton.py` | 几何/语义统一 frontier、信息增益与骨架拓扑 |
 | 路径排序 | `agents/planner.py` | VLM 不可用时的最近实例/TSP 回退 |
 | 运维诊断 | `scripts/diagnostics/` | 重力、自由空间和点云的只读检查脚本 |
+| 远端工具 | `scripts/remote/` | SSH 助手（`remote_ssh.py`）与远端离线验证脚本（caption/pointing/BGE 检索测试、鸟瞰图重渲）；脚本内使用远端绝对路径，本仓库不引用 |
 
 ## 3. 统一感知与实例生成
 
 探索阶段的语义链路是：
 
-1. 为关键帧生成 caption，并用 BGE 建立文本检索索引；
-2. 根据任务文本召回相关关键帧；
-3. VLM 在召回图像上 pointing 一个或多个像素；
-4. 在 VGGT 点图中采样像素邻域，恢复当前图优化坐标系中的 3D 点；
+1. 为关键帧生成查询无关的 caption（首行列可见物体类别，随后逐实例一句
+   自然语言内在属性描述，跳过 wall/floor/ceiling），并用 BGE-M3 建立文本
+   检索索引。caption 模型默认走独立 VLM API（`NAV_CAPTION_API_MODEL`，
+   URL/Key 缺省回落决策 VLM 的 `NAV_VLM_API_*`）；未配置时回落本地 vLLM
+   （`NAV_CAPTION_MODEL_PATH`）。pointing 始终走本地 vLLM
+   （`NAV_POINTING_MODEL_PATH`，当前为 Qwen2.5-VL-7B-Instruct-AWQ）；
+2. 根据任务文本召回相关关键帧，默认 top-K=2（`NAV_RETRIEVE_TOP_K` /
+   `NAV_GROUND_TOP_K`）；
+3. VLM 在召回图像上 pointing 一个或多个像素；point 被要求落在物体可见
+   区域中心（该像素将用于采深度），bbox 仅作交叉验证——point 落在 bbox
+   外时置信度减半；
+4. 在 VGGT 点图中采样像素邻域：有 bbox 时采样窗被约束在 bbox 内区
+   （四边内缩 15%），point 严重偏离时退化为 bbox 内区中心采样；patch 内
+   先按 VGGT confidence 过滤再取中位数，恢复当前图优化坐标系中的 3D 点；
 5. 每个有效 3D 结果立即写入 `InstanceMemory`；
 6. 新实例入库后，VLM 结合 pointing overlay、bbox 局部裁剪图、任务文本
    与关键帧 caption 生成实例级初始描述（`chat_text` 自由文本调用）；
@@ -73,7 +86,8 @@ flowchart LR
 探索阶段不先用 VQA 判定类别，也不以 pointing 分数、目标尺寸或深度方差
 阻止实例入库。这些值只作为 evidence 保存。到达候选点后不再强制调用
 `ground_frame` 或 pointing/verify；决策 VLM 直接接收当前 RGB、候选历史证据和
-world-state，决定报告、离开、扫描或进入微调。
+world-state，决定报告、离开、扫描或进入微调。（`ground_frame` /
+`verify_frame` 链路仅保留为单帧诊断接口，不在生产路径上。）
 
 ### 3.1 几何覆盖、语义检查与统一 frontier
 
@@ -137,17 +151,18 @@ attach_node        可选骨架节点
   实例折叠为 `reported_instance_ids`，全文与证据经 `search_instances` /
   `inspect_instance` 按需查询；A* 路径代价只对入选摘要的实例预计算；
 - RGB 点云鸟瞰图：先将 VGGT-SLAM 点云重力对齐，再严格沿 Z 轴正投影到 XY
-  平面；默认以 `NAV_DECISION_MAP_POINT_STRIDE=3` 提取点，并将同一输出像素内
-  的 RGB 按高度加权融合（高度只影响颜色，不影响投影位置），最多保留
-  `NAV_DECISION_MAP_MAX_POINTS=600000` 个点。底图不再用颜色编码
-  free、obstacle、geometry/semantic coverage 等区域，也不显示历史轨迹或原始
-  frontier 边界。蓝色箭头是 Agent 位置和朝向，紫色菱形 `fN` 是经过可达性与
-  冷却过滤后可选择的 frontier，绿色圆圈 `tN` 是实例目标，橙色星形是 active
-  target。图中 ID 与 world-state 完全一致；occupancy 和语义覆盖仍由确定性模块
-  用于 A*、frontier 生成和结束判断，只是不再作为 VLM 图像底色。点、颜色、位姿
-  和 frontier 来自 mapping server 同一次锁内 frame snapshot，并按
-  frame/submap/loop revision 刷新；即将显示的实例按 candidate_id 批量重投影，
-  避免回环后叠加到不同坐标系；
+  平面；默认以 `NAV_DECISION_MAP_POINT_STRIDE=3` 提取点，只保留高度
+  2.2m 以下的点以去除天花板遮挡，同一输出像素内的 RGB 按高度带通权重
+  融合（地板层 1.0、家具层最高 3.0、接近 2.2m 上限渐隐；高度只影响颜色，
+  不影响投影位置），最多保留 `NAV_DECISION_MAP_MAX_POINTS=2000000` 个点。
+  底图不再用颜色编码 free、obstacle、geometry/semantic coverage 等区域，
+  也不显示历史轨迹或原始 frontier 边界。蓝色箭头是 Agent 位置和朝向，
+  紫色菱形 `fN` 是经过可达性与冷却过滤后可选择的 frontier，绿色圆圈 `tN`
+  是实例目标，橙色星形是 active target。图中 ID 与 world-state 完全一致；
+  occupancy 和语义覆盖仍由确定性模块用于 A*、frontier 生成和结束判断，
+  只是不再作为 VLM 图像底色。点、颜色、位姿和 frontier 来自 mapping
+  server 同一次锁内 frame snapshot，并按 frame/submap/loop revision 刷新；
+  即将显示的实例按 candidate_id 批量重投影，避免回环后叠加到不同坐标系；
 - 事件图像：普通决策与微调时的当前 RGB，到达时的候选历史证据，
   或一圈扫描的多视角图像。
 
@@ -247,16 +262,18 @@ VLM 必须输出一个 JSON 对象：
 当前 run 目录，避免在启动工作目录中散落文件。
 
 每个评测 episode 可产生以下记录，所有关联通过 `episode`、`step` 和
-`frame_id` 完成，不保存 API key 或图像 base64：
+`frame_id` 完成，不保存 API key；图像 base64 默认不落盘，仅在显式打开
+trace 开关时内联：
 
 | 产物 | 内容 |
 |---|---|
 | `action_trace.jsonl` | 每步实际 Habitat 动作、agent mode、当前目标、碰撞状态、mapping frame 及最近决策 |
 | `decision_trace.jsonl` | 事件、校验后高层动作、理由、工具调用与校验结果 |
-| `vlm_calls.jsonl` | 决策/实例描述 VLM 的 prompt、图像标签与哈希、原始 API 响应及解析结果 |
+| `vlm_calls.jsonl` | 决策/实例描述 VLM 的 prompt、图像标签与哈希、原始 API 响应及解析结果；`NAV_VLM_TRACE_INLINE_IMAGES=1` 时内联图像 base64 |
+| `vlm_caption.jsonl` / `vlm_pointing.jsonl` | mapping 端 caption/pointing VLM 按角色拆分的完整调用记录（prompt + 输出）；`NAV_VLLM_TRACE_IMAGES=1` 时内联图像 base64 |
 | `<episode>_frames/` | mapping server 收到的全部 RGB，文件名中包含 `frame_id` |
 | `<episode>_frame_captions.jsonl` | 全部图像的 `frame_saved` 记录和关键帧的 `caption_result`；非关键帧不做 caption |
-| `<episode>_queries.jsonl` | 本地 caption/pointing VLM 原始输出、caption 检索、pointing 和 3D 候选诊断 |
+| `<episode>_queries.jsonl` | caption 检索、ground_object 与 3D 候选诊断摘要（VLM 原始输出已拆到上面的角色文件） |
 | `vlm_inputs/` | 实际进入决策 API payload 的 RGB、鸟瞰图和候选证据；与 `vlm_calls.jsonl` 中 SHA-1 一致 |
 
 `scripts/diagnostics/dump_mapping_snapshot.py` 可将一次 VGGT frame snapshot 保存为
@@ -276,6 +293,9 @@ frontier utility 由加权几何/语义信息增益、路径代价和执行失�
 
 - 实例初始文本已在入库时由 VLM 生成实例级描述（overlay + bbox 局部图 +
   任务上下文），其质量与耗时需要在真实模型上验证；
+- pointing 精度受本地 7B VLM（Qwen2.5-VL-AWQ）能力限制，小目标/远目标的
+  像素误差目前由 bbox 约束采样兜底；如需更高精度可换专门 pointing 模型
+  （如 Molmo），接口上只需替换 `NAV_POINTING_MODEL_PATH` 与 prompt；
 - 跨视角实例关联完全交给决策 VLM；world-state 实例表已做有界摘要，
   长 episode 下若 top-K 选择仍分散注意力，可再引入空间查询或自动候选
   对提示，但不应重新引入硬语义状态；

@@ -181,5 +181,33 @@ def test_sample_depth_std_uses_cam_origin():
     assert out["depth_std"] is not None and out["depth_std"] > 0
 
 
+def test_sample_bbox_constrains_window():
+    # point 附近全是 NaN，但 bbox 内区有有效点：窗口被 bbox 裁掉后
+    # 交集为空 -> 退到 bbox 内区中心采样成功。
+    pts = _grid()
+    pts[:, :] = np.nan
+    xs, ys = np.mgrid[2:8, 2:8]
+    pts[2:8, 2:8] = np.stack(
+        [xs.astype(float), ys.astype(float), np.full((6, 6), 2.0)],
+        axis=-1)
+    conf = np.ones(pts.shape[:2], dtype=bool)
+    out = sample_point_depth(pts, conf, pixel=(15, 15), patch=11,
+                             min_points=5, bbox=[0, 0, 10, 10])
+    assert out["found"] is True
+    px, py, _ = out["point"]
+    assert 0 <= px <= 10 and 0 <= py <= 10
+
+
+def test_sample_bbox_intersection_clips_patch():
+    # point 在 bbox 右边缘：patch 应被裁到 bbox 内（内缩 15%），
+    # 采样点 x 不超过 bbox 右界。
+    pts = _grid()
+    conf = np.ones(pts.shape[:2], dtype=bool)
+    out = sample_point_depth(pts, conf, pixel=(14, 10), patch=11,
+                             bbox=[0, 0, 15, 20])
+    assert out["found"] is True
+    assert out["point"][0] <= 15 * (1 - 0.15) + 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

@@ -7,8 +7,9 @@
    pointing 在途）时让路。
 2. CaptionStore：{frame_id, 位姿, caption, embedding(BGE-M3)} 记忆库，
    落盘持久化，支持按 episode 清空。检索使用 BGE-M3 文本向量和余弦
-   相似度 top-K，以支持较长 caption 和完整任务描述。具体本地 VLM 由
-   NAV_CAPTION_MODEL_PATH 配置。
+   相似度 top-K，以支持较长 caption 和完整任务描述。caption 模型由
+   NAV_CAPTION_API_MODEL（独立 API）或回落时 NAV_CAPTION_MODEL_PATH
+   （本地 vLLM）配置，见 server._init_semantic_memory。
 
 CaptionStore 只用 numpy，可脱离 GPU/网络单测；Embedder/Gateway 均可
 mock 替换（权重缺失时 BGEM3Embedder 构造抛清晰错误，由上层降级）。
@@ -24,7 +25,24 @@ import numpy as np
 
 from mapping.vllm_client import Priority, VLLMError
 
-CAPTION_PROMPT = """Output a list of all visible objects with their attributes in this indoor RGB image. This description is for later text-based retrieval and is query-independent, so prefer completeness over brevity."""
+CAPTION_PROMPT = """List all visible objects in this indoor RGB image for later text-based retrieval.
+Skip room surfaces entirely (walls, floor, ceiling).
+First line: "Objects:" followed by the object category names only, comma-separated
+(e.g. "chair, table, clock"); list each category once even if several are visible.
+Then write one natural-language sentence per object instance, numbered per
+category (e.g. "chair 1: ...", "chair 2: ...").
+
+Each sentence must describe ONLY the object's intrinsic appearance and
+distinguishing details or contents it visibly holds.
+Do NOT mention:
+- where the object appears in the image (left/right/center/foreground/...),
+- where it is relative to other objects or the room (next to/above/near/mounted
+  on/in front of/beside/...),
+- or name any other object when describing this one.
+To tell same-category instances apart, use intrinsic differences only;
+if two instances are truly indistinguishable, still write one sentence each.
+At most 20 sentences. Query-independent; prefer completeness over brevity. No
+extra commentary."""
 
 
 def _safe_episode_component(value):

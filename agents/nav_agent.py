@@ -60,7 +60,7 @@ class NavAgent(MappingAgent):
             "NAV_FINISH_FRONTIER_PATIENCE", "3"))
         self.finish_map_stable_steps = int(os.environ.get(
             "NAV_FINISH_MAP_STABLE_STEPS", "100"))
-        self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "5"))
+        self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "2"))
         self.adjust_max_steps = max(1, int(os.environ.get(
             "NAV_ADJUST_MAX_STEPS", "10")))
         self.adjust_map_radius_m = max(1.0, float(os.environ.get(
@@ -146,7 +146,7 @@ class NavAgent(MappingAgent):
         # is the only base layer sent to the decision VLM.
         self._frontier_pointcloud = None
         self.decision_map_max_points = max(10000, int(os.environ.get(
-            "NAV_DECISION_MAP_MAX_POINTS", "600000")))
+            "NAV_DECISION_MAP_MAX_POINTS", "2000000")))
         self.decision_map_point_stride = max(1, int(os.environ.get(
             "NAV_DECISION_MAP_POINT_STRIDE", "3")))
         self._frontier_revision = 0

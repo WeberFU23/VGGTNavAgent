@@ -1,7 +1,8 @@
 """vLLM OpenAI 兼容服务客户端（server 端，vggtslam 环境）。
 
-caption 和 pointing 统一走本地 vLLM 服务（OpenAI chat completions API），
-本模块提供：
+pointing 走本地 vLLM 服务；caption 在配置 NAV_CAPTION_API_MODEL 时改走
+独立的 VLM API（server.py 里建第二个 gateway 实例），否则同样回落本地
+vLLM。本模块提供：
 
 1. 优先级队列：高优先级请求 > pointing > caption。所有请求经单 worker
    线程串行发出（vLLM 服务端自身做连续批处理，这里只保证提交顺序），
@@ -19,6 +20,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import queue
 import re
 import threading
@@ -88,6 +90,11 @@ class VLLMGateway:
         self._cache_lock = threading.Lock()
         self._closed = False
         self._worker = None
+        # NAV_VLLM_TRACE_IMAGES=1 时 trace 记录内联 base64 图像（完整 I/O
+        # 落盘，用于 prompt 审计）；默认关闭避免诊断日志膨胀。
+        self.trace_images = os.environ.get(
+            "NAV_VLLM_TRACE_IMAGES", "0").strip().lower() in {
+            "1", "true", "yes", "on"}
         if start_worker:
             self._worker = threading.Thread(
                 target=self._consume, name="vllm-gateway", daemon=True)
@@ -180,12 +187,29 @@ class VLLMGateway:
                             self._cache.pop(next(iter(self._cache)))
                         self._cache[key] = value
                 pending.value = value
-                self._trace({**meta, "raw_output": value, "ok": True})
+                self._trace({**meta, "raw_output": value, "ok": True,
+                             **self._trace_image_entries(payload)})
             except Exception as exc:  # noqa: BLE001 - 透传给等待方
                 pending.error = exc
-                self._trace({**meta, "error": str(exc), "ok": False})
+                self._trace({**meta, "error": str(exc), "ok": False,
+                             **self._trace_image_entries(payload)})
             finally:
                 pending.event.set()
+
+    def _trace_image_entries(self, payload):
+        """trace_images 开启时，从 payload 提取内联 base64 图像。"""
+        if not self.trace_images or not isinstance(payload, dict):
+            return {}
+        images = []
+        for message in payload.get("messages", []):
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = str(part.get("image_url", {}).get("url", ""))
+                    images.append({"index": len(images), "data_url": url})
+        return {"images": images} if images else {}
 
     def _trace(self, record):
         if self._trace_fn is None:

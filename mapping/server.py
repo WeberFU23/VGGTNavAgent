@@ -159,6 +159,7 @@ class MappingServer:
         self.diag_lock = threading.Lock()
         self._current_episode = None
         self._diag_fp = None
+        self._vlm_trace_fps = {}
         self._frame_manifest_fp = None
         self._diag_frame_dir = None
         self._diag_write_warned = False
@@ -166,7 +167,7 @@ class MappingServer:
         os.makedirs(self.diag_dir, exist_ok=True)
 
         # 唯一语义链路：查询无关 caption + BGE-M3 检索 + VLM pointing。
-        self.retrieve_top_k = int(os.environ.get("NAV_RETRIEVE_TOP_K", "10"))
+        self.retrieve_top_k = int(os.environ.get("NAV_RETRIEVE_TOP_K", "2"))
         self.point_patch = int(os.environ.get("NAV_POINT_PATCH", "11"))
         self.vllm = None
         self.embedder = None
@@ -206,6 +207,23 @@ class MappingServer:
             api_key=os.environ.get("NAV_VLLM_API_KEY", "EMPTY"),
             trace_fn=lambda record: self._diag_write(
                 {"cmd": "vlm_call", **record}))
+
+        # caption 可走独立的高级 VLM API（pointing 仍留本地 Qwen2.5-VL）。
+        # NAV_CAPTION_API_MODEL 必填；URL/Key 缺省回落到决策 VLM 的配置。
+        caption_api_model = os.environ.get("NAV_CAPTION_API_MODEL", "").strip()
+        caption_api_url = (os.environ.get("NAV_CAPTION_API_URL")
+                           or os.environ.get("NAV_VLM_API_URL", "")).strip()
+        if caption_api_model and caption_api_url:
+            self.vllm_caption = VLLMGateway(
+                url=caption_api_url,
+                api_key=(os.environ.get("NAV_CAPTION_API_KEY")
+                         or os.environ.get("NAV_VLM_API_KEY", "")),
+                trace_fn=lambda record: self._diag_write(
+                    {"cmd": "vlm_call", **record}))
+            print(f"[server] caption 走独立 API: {caption_api_model} @ "
+                  f"{caption_api_url}", flush=True)
+        else:
+            self.vllm_caption = None
         store_path = os.environ.get(
             "NAV_CAPTION_STORE_PATH",
             os.path.join(self.args.diag_dir, "caption_store"))
@@ -218,10 +236,15 @@ class MappingServer:
         except RuntimeError as exc:
             print(f"[server] WARNING: {exc}；caption 检索不可用", flush=True)
             self.embedder = None
-        caption_model = os.environ.get("NAV_CAPTION_MODEL_PATH", "")
+        if self.vllm_caption is not None:
+            caption_gateway = self.vllm_caption
+            caption_model = caption_api_model
+        else:
+            caption_gateway = self.vllm
+            caption_model = os.environ.get("NAV_CAPTION_MODEL_PATH", "")
         if self.embedder is not None and caption_model:
             self.caption_worker = CaptionWorker(
-                self.vllm, self.embedder, self.caption_store,
+                caption_gateway, self.embedder, self.caption_store,
                 model=caption_model,
                 busy_fn=lambda: self.gpu_lock.locked()
                 or self.solver_lock.locked(),
@@ -668,16 +691,40 @@ class MappingServer:
         record.setdefault("episode", self._current_episode)
         record.setdefault("t", time.strftime("%H:%M:%S"))
         with self.diag_lock:
+            # VLM 调用（caption/pointing）按角色拆到独立文件，保留完整
+            # prompt + 内联图像 + 输出；主 queries 文件只写无图像摘要。
+            if record.get("cmd") == "vlm_call":
+                self._vlm_trace_write(record)
             if self._diag_fp is None:
                 return
             try:
-                self._diag_fp.write(json.dumps(record) + "\n")
+                slim = {k: v for k, v in record.items() if k != "images"}
+                self._diag_fp.write(json.dumps(slim) + "\n")
                 self._diag_fp.flush()
             except OSError as exc:
                 if not self._diag_write_warned:
                     print(f"[server] WARNING: 诊断查询日志写入失败: {exc}",
                           flush=True)
                     self._diag_write_warned = True
+
+    def _vlm_trace_write(self, record):
+        """把 vlm_call 记录按角色写入 vlm_{caption,pointing,other}.jsonl。"""
+        kind = str(record.get("kind") or "other")
+        role = {"caption": "caption", "point": "pointing",
+                "verify": "pointing"}.get(kind, "other")
+        fp = self._vlm_trace_fps.get(role)
+        if fp is None:
+            path = os.path.join(self.diag_dir, f"vlm_{role}.jsonl")
+            fp = open(path, "a", encoding="utf-8")
+            self._vlm_trace_fps[role] = fp
+        try:
+            fp.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            fp.flush()
+        except OSError as exc:
+            if not self._diag_write_warned:
+                print(f"[server] WARNING: VLM trace 写入失败: {exc}",
+                      flush=True)
+                self._diag_write_warned = True
 
     def _frame_manifest_write(self, record):
         """Append frame/caption events joined by frame_id."""
@@ -843,7 +890,7 @@ class MappingServer:
         cam_origin = (hom @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
         sampled = sample_point_depth(
             pts_world, conf, pixel, patch=self.point_patch,
-            cam_origin=cam_origin)
+            cam_origin=cam_origin, bbox=point_info.get("bbox"))
         if not sampled["found"]:
             return {"found": False, "pixel": [float(pixel[0]), float(pixel[1])],
                     "point_score": float(point_info["confidence"]),
@@ -1058,7 +1105,7 @@ class MappingServer:
             return {"ok": True, **resp}, image
         if cmd == "ground_object":
             return {"ok": True, **self.ground_object(
-                header["text"], int(header.get("top_k", 3)))}, b""
+                header["text"], int(header.get("top_k", 2)))}, b""
         if cmd == "resolve_candidate":
             return {"ok": True, **self.resolve_candidate(
                 header["candidate_id"])}, b""

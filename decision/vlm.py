@@ -149,8 +149,13 @@ class VLMDecisionClient:
                 self._trace_warned = True
 
     def _snapshot_images(self, kind, images, sequence):
-        """Build image metadata and optionally save byte-identical snapshots."""
+        """Build image metadata and optionally save byte-identical snapshots.
+
+        NAV_VLM_TRACE_INLINE_IMAGES=1 时把图像 base64 内联进 trace 记录，
+        使单个 JSONL 文件即可完整复盘 VLM 输入（不需要配套图像目录）。
+        """
         image_meta = []
+        inline = _env_bool("NAV_VLM_TRACE_INLINE_IMAGES", False)
         context = dict(self._trace_context)
         episode = self._safe_name(context.get("episode", "episode"))
         step = self._safe_name(context.get("step", "unknown"))
@@ -163,6 +168,8 @@ class VLMDecisionClient:
                 "label": label, "mime_type": mime, "bytes": len(data),
                 "sha1": hashlib.sha1(data).hexdigest() if data else None,
             }
+            if inline and data:
+                meta["data_b64"] = base64.b64encode(data).decode("ascii")
             if self.image_dir and data:
                 extension = ".png" if mime == "image/png" else ".jpg"
                 filename = (

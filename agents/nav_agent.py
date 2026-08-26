@@ -1052,12 +1052,9 @@ class NavAgent(MappingAgent):
                 "yaw_deg": round(math.degrees(float(pose[2])), 1),
             } if pose is not None else None),
             "active_target": active_target,
-            "map_revision": int(self._frontier_revision),
-            "mapping_snapshot_revision": self._frontier_server_revision,
             "snapshot_age_steps": max(
                 0, int(observation.step_count) - int(self._last_frontier_step)),
         }
-        state["frontier_status"] = dict(self._frontier_stats)
         map_png = None
         if grid is not None:
             try:

@@ -29,11 +29,7 @@ def _state(mode="all", found=1, expected=None, instances=None, frontiers=None):
         "instances": instances if instances is not None else [
             {"id": 1, "text": "basket near a shelf", "reported": False}],
         "frontiers": frontiers if frontiers is not None else [
-            {"id": "f0", "dist_m": 3.0, "size": 12}],
-        "recent_events": [],
-        "termination": {"unexplored_ratio": 0.05,
-                        "unreported_instance_count": 1,
-                        "frontier_count": 1},
+            {"id": "f0", "path_cost_m": 3.0}],
     }
 
 
@@ -520,15 +516,12 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
     row = state["instances"][0]
     assert row["id"] == node.iid
     assert row["text"] == "possible woven basket"
-    assert row["evidence_count"] == 1
     assert "belief_anchors" not in state
-    assert state["termination"]["unreported_instance_count"] == 1
     assert state["instances_total"] == 1
     assert state["instances_omitted_ids"] == []
     assert state["reported_instance_ids"] == []
-    assert state["frontiers"][0]["reason"] == "semantic"
-    assert state["frontiers"][0]["semantic_gain"] == 9
-    assert state["map_coverage"]["semantic_enabled"] is False
+    assert set(state["frontiers"][0]) == {"id", "path_cost_m"}
+    assert "dist_m" not in row
 
 
 def test_world_state_uses_explicit_map_snapshot_pose():
@@ -540,8 +533,8 @@ def test_world_state_uses_explicit_map_snapshot_pose():
     obs = SimpleNamespace(step_count=50, max_steps=500,
                           goal_text="Find all baskets")
     state = build_world_state(agent, obs, start_xy=(0.0, 0.0))
-    assert state["instances"][0]["dist_m"] == 5.0
-    assert state["termination"]["frontier_filters"]["raw_clusters"] == 3
+    assert state["instances"][0]["id"] == 1
+    assert "dist_m" not in state["instances"][0]
 
 
 def _build_state(agent, step=50):
@@ -565,9 +558,9 @@ def test_world_state_summarizes_instances_beyond_k():
     # 摘要按距离排序，最近的一定入选；reported 不在表中
     ids = [row["id"] for row in state["instances"]]
     assert 1 in ids and reported.iid not in ids
-    assert all(not row["reported"] for row in state["instances"])
-    dists = [row["dist_m"] for row in state["instances"]]
-    assert dists == sorted(dists)
+    assert all("reported" not in row for row in state["instances"])
+    ids_in_order = [row["id"] for row in state["instances"]]
+    assert ids_in_order == sorted(ids_in_order)  # 距离升序=id 升序
 
 
 def test_world_state_summary_prefers_nearest_newest_relevant():

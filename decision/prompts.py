@@ -16,8 +16,8 @@ purple diamonds fN = selectable frontiers, green circles tN = target
 instances, orange ACTIVE star = the active navigation target; marker ids
 match the state JSON. The image shows reconstructed 3D colors only — no
 free/obstacle coloring, no trajectory; blank pixels mean "no rendered 3D
-point", not known free space. Judge reachability from frontier_status and
-precomputed path costs, never from image color.
+point", not known free space. Judge reachability from the precomputed
+path costs, never from image color.
 
 Each instance is created from a VLM-pointed image pixel and its VGGT 3D
 point. Its text is your editable working memory, not a fixed class label.
@@ -32,8 +32,6 @@ Actions (target_id = an id from the state tables, or null):
   matches the task.
 - GOTO_FRONTIER id: follow the precomputed path to an exploration frontier,
   feed new frames into SLAM, then refresh instances and frontiers.
-  reason=geometry seeks missing 3D coverage, reason=semantic seeks better
-  captioned views of reachable space, reason=both improves both.
 - REPORT_FOUND: arrival only. Judge the current observation together with
   the candidate evidence and directly authorize TARGET_FOUND. No automatic
   current-frame pointing, verify, or visual servo follows.

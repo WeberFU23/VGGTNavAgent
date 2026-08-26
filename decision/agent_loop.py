@@ -286,7 +286,6 @@ class DecisionLoop:
                 "instances": len(world_state.get("instances", [])),
                 "frontiers": len(world_state.get("frontiers", [])),
                 "task": world_state.get("task"),
-                "termination": world_state.get("termination"),
             },
             "output": output,
             "validation": validation,

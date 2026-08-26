@@ -144,9 +144,11 @@ attach_node        可选骨架节点
 
 每次事件决策包含三类输入：
 
-- world-state JSON：公开任务、进度、frontier 信息、近期事件、终止统计，
-  以及实例表的有界摘要——未报告实例按"最近邻 + 最新 + 任务相关"并集取
-  top-K（`NAV_STATE_MAX_INSTANCES`，默认 30），文本截断 120 字符；其余
+- world-state JSON：任务账本（goal/mode/found/expected）、step/max_steps/
+  steps_remaining、frontier 表（id + 预计算 path_cost_m）、导航状态
+  （当前位姿、active target），以及实例表的有界摘要——未报告实例按
+  "最近邻 + 最新 + 任务相关"并集取 top-K（`NAV_STATE_MAX_INSTANCES`，
+  默认 30），文本截断 120 字符，每条只有 id/text/path_cost_m；其余
   未报告实例折叠为 `instances_omitted_ids`（仍是合法导航目标），已报告
   实例折叠为 `reported_instance_ids`，全文与证据经 `search_instances` /
   `inspect_instance` 按需查询；A* 路径代价只对入选摘要的实例预计算；

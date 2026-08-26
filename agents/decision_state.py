@@ -74,68 +74,18 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         instances.append({
             "id": nd.iid,
             "text": _truncate(nd.text),
-            "reported": False,
-            "evidence_count": len(nd.evidence),
-            "dist_m": dist_m[nd.iid],
             "path_cost_m": _path_cost_m(grid, start, nd.point, scale),
         })
     omitted_ids = [nd.iid for nd in unreported if nd.iid not in selected_ids]
 
-    # 对外只有一套 frontier；reason/gain 解释它主要补几何还是语义信息。
+    # 对外只有一套 frontier；路径代价预计算成米制，其余排序细节不暴露。
     frontier_rows = []
     for i, c in enumerate(frontiers or []):
-        dist_m = None
-        if start is not None:
-            dist_m = math.hypot(c["world"][0] - start[0],
-                                c["world"][1] - start[1]) * scale
         frontier_rows.append({
             "id": f"f{i}",
-            "dist_m": round(dist_m, 2) if dist_m is not None else None,
-            "size": int(c.get("size", 0)),
-            "reason": c.get("reason", "geometry"),
-            "geometry_gain": int(c.get("geometry_gain", 0)),
-            "semantic_gain": int(c.get("semantic_gain", 0)),
-            "information_gain": int(c.get("information_gain", 0)),
             "path_cost_m": (round(float(c["path_cost_m"]), 2)
                             if c.get("path_cost_m") is not None else None),
-            "failure_count": int(c.get("failure_count", 0)),
-            "utility": (round(float(c["utility"]), 3)
-                        if c.get("utility") is not None else None),
         })
-
-    # 近期事件：最近 10 条原文 + 更早压缩统计
-    events = list(getattr(agent, "_events", []))
-    recent = events[-10:]
-
-    # 终止账本
-    unexplored_ratio = None
-    coverage = None
-    if grid is not None:
-        geometry = np.asarray(getattr(
-            grid, "geometry_observed",
-            getattr(grid, "observed",
-                    np.asarray(grid.free) | np.asarray(grid.obstacle))),
-            dtype=bool)
-        free = np.asarray(grid.free, dtype=bool)
-        semantic_enabled = bool(getattr(
-            grid, "semantic_coverage_enabled", False))
-        semantic = np.asarray(getattr(
-            grid, "semantic_inspected", geometry), dtype=bool)
-        geometry_missing = ~geometry
-        semantic_missing = free & ~semantic if semantic_enabled \
-            else np.zeros_like(free)
-        incomplete = geometry_missing | semantic_missing
-        unexplored_ratio = float(incomplete.sum()) / float(incomplete.size)
-        free_count = max(int(free.sum()), 1)
-        coverage = {
-            "semantic_enabled": semantic_enabled,
-            "geometry_unobserved_ratio": round(
-                float(geometry_missing.sum()) / float(geometry.size), 4),
-            "semantic_uninspected_free_ratio": (
-                round(float(semantic_missing.sum()) / free_count, 4)
-                if semantic_enabled else None),
-            "incomplete_ratio": round(unexplored_ratio, 4),
-        }
 
     return {
         "task": {
@@ -147,25 +97,13 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         },
         "step": int(observation.step_count),
         "max_steps": int(observation.max_steps),
+        "steps_remaining": max(
+            0, int(observation.max_steps) - int(observation.step_count)),
         "instances": instances,
         "instances_total": len(nodes),
         "instances_omitted_ids": omitted_ids,
         "reported_instance_ids": reported_ids,
         "frontiers": frontier_rows,
-        "map_coverage": coverage,
-        "recent_events": recent,
-        "older_events_total": max(0, len(events) - len(recent)),
-        "termination": {
-            "unexplored_ratio": (round(unexplored_ratio, 4)
-                                 if unexplored_ratio is not None else None),
-            "frontier_count": len(frontiers or []),
-            "reachable_frontier_count": getattr(
-                agent, "_last_reachable_frontier_count", len(frontiers or [])),
-            "frontier_filters": dict(getattr(
-                agent, "_frontier_stats", {}) or {}),
-            "unreported_instance_count": len(agent.memory.available()),
-            "recent_queries_without_new_candidate": agent._no_hit_queries,
-        },
     }
 
 

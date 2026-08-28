@@ -200,6 +200,13 @@ class MappingClient:
         return bool(resp.get("enabled")), [
             int(fid) for fid in resp.get("frame_ids", [])]
 
+    def get_captions(self, frame_ids):
+        """按 frame_id 批量取回 caption（新关键帧编号通知用）。
+        返回 {"captions": [{frame_id, caption}]}；未入库帧被服务端跳过。"""
+        resp, _ = self._request({"cmd": "get_captions",
+                                 "frame_ids": [int(f) for f in frame_ids]})
+        return resp
+
     def get_intrinsics(self):
         """返回 VGGT 预测的各子图首帧内参列表（预处理图像坐标系）。"""
         resp, _ = self._request({"cmd": "get_intrinsics"})
@@ -219,7 +226,7 @@ class MappingClient:
         return resp.get("results", [])
 
     def get_frame_image(self, frame_id):
-        """返回指定关键帧的 JPEG（决策层 look_instance 工具）。
+        """返回指定关键帧的 JPEG（决策层 view_frame/view_instance 工具）。
         返回 (meta, payload)；失败时 meta["found"]=False。"""
         resp, payload = self._request(
             {"cmd": "get_frame_image", "frame_id": int(frame_id)})
@@ -231,6 +238,29 @@ class MappingClient:
         resp, _ = self._request({"cmd": "ground_object", "text": text,
                                  "top_k": top_k})
         return resp.get("results", [])
+
+
+    def point_frame(self, frame_id, text):
+        """对指定关键帧直接 pointing + 3D 实例化（跳过 caption 检索）。
+        返回 {results: [{found, point, point_score, candidate_id, ...}]}。"""
+        resp, _ = self._request({"cmd": "point_frame",
+                                 "frame_id": int(frame_id), "text": text})
+        return resp
+
+    def point_pixels(self, frame_id, text):
+        """仅指向：返回 {points: [{pixel: [x, y], confidence, bbox}]}。"""
+        resp, _ = self._request({"cmd": "point_pixels",
+                                 "frame_id": int(frame_id), "text": text})
+        return resp
+
+    def instantiate_pixels(self, frame_id, pixels, normalized=True):
+        """按像素实例化；pixels 为 0-1000 归一化坐标（normalized=True）。
+        返回 {results: [{found, point, candidate_id, ...}]}。"""
+        resp, _ = self._request({
+            "cmd": "instantiate_pixels", "frame_id": int(frame_id),
+            "pixels": [[float(p[0]), float(p[1])] for p in (pixels or [])],
+            "normalized": bool(normalized)})
+        return resp
 
     def resolve_candidate(self, candidate_id):
         """在最新图优化坐标系中重新计算候选的 3D 点。"""

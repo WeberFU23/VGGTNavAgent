@@ -6,12 +6,18 @@ bbox 只作交叉验证：point 落在 bbox 外则降置信；一次调用允许
 中位数，得到 3D instance。到达后的判断由决策 VLM 直接完成；
 verify_frame 仅保留给 ground_frame 诊断接口。
 
-模型由 NAV_POINTING_MODEL_PATH 配置并经 VLLMGateway 调用。输出走 JSON
-schema 校验，解析失败重试 1 次。本模块不 import torch/cv2，
+后端由 NAV_POINTING_BACKEND 选择：
+- qwen（默认）：JSON 输出绝对像素坐标，模型路径 NAV_POINTING_MODEL_PATH。
+- molmo：<point>/<points> XML 标签输出 0-100 归一化坐标，模型路径同为
+  NAV_POINTING_MODEL_PATH；Molmo 不输出 bbox/confidence，bbox 交叉验证
+  自动跳过，confidence 固定 1.0。
+输出走校验，解析失败重试 1 次。本模块不 import torch/cv2，
 sample_point_depth 为纯 numpy 函数，可脱离 GPU 单测。
 """
 
 import math
+import os
+import re
 
 import numpy as np
 
@@ -58,17 +64,46 @@ Return exactly one JSON object:
 # point 落在 bbox 外时置信度乘的惩罚系数（bbox 仅交叉验证，point 优先）
 _BBOX_MISMATCH_FACTOR = 0.5
 
+# Molmo 的 pointing 输出为 <point x=".." y=".." alt=".."> 或
+# <points x1=".." y1=".." x2=".." .../>，坐标是 0-100 归一化百分比。
+MOLMO_POINT_PROMPT = (
+    "Point to every visible object matching this description: {goal_text}")
+
+_MOLMO_TAG_RE = re.compile(r"<points?\b([^>]*)/?>", re.IGNORECASE)
+
+
+def _parse_molmo_points(text, w, h):
+    """把 Molmo 的 0-100 归一化 <point>/<points> 标签解析为像素坐标。"""
+    out = []
+    for tag in _MOLMO_TAG_RE.findall(str(text)):
+        xs = dict()
+        ys = dict()
+        for m in re.finditer(r'(x|y)(\d*)="([\d.]+)"', tag):
+            axis, idx, value = m.group(1), m.group(2) or "0", m.group(3)
+            (xs if axis == "x" else ys)[idx] = float(value)
+        for idx, xv in xs.items():
+            if idx not in ys:
+                continue
+            px = min(max(xv / 100.0 * w, 0), w - 1)
+            py = min(max(ys[idx] / 100.0 * h, 0), h - 1)
+            out.append({"pixel": (px, py), "confidence": 1.0, "bbox": None})
+    return out
+
 
 class PointingGrounder:
     """本地多模态 VLM pointing；model 为空时构造报错。"""
 
-    def __init__(self, gateway, model, parse_retries=1, max_tokens=512):
+    def __init__(self, gateway, model, parse_retries=1, max_tokens=512,
+                 backend=None):
         self.gateway = gateway
         self.model = str(model or "").strip()
         if not self.model:
             raise RuntimeError(
                 "pointing 模型未配置：请设置 NAV_POINTING_MODEL_PATH"
-                "（Qwen2.5-VL-7B-Instruct 权重路径）")
+                "（Qwen2.5-VL-7B-Instruct 或 Molmo 权重路径）")
+        self.backend = str(
+            backend or os.environ.get("NAV_POINTING_BACKEND", "qwen")
+        ).strip().lower()
         self.parse_retries = int(parse_retries)
         self.max_tokens = int(max_tokens)
 
@@ -96,6 +131,8 @@ class PointingGrounder:
         像素坐标裁剪到图像范围内。模型持续非法输出时返回空列表。
         """
         w, h = pil_img.size
+        if self.backend == "molmo":
+            return self._point_molmo(pil_img, goal_text, frame_key, w, h)
         prompt = POINT_PROMPT.format(goal_text=str(goal_text),
                                      width=w, height=h)
         data = self._chat_checked(prompt, pil_img, frame_key, "point")
@@ -119,6 +156,23 @@ class PointingGrounder:
                 conf *= _BBOX_MISMATCH_FACTOR
             out.append({"pixel": (x, y), "confidence": conf, "bbox": bbox})
         return out
+
+    def _point_molmo(self, pil_img, goal_text, frame_key, w, h):
+        """Molmo pointing：纯文本 <point> 标签输出，无 bbox/confidence。"""
+        prompt = MOLMO_POINT_PROMPT.format(goal_text=str(goal_text))
+        for _ in range(self.parse_retries + 1):
+            try:
+                text = self.gateway.chat(
+                    self.model, prompt, [pil_img], kind="point",
+                    cache_key=frame_key, priority=Priority.POINTING,
+                    max_tokens=self.max_tokens)
+            except VLLMError:
+                continue
+            out = _parse_molmo_points(text, w, h)
+            if out or not re.search(r"<points?\b", str(text)):
+                # 解析到点，或模型明确没有输出任何 point 标签（即没有目标）
+                return out
+        return []
 
     def _chat_checked(self, prompt, pil_img, frame_key, kind):
         """调模型并解析 JSON；失败时带错误提示重试 parse_retries 次。"""

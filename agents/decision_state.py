@@ -5,7 +5,7 @@
 
 实例表是有界摘要：未报告实例按"最近邻 + 最新 + 任务相关"并集取
 top-K（NAV_STATE_MAX_INSTANCES，默认 30），其余折叠为 id 列表，
-全文与证据经 search_instances / inspect_instance 按需查询。
+全文与证据经 search_instances / get_instance 按需查询。
 """
 
 import math
@@ -55,6 +55,12 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
     nodes = list(agent.memory.nodes)
     unreported = [nd for nd in nodes if not nd.reported]
     reported_ids = [nd.iid for nd in nodes if nd.reported]
+    reported_instances = [{
+        "id": nd.iid,
+        "text": _truncate(nd.text),
+        "observation_count": len(getattr(nd, "observation_ids", [])),
+        "report_claim_id": getattr(nd, "report_claim_id", None),
+    } for nd in nodes if nd.reported]
 
     dist_m = {}
     for nd in unreported:
@@ -74,6 +80,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         instances.append({
             "id": nd.iid,
             "text": _truncate(nd.text),
+            "observation_count": len(getattr(nd, "observation_ids", [])),
             "path_cost_m": _path_cost_m(grid, start, nd.point, scale),
         })
     omitted_ids = [nd.iid for nd in unreported if nd.iid not in selected_ids]
@@ -103,7 +110,17 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         "instances_total": len(nodes),
         "instances_omitted_ids": omitted_ids,
         "reported_instance_ids": reported_ids,
+        "reported_instances": reported_instances,
+        "report_claims": [claim.as_dict() for claim in
+                          getattr(agent.memory, "report_claims", [])[-20:]],
         "frontiers": frontier_rows,
+        # VLM 自己维护的跨决策工作记忆（经 set_notes 工具改写）。
+        "notes": getattr(agent, "_notes", ""),
+        # 最近 3 步高层动作流水（不含进行中的条目）；更早的经
+        # get_action_history 按需查询。
+        "recent_actions": [
+            dict(entry) for entry in getattr(agent, "_action_log", [])
+            if entry.get("outcome") is not None][-3:],
     }
 
 

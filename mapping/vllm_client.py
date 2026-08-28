@@ -76,7 +76,8 @@ class VLLMGateway:
 
     def __init__(self, url=_DEFAULT_URL, api_key="EMPTY", timeout=120.0,
                  max_retries=3, backoff_base=0.5, post_fn=None,
-                 start_worker=True, trace_fn=None):
+                 start_worker=True, trace_fn=None, workers=1,
+                 enable_thinking=None):
         self.url = str(url or _DEFAULT_URL).rstrip("/")
         self.api_key = str(api_key or "EMPTY")
         self.timeout = float(timeout)
@@ -89,25 +90,33 @@ class VLLMGateway:
         self._cache = {}
         self._cache_lock = threading.Lock()
         self._closed = False
-        self._worker = None
+        self._workers = []
+        # 思考模式开关（仅部分 API 模型支持，如 qwen3 系列）；None=不加该字段
+        self._enable_thinking = enable_thinking
         # NAV_VLLM_TRACE_IMAGES=1 时 trace 记录内联 base64 图像（完整 I/O
         # 落盘，用于 prompt 审计）；默认关闭避免诊断日志膨胀。
         self.trace_images = os.environ.get(
             "NAV_VLLM_TRACE_IMAGES", "0").strip().lower() in {
             "1", "true", "yes", "on"}
         if start_worker:
-            self._worker = threading.Thread(
-                target=self._consume, name="vllm-gateway", daemon=True)
-            self._worker.start()
+            # workers>1 用于不抢 GPU 的远端 API（如 caption 走 DashScope）；
+            # 本地 vLLM 保持 1，串行保护显存。
+            for i in range(max(1, int(workers))):
+                t = threading.Thread(
+                    target=self._consume, name=f"vllm-gateway-{i}",
+                    daemon=True)
+                t.start()
+                self._workers.append(t)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        # 唤醒 worker 退出
-        self._queue.put((Priority.CAPTION, next(self._seq), None))
-        if self._worker is not None:
-            self._worker.join(timeout=2.0)
+        # 唤醒全部 worker 退出
+        for _ in self._workers or [None]:
+            self._queue.put((Priority.CAPTION, next(self._seq), None))
+        for t in self._workers:
+            t.join(timeout=2.0)
 
     def queue_size(self):
         return self._queue.qsize()
@@ -261,8 +270,7 @@ class VLLMGateway:
         return (self.url if self.url.endswith("/chat/completions")
                 else f"{self.url}/chat/completions")
 
-    @staticmethod
-    def _build_payload(model, prompt, images, max_tokens):
+    def _build_payload(self, model, prompt, images, max_tokens):
         content = [{"type": "text", "text": str(prompt)}]
         for raw in images or []:
             if raw is None:
@@ -278,12 +286,15 @@ class VLLMGateway:
                 "image_url": {"url": "data:image/jpeg;base64,"
                               + base64.b64encode(jpeg).decode("ascii")},
             })
-        return {
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0,
             "max_tokens": int(max_tokens),
         }
+        if self._enable_thinking is not None:
+            payload["enable_thinking"] = bool(self._enable_thinking)
+        return payload
 
     @staticmethod
     def _make_cache_key(cache_key, model, kind, prompt):

@@ -13,23 +13,30 @@ import os
 import threading
 import time
 
-from decision.prompts import build_decision_prompt
+from decision.prompts import build_decision_prompt, build_final_decision_prompt
 
 ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND", "SCAN",
            "EXPLORE", "FINISH", "START_ADJUST", "END_ADJUST",
            "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
 
-# 写工具：成功执行后实例记忆已变化，动作校验前必须刷新 world-state。
-WRITE_TOOLS = ("update_instance", "merge_instances", "undo_merge")
+DEFAULT_MAX_TOOL_ROUNDS = 7
+FINAL_ACTION_ATTEMPTS = 2
+
+# 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
+WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points",
+               "ground_target")
 
 EVENT_ACTIONS = {
-    "world_state_updated": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE",
-                            "START_ADJUST"},
-    "arrival": {"REPORT_FOUND", "SCAN", "EXPLORE",
-                "GOTO_INSTANCE", "GOTO_FRONTIER", "START_ADJUST"},
-    "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE",
-                      "START_ADJUST"},
-    "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "EXPLORE", "FINISH"},
+    # 除 finish_check / adjustment 外放行高层动作（EXPLORE 除外——VLM 滥用
+    # 一键探索；探索应显式选 frontier 或用 START_ADJUST 局部观察）。
+    # EXPLORE 保留在 ACTIONS 中供 harness 内部降级（_enforce_finish 兜底）。
+    "world_state_updated": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
+                            "SCAN", "FINISH", "START_ADJUST"},
+    "arrival": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
+                "SCAN", "FINISH", "START_ADJUST"},
+    "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
+                      "SCAN", "FINISH", "START_ADJUST"},
+    "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "FINISH"},
     "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "END_ADJUST"},
 }
 
@@ -79,11 +86,13 @@ class DecisionTraceLogger:
 
 
 class DecisionLoop:
-    def __init__(self, chat_fn, tools=None, logger=None, max_tool_rounds=3):
+    def __init__(self, chat_fn, tools=None, logger=None,
+                 max_tool_rounds=DEFAULT_MAX_TOOL_ROUNDS):
         self.chat_fn = chat_fn
         self.tools = dict(tools or {})
         self.logger = logger
-        self.max_tool_rounds = max(0, int(max_tool_rounds))
+        self.max_tool_rounds = min(
+            DEFAULT_MAX_TOOL_ROUNDS, max(0, int(max_tool_rounds)))
 
     def decide(self, event, world_state, map_png=None, images=None,
                state_fn=None):
@@ -98,21 +107,38 @@ class DecisionLoop:
         if map_png:
             images = self._with_topdown_map(images, map_png)
         tool_calls = 0
-        for _round in range(self.max_tool_rounds + 2):
+        tool_results = []
+        while True:
             data = self._chat(prompt, images)
             if data is None:
                 self._log(event, state, None, "model_unavailable",
                           tool_calls)
                 return None
             tool_call = data.get("tool_call")
-            if tool_call and tool_calls < self.max_tool_rounds:
+            if tool_call and str(event) == "adjustment":
+                # takeover 期间禁止工具调用：按非法输出走校验失败重试路径。
+                result, err = None, "tools are disabled during adjustment"
+            elif tool_call:
+                if tool_calls >= self.max_tool_rounds:
+                    return self._finalize_after_tool_limit(
+                        event, state, images, tool_calls, tool_results)
                 tool_calls += 1
                 feedback, tool_img, ok = self._run_tool(tool_call)
-                prompt += ("\n\nTool result:\n" + feedback
-                           + "\nContinue with another tool call or reply with "
-                             "the final decision JSON.")
+                tool_name = str(tool_call.get("name") or "")
+                tool_results.append(
+                    f"Tool {tool_calls}/{self.max_tool_rounds} "
+                    f"({tool_name}) result:\n{feedback}")
+                remaining = self.max_tool_rounds - tool_calls
+                prompt += (
+                    "\n\nTool result:\n" + feedback
+                    + f"\nTool usage: {tool_calls}/{self.max_tool_rounds}; "
+                      f"{remaining} calls remain."
+                    + ("\nContinue with another tool call only if needed, "
+                       "otherwise reply with the final decision JSON."
+                       if remaining else
+                       "\nThe hard tool-call limit has been reached."))
                 if tool_img:
-                    images.append(("tool_instance_evidence", tool_img))
+                    images = self._with_tool_image(images, *tool_img)
                 if ok and state_fn is not None and \
                         str(tool_call.get("name") or "") in WRITE_TOOLS:
                     state, refreshed_map, has_map = self._refresh_context(
@@ -122,8 +148,12 @@ class DecisionLoop:
                             images, refreshed_map)
                     prompt += ("\n\nWorld state after your write:\n"
                                + json.dumps(state, ensure_ascii=False))
+                if tool_calls >= self.max_tool_rounds:
+                    return self._finalize_after_tool_limit(
+                        event, state, images, tool_calls, tool_results)
                 continue
-            result, err = self._validate(data, state, tool_calls, event)
+            else:
+                result, err = self._validate(data, state, tool_calls, event)
             if result is not None:
                 result = self._enforce_finish(result, state)
                 self._log(event, state, result.as_dict(),
@@ -133,8 +163,15 @@ class DecisionLoop:
             prompt += ("\n\nYour previous output was rejected: " + err
                        + "\nReturn exactly one valid decision JSON object.")
             data2 = self._chat(prompt, images)
-            result2, err2 = self._validate(data2, state, tool_calls, event) \
-                if data2 is not None else (None, "model_unavailable")
+            if data2 is None:
+                result2, err2 = None, "model_unavailable"
+            elif data2.get("tool_call"):
+                result2, err2 = None, (
+                    "a final action JSON was required; tool_call is not "
+                    "allowed on validation retry")
+            else:
+                result2, err2 = self._validate(
+                    data2, state, tool_calls, event)
             if result2 is not None:
                 result2 = self._enforce_finish(result2, state)
                 self._log(event, state, result2.as_dict(),
@@ -143,9 +180,87 @@ class DecisionLoop:
             self._log(event, state, None,
                       f"fallback: {err2}", tool_calls)
             return None
-        self._log(event, state, None, "fallback: tool rounds exhausted",
-                  tool_calls)
-        return None
+
+    def _finalize_after_tool_limit(self, event, state, images, tool_calls,
+                                   tool_results):
+        """Require an action after the hard limit; never validate tool_call.
+
+        If the model still refuses the final-action-only contract, return a
+        deterministic valid navigation decision rather than leaking a residual
+        tool_call into action validation or returning None.
+        """
+        allowed = EVENT_ACTIONS.get(
+            str(event), set(ACTIONS) - {"EXPLORE"})
+        prompt = build_final_decision_prompt(
+            event, state, tool_results, self.max_tool_rounds, allowed)
+        last_error = "final action not produced"
+        for _attempt in range(FINAL_ACTION_ATTEMPTS):
+            data = self._chat(prompt, images)
+            if data is None:
+                last_error = "model_unavailable"
+            elif data.get("tool_call"):
+                last_error = (
+                    "tool_call is disabled after the hard limit; output one "
+                    "final action JSON")
+            else:
+                result, last_error = self._validate(
+                    data, state, tool_calls, event)
+                if result is not None:
+                    result = self._enforce_finish(result, state)
+                    self._log(event, state, result.as_dict(),
+                              result.validation, tool_calls)
+                    return result
+            prompt += (
+                "\n\nRejected final response: " + str(last_error)
+                + "\nTools remain disabled. Return exactly one executable "
+                  "final action JSON now.")
+        result = self._forced_navigation_result(
+            event, state, tool_calls, last_error)
+        result = self._enforce_finish(result, state)
+        self._log(event, state, result.as_dict(),
+                  result.validation, tool_calls)
+        return result
+
+    @staticmethod
+    def _forced_navigation_result(event, world_state, tool_calls, error):
+        """Choose a valid progress action if final-only VLM replies stay invalid."""
+        allowed = EVENT_ACTIONS.get(str(event), set(ACTIONS) - {"EXPLORE"})
+        if "GOTO_INSTANCE" in allowed:
+            instances = [item for item in world_state.get("instances", [])
+                         if not item.get("reported", False)]
+            if instances:
+                return DecisionResult(
+                    "GOTO_INSTANCE", str(instances[0]["id"]),
+                    "Forced final action after tool limit: " + str(error),
+                    validation="forced_after_tool_limit",
+                    tool_calls=tool_calls)
+            omitted = world_state.get("instances_omitted_ids", [])
+            if omitted:
+                return DecisionResult(
+                    "GOTO_INSTANCE", str(omitted[0]),
+                    "Forced final action after tool limit: " + str(error),
+                    validation="forced_after_tool_limit",
+                    tool_calls=tool_calls)
+        if "GOTO_FRONTIER" in allowed:
+            frontiers = world_state.get("frontiers", [])
+            if frontiers:
+                return DecisionResult(
+                    "GOTO_FRONTIER", str(frontiers[0]["id"]),
+                    "Forced final action after tool limit: " + str(error),
+                    validation="forced_after_tool_limit",
+                    tool_calls=tool_calls)
+        for action in ("SCAN", "START_ADJUST", "FINISH", "END_ADJUST",
+                       "TURN_LEFT", "TURN_RIGHT", "MOVE_FORWARD"):
+            if action in allowed:
+                return DecisionResult(
+                    action, None,
+                    "Forced final action after tool limit: " + str(error),
+                    validation="forced_after_tool_limit",
+                    tool_calls=tool_calls)
+        return DecisionResult(
+            "FINISH", None,
+            "Forced final action after tool limit: " + str(error),
+            validation="forced_after_tool_limit", tool_calls=tool_calls)
 
     @staticmethod
     def _with_topdown_map(images, map_png):
@@ -161,6 +276,13 @@ class DecisionLoop:
             return images
         insert_at = 1 if images and images[0][0] == "current_observation" else 0
         images.insert(insert_at, ("topdown_map", map_png))
+        return images
+
+    @staticmethod
+    def _with_tool_image(images, label, payload):
+        """Replace an identical tool attachment instead of accumulating it."""
+        images = [(name, value) for name, value in images if name != label]
+        images.append((label, payload))
         return images
 
     @staticmethod
@@ -190,28 +312,85 @@ class DecisionLoop:
             return None
         return data if isinstance(data, dict) else None
 
+    @staticmethod
+    def _serialize_tool_feedback(payload, max_chars=4000):
+        """Keep feedback valid JSON even when a tool returns a large record."""
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+        if len(raw) <= max_chars:
+            return raw
+        compact = {
+            "ok": payload.get("ok", False),
+            "tool": payload.get("tool"),
+            "state_changed": payload.get("state_changed", False),
+            "truncated": True,
+            "result_preview": raw[:max_chars - 300],
+        }
+        return json.dumps(compact, ensure_ascii=False, default=str)
+
+    @classmethod
+    def _tool_error(cls, name, code, message):
+        payload = {
+            "ok": False,
+            "tool": name,
+            "state_changed": False,
+            "error": {"code": code, "message": str(message)[:300]},
+        }
+        return cls._serialize_tool_feedback(payload), None, False
+
+    @staticmethod
+    def _tool_image_label(kind, value):
+        safe = "".join(
+            char if char.isalnum() or char in "-_." else "-"
+            for char in str(value))
+        return f"tool_{kind}_{safe or 'unknown'}"
+
     def _run_tool(self, tool_call):
-        """执行工具，返回 (feedback_text, tool_image|None, ok)。"""
+        """执行工具，返回 (统一 JSON, (image_label, bytes)|None, ok)。"""
         name = str(tool_call.get("name") or "")
         fn = self.tools.get(name)
         if fn is None:
-            return json.dumps({"error": f"unknown tool: {name}"}), None, False
+            return self._tool_error(
+                name, "UNKNOWN_TOOL", f"unknown tool: {name}")
         try:
-            if name == "search_captions":
-                out = fn(str(tool_call.get("text") or ""))
-                return json.dumps(out, ensure_ascii=False)[:4000], None, True
-            if name == "look_instance":
+            if name == "view_instance":
                 out = fn(tool_call.get("instance_id"))
                 if not out:
-                    return json.dumps(
-                        {"error": "instance image not found"}), None, False
-                return "Instance evidence image attached.", out, True
+                    return self._tool_error(
+                        name, "IMAGE_NOT_FOUND", "instance image not found")
+                iid = tool_call.get("instance_id")
+                label = self._tool_image_label(
+                    "instance", f"{iid}_evidence")
+                payload = {
+                    "ok": True, "tool": name, "state_changed": False,
+                    "result": {"instance_id": iid, "image_ref": label},
+                }
+                return (self._serialize_tool_feedback(payload),
+                        (label, out), True)
+            if name == "view_frame":
+                out = fn(tool_call.get("frame_id"))
+                if not out:
+                    return self._tool_error(
+                        name, "IMAGE_NOT_FOUND", "frame image not found")
+                fid = tool_call.get("frame_id")
+                label = self._tool_image_label("frame", f"{fid}_rgb")
+                payload = {
+                    "ok": True, "tool": name, "state_changed": False,
+                    "result": {"frame_id": fid, "image_ref": label},
+                }
+                return (self._serialize_tool_feedback(payload),
+                        (label, out), True)
             out = fn(**{k: v for k, v in tool_call.items() if k != "name"})
             if isinstance(out, dict) and "error" in out:
-                return json.dumps(out, ensure_ascii=False), None, False
-            return json.dumps(out, ensure_ascii=False)[:4000], None, True
+                return self._tool_error(name, "TOOL_ERROR", out["error"])
+            payload = {
+                "ok": True,
+                "tool": name,
+                "state_changed": name in WRITE_TOOLS,
+                "result": out,
+            }
+            return self._serialize_tool_feedback(payload), None, True
         except Exception as exc:
-            return json.dumps({"error": str(exc)[:200]}), None, False
+            return self._tool_error(name, "TOOL_EXCEPTION", exc)
 
     def _validate(self, data, world_state, tool_calls, event=None):
         """schema + id 存在性校验。返回 (DecisionResult|None, error)。"""
@@ -238,6 +417,19 @@ class DecisionLoop:
             valid = {str(f["id"]) for f in world_state.get("frontiers", [])}
             if target_id not in valid:
                 return None, f"target_id {target_id!r} not a frontier"
+        elif action == "REPORT_FOUND":
+            valid = {str(i["id"]) for i in world_state.get("instances", [])}
+            valid |= {str(i) for i in
+                      world_state.get("instances_omitted_ids", [])}
+            if target_id not in valid:
+                return None, (f"REPORT_FOUND target_id {target_id!r} is not "
+                              "an available canonical instance")
+            active = (world_state.get("navigation", {})
+                      .get("active_target") or {})
+            if active.get("type") != "instance" or \
+                    str(active.get("id")) != target_id:
+                return None, ("REPORT_FOUND must target the active canonical "
+                              "instance")
         else:
             target_id = None
         return DecisionResult(action, target_id,

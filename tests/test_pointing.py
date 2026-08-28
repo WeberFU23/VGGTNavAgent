@@ -33,6 +33,12 @@ class _MockGateway:
             raise VLLMError("bad json")
         return self.replies.pop(0) if self.replies else {}
 
+    def chat(self, model, prompt, images, *, kind, cache_key,
+             priority, max_tokens):
+        self.calls.append({"kind": kind, "cache_key": cache_key,
+                           "prompt": prompt})
+        return self.replies.pop(0) if self.replies else ""
+
 
 def _img(w=64, h=48):
     return Image.new("RGB", (w, h))
@@ -97,6 +103,35 @@ def test_point_gives_up_after_retries():
 def test_requires_model():
     with pytest.raises(RuntimeError, match="NAV_POINTING_MODEL_PATH"):
         PointingGrounder(_MockGateway(), model="")
+
+
+# ----------------------------------------------------------------------
+# point：Molmo 后端（<point>/<points> 标签，0-100 归一化坐标）
+# ----------------------------------------------------------------------
+def test_molmo_point_single():
+    gw = _MockGateway(replies=['<point x="75.0" y="25.0" alt="red square">'])
+    g = PointingGrounder(gw, model="molmo", backend="molmo")
+    pts = g.point(_img(w=1280, h=1280), "red square")
+    assert len(pts) == 1
+    assert pts[0]["pixel"] == pytest.approx((960.0, 320.0))
+    assert pts[0]["confidence"] == 1.0
+    assert pts[0]["bbox"] is None
+
+
+def test_molmo_point_multi():
+    gw = _MockGateway(replies=[
+        '<points x1="10.0" y1="20.0" x2="30.5" y2="40.5" alt="chairs">'])
+    g = PointingGrounder(gw, model="molmo", backend="molmo")
+    pts = g.point(_img(w=1280, h=1280), "wooden chair")
+    assert len(pts) == 2
+    assert pts[0]["pixel"] == pytest.approx((128.0, 256.0))
+    assert pts[1]["pixel"] == pytest.approx((390.4, 518.4))
+
+
+def test_molmo_point_none_returns_empty():
+    gw = _MockGateway(replies=["I cannot see any matching object."])
+    g = PointingGrounder(gw, model="molmo", backend="molmo")
+    assert g.point(_img(), "golden bicycle") == []
 
 
 # ----------------------------------------------------------------------

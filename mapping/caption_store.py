@@ -102,6 +102,15 @@ class CaptionStore:
         with self._lock:
             return any(r["frame_id"] == frame_id for r in self.records)
 
+    def get_captions(self, frame_ids):
+        """按 frame_id 批量取回 caption；未入库的帧跳过。
+        返回 [{frame_id, caption}]，顺序与请求一致。"""
+        wanted = [int(fid) for fid in (frame_ids or [])]
+        with self._lock:
+            by_id = {r["frame_id"]: r["caption"] for r in self.records}
+        return [{"frame_id": fid, "caption": by_id[fid]}
+                for fid in wanted if fid in by_id]
+
     def retrieve(self, query_embedding, k=10):
         """余弦 top-K，返回 [{frame_id, caption, score, pose}]（score 降序）。"""
         with self._lock:
@@ -243,7 +252,7 @@ class CaptionWorker:
 
     def __init__(self, gateway, embedder, store, model,
                  busy_fn=None, max_tokens=512, prompt=CAPTION_PROMPT,
-                 result_fn=None):
+                 result_fn=None, workers=1):
         self.gateway = gateway
         self.embedder = embedder
         self.store = store
@@ -255,15 +264,22 @@ class CaptionWorker:
         self._queue = queue.Queue()
         self._closed = False
         self._state_lock = threading.RLock()
+        self._embed_lock = threading.Lock()  # embedder 非线程安全，串行编码
         self._generation = 0
         self.errors = 0
         # 语义记忆进度：已入队但尚未生成 caption 的关键帧（含在途处理）。
         # agent 端据此判断检索是否会漏掉最新关键帧。
         self._pending = set()       # (generation, frame_id)
         self.last_completed_frame_id = None
-        self._thread = threading.Thread(
-            target=self._consume, name="caption-worker", daemon=True)
-        self._thread.start()
+        # caption 走远端 API 时不占 GPU，workers>1 并发消化积压；本地
+        # vLLM 时保持 1（网关层串行保护显存）。
+        self._threads = []
+        for i in range(max(1, int(workers))):
+            t = threading.Thread(
+                target=self._consume, name=f"caption-worker-{i}",
+                daemon=True)
+            t.start()
+            self._threads.append(t)
 
     def enqueue(self, frame_id, pil_img, pose=None):
         if self._closed or not self.model:
@@ -312,8 +328,10 @@ class CaptionWorker:
             except queue.Empty:
                 pass
             self._pending.clear()
-        self._queue.put(None)
-        self._thread.join(timeout=2.0)
+        for _ in self._threads:
+            self._queue.put(None)
+        for t in self._threads:
+            t.join(timeout=2.0)
 
     def _consume(self):
         while True:
@@ -340,8 +358,8 @@ class CaptionWorker:
                 caption = str(caption).strip()
                 if not caption:
                     raise VLLMError("caption 为空")
-                emb = self.embedder.encode([caption])[0]
-                # clear() 与此临界区互斥；旧 generation 不能写入新 episode。
+                with self._embed_lock:
+                    emb = self.embedder.encode([caption])[0]                # clear() 与此临界区互斥；旧 generation 不能写入新 episode。
                 with self._state_lock:
                     if generation != self._generation:
                         continue

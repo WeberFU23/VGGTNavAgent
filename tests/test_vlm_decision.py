@@ -81,6 +81,45 @@ def test_png_topdown_map_uses_png_data_uri():
     assert urls[1].startswith("data:image/png;base64,")
 
 
+def test_image_budget_keeps_core_context_and_newest_tool_image():
+    previous = os.environ.get("NAV_VLM_MAX_IMAGES")
+    os.environ["NAV_VLM_MAX_IMAGES"] = "4"
+    try:
+        parts = VLMDecisionClient._image_parts([
+            ("current_observation", b"current"),
+            ("topdown_map", b"map"),
+            ("selected_candidate", b"candidate"),
+            ("tool_frame_10_rgb", b"old-tool"),
+            ("tool_frame_11_rgb", b"new-tool"),
+        ])
+    finally:
+        if previous is None:
+            os.environ.pop("NAV_VLM_MAX_IMAGES", None)
+        else:
+            os.environ["NAV_VLM_MAX_IMAGES"] = previous
+    assert [part[0] for part in parts] == [
+        "current_observation", "topdown_map", "selected_candidate",
+        "tool_frame_11_rgb"]
+
+
+def test_entity_image_budget_never_drops_new_observation():
+    previous = os.environ.get("NAV_VLM_MAX_IMAGES")
+    os.environ["NAV_VLM_MAX_IMAGES"] = "2"
+    try:
+        parts = VLMDecisionClient._image_parts([
+            ("new_observation", b"new"),
+            ("candidate_instance_1", b"old-1"),
+            ("candidate_instance_2", b"old-2"),
+        ])
+    finally:
+        if previous is None:
+            os.environ.pop("NAV_VLM_MAX_IMAGES", None)
+        else:
+            os.environ["NAV_VLM_MAX_IMAGES"] = previous
+    assert [part[0] for part in parts] == [
+        "new_observation", "candidate_instance_2"]
+
+
 def test_chat_text_returns_plain_text_without_json_mode():
     calls = []
 

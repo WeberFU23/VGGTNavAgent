@@ -81,16 +81,23 @@ class VLMDecisionClient:
         """决策层 agentic 循环低层接口：自由 prompt + 原始 JPEG 字节图像
         列表，返回解析后的 JSON dict；API 不可达自动回退 None（调用方
         走确定性规则），并打 warning。复用同一 HTTP/JSON 解析通路。"""
+        return self.chat_json(user_prompt, images, trace_kind="decision")
+
+    def chat_json(self, user_prompt, images=None, trace_kind="json"):
+        """Focused structured visual call outside the decision tool loop.
+
+        Entity identity resolution uses this path so its comparison does not
+        consume the decision VLM's per-decision tool budget.
+        """
         if not self.enabled:
             return None
         prompt = str(user_prompt)
         image_parts = self._image_parts(images)
         payload = self._build_payload(
-            prompt, image_parts,
-            self.JSON_SYSTEM, self.json_mode)
+            prompt, image_parts, self.JSON_SYSTEM, self.json_mode)
         response = self._send(payload)
         parsed = self._extract_json(response)
-        self._trace("decision", prompt, image_parts, response, parsed)
+        self._trace(str(trace_kind), prompt, image_parts, response, parsed)
         return parsed
 
     def chat_text(self, user_prompt, images=None, max_tokens=None):
@@ -203,6 +210,27 @@ class VLMDecisionClient:
                           data.startswith(b"\x89PNG\r\n\x1a\n"))
                 mime = "image/png" if is_png else "image/jpeg"
                 parts.append((str(name), raw, mime))
+        if max_images > 0 and len(parts) > max_images:
+            # Keep core spatial context, then fill the remaining budget with
+            # the newest attachments. Tool images are appended after each
+            # call, so taking the tail prevents a newly requested frame from
+            # being silently dropped behind stale evidence.
+            core_labels = ("current_observation", "topdown_map",
+                           "selected_candidate", "new_observation")
+            selected = []
+            selected_indexes = set()
+            for label in core_labels:
+                for index, part in enumerate(parts):
+                    if index not in selected_indexes and part[0] == label:
+                        selected.append(part)
+                        selected_indexes.add(index)
+                        break
+            remaining = max_images - len(selected)
+            if remaining > 0:
+                extras = [part for index, part in enumerate(parts)
+                          if index not in selected_indexes]
+                selected.extend(extras[-remaining:])
+            return selected[:max_images]
         if max_images > 0:
             return parts[:max_images]
         return parts

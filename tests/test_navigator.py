@@ -520,6 +520,53 @@ def test_semantic_coverage_requires_close_or_two_completed_views():
     assert not inspected[6, 6], "连续同向 caption 帧不能伪装成多视角"
 
 
+def test_raycast_clears_ghost_wall():
+    """射线法：鬼影墙（漂浮在房间中央的假墙）被看穿它的射线清除，
+    两侧自由空间连通；关闭 raycast 时鬼影墙保持阻断。"""
+    rng = np.random.default_rng(3)
+    pts, pfid = [], []
+    # 地板 10x6m
+    xs = np.arange(0, 10.001, 0.15)
+    ys = np.arange(0, 6.001, 0.15)
+    gx, gy = np.meshgrid(xs, ys)
+    floor_pts = np.stack([gx.ravel(), gy.ravel(),
+                          rng.normal(0, 0.01, gx.size)], axis=1)
+    # 鬼影墙：x=5, y 0~6, z 0.3~1.6（躯干高度），把房间一切为二
+    t = np.arange(0.0, 6.001, 0.1)
+    zz = np.arange(0.3, 1.6, 0.1)
+    mt, mz = np.meshgrid(t, zz)
+    ghost = np.stack([np.full(mt.size, 5.0), mt.ravel(), mz.ravel()],
+                     axis=1)
+    # 两个相机：左右两侧各一，互相能看到对方一侧的地板（视线穿过鬼影墙）
+    cams = np.array([[1.0, 3.0, 1.5], [9.0, 3.0, 1.5]])
+    for fid, (cx, cy, cz) in enumerate(cams):
+        # 该相机看到的地板：对面一侧
+        if cx < 5:
+            seen = floor_pts[floor_pts[:, 0] > 5.5]
+        else:
+            seen = floor_pts[floor_pts[:, 0] < 4.5]
+        seen = seen[::5]
+        pts.append(seen)
+        pfid.append(np.full(len(seen), fid, dtype=np.int64))
+        pts.append(ghost)
+        pfid.append(np.full(len(ghost), fid, dtype=np.int64))
+    points = np.concatenate(pts)
+    frame_ids = np.concatenate(pfid)
+
+    common = dict(point_frame_ids=frame_ids, cam_frame_ids=[0, 1],
+                  min_voxel_views=1)
+    grid_ray = nav.OccupancyGrid.build(points, cams, raycast_free=True,
+                                       **common)
+    grid_plain = nav.OccupancyGrid.build(points, cams, raycast_free=False,
+                                         **common)
+    left = grid_ray.world_to_cell([2.0, 3.0, 1.5])
+    right = grid_ray.world_to_cell([8.0, 3.0, 1.5])
+    ghost_cell = grid_ray.world_to_cell([5.0, 3.0, 1.5])
+    assert grid_ray.traversable(left) and grid_ray.traversable(right)
+    assert not grid_ray.obstacle[ghost_cell[1], ghost_cell[0]],         "被多条射线穿过的鬼影墙应被清除"
+    assert grid_plain.obstacle[ghost_cell[1], ghost_cell[0]],         "关闭射线时鬼影墙仍是障碍"
+
+
 if __name__ == "__main__":
     test_gravity_alignment()
     test_gravity_alignment_straight_trajectory()

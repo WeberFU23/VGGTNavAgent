@@ -423,7 +423,9 @@ class OccupancyGrid:
               res_m=0.10, floor_band_m=0.12, obs_low_m=0.15, obs_high_m=1.8,
               robot_radius_m=0.25, margin_m=0.5, cam_height_m=1.5,
               unit_per_m=None, point_frame_ids=None,
-              voxel_size_m=0.05, min_voxel_views=3):
+              voxel_size_m=0.05, min_voxel_views=3,
+              min_obstacle_votes=2, raycast_free=True,
+              ray_clear_votes=5, cam_frame_ids=None):
         """从对齐点云构建栅格。
 
         有动作尺度时，地板峰只在“相机下方约 1.5m”的范围内搜索；没有
@@ -466,6 +468,11 @@ class OccupancyGrid:
             1e-6)
         source_point_count = len(points_aligned)
         retained_voxel_count = source_point_count
+        # 射线法自由空间用原始（未体素融合）点：融合后丢失帧关联，
+        # 而射线必须知道每个点属于哪个相机。
+        raw_ray = None
+        if raycast_free and point_frame_ids is not None:
+            raw_ray = (xy.copy(), z.copy(), point_frame_ids.copy())
         if point_frame_ids is not None and min_voxel_views > 1 and \
                 np.unique(point_frame_ids).size >= min_voxel_views:
             cells = np.floor(points_aligned / voxel_size).astype(np.int64)
@@ -543,10 +550,12 @@ class OccupancyGrid:
         u = float(unit_per_m) if supplied_units else ruler / cam_height_m
         res = res_m * u
 
-        # 分层
-        is_floor = np.abs(z - floor_z) < floor_band_m * u
-        is_obs = (z > floor_z + obs_low_m * u) & \
-                 (z < floor_z + obs_high_m * u)
+        # 分层（分块地板高度）：回环修正/对齐误差会把地板点垂直涂抹
+        # 开，全局单一 floor_z + 窄带会漏掉大部分地板（实测 free 层只剩
+        # 零头）。按瓦片各自估计地板高度，证据不足或明显不可能时回落
+        # 全局 floor_z。
+        is_floor, is_obs = cls._classify_layers(
+            xy, z, floor_z, cam_h, u, floor_band_m, obs_low_m, obs_high_m)
 
         # 栅格边界（裁剪离群点 + 边距）
         qlo = np.percentile(xy, 0.5, axis=0) - margin_m * u
@@ -572,15 +581,42 @@ class OccupancyGrid:
                     grid[c[ok, 1], c[ok, 0]] = True
             return grid
 
+        def raster_count(mask):
+            """不溅射的逐格计数（障碍票数用）。"""
+            cnt = np.zeros((h, w), dtype=np.int32)
+            p = xy[mask]
+            cell = np.floor((p - qlo) / res).astype(np.int64)
+            ok = (cell[:, 0] >= 0) & (cell[:, 0] < w) & \
+                 (cell[:, 1] >= 0) & (cell[:, 1] < h)
+            np.add.at(cnt, (cell[ok, 1], cell[ok, 0]), 1)
+            return cnt
+
         free = raster(is_floor, splat=1)
-        obstacle = raster(is_obs, splat=0)
+        # 孤立障碍点才滤除：单点噪声（无相邻障碍、票数不足）若直接
+        # 参与 0.25m 半径膨胀会抹掉大片自由空间；薄但连续的表面
+        # （桌面等，体素融合后每格仅 1 票）靠邻域支持保留。
+        obs_votes = raster_count(is_obs)
+        obs_raw = obs_votes >= 1
+        obs_has_neighbor = _binary_dilate(obs_raw, iterations=1)
+        obstacle = obs_raw & (
+            (obs_votes >= int(min_obstacle_votes)) | obs_has_neighbor)
+        if raw_ray is not None and len(cam_centers_aligned):
+            # 射线法：相机到观测点的连线在躯干高度带内经过的格子为自由。
+            # 光线既然能到达表面，路径就是空气——与地板高度分类无关，
+            # 对鬼影/涂抹鲁棒。同时，被多条射线穿过的"障碍"格是鬼影
+            # （真实墙面不会被看到它后面的射线穿过），予以清除。
+            ray_free, ray_votes = cls._raycast_free_cells(
+                raw_ray[0], raw_ray[1], raw_ray[2], cam_centers_aligned,
+                cam_frame_ids, qlo, res, free.shape, floor_z, u)
+            free |= ray_free
+            obstacle &= ~(ray_votes >= int(ray_clear_votes))
         observed = raster(np.ones(len(xy), dtype=bool), splat=1)
         grid = cls._finalize(
             free, obstacle, res, qlo, cam_centers_aligned,
             floor_z=floor_z, unit_per_m=u,
             robot_radius_m=robot_radius_m, res_m=res_m,
             observed=observed, ground_votes=free.astype(np.uint32),
-            obstacle_votes=obstacle.astype(np.uint32))
+            obstacle_votes=obs_votes.astype(np.uint32))
         grid.source_point_count = int(source_point_count)
         grid.retained_voxel_count = int(retained_voxel_count)
         grid.voxel_size_m = float(voxel_size_m)
@@ -690,11 +726,107 @@ class OccupancyGrid:
             cam_height_m=cam_height_m, unit_per_m=unit_per_m,
             point_frame_ids=np.concatenate(point_frame_parts),
             voxel_size_m=voxel_size_m,
-            min_voxel_views=min_voxel_views)
+            min_voxel_views=min_voxel_views,
+            cam_frame_ids=sorted(unique_frames))
         if grid is not None:
             grid.floor_model = "global_height_peak"
             grid.source_frame_count = len(unique_frames)
         return grid
+
+    @staticmethod
+    def _raycast_free_cells(xy, z, fids, cam_centers, cam_fids, qlo, res,
+                            shape, floor_z, u, max_rays_per_frame=400,
+                            torso_low_m=0.25, torso_high_m=1.6):
+        """相机→观测点射线经过的格子（躯干高度带内）标为自由。
+
+        返回 (ray_free bool 栅格, ray_votes 射线穿过计数)。表面所在端点格
+        不计入自由。按帧子采样射线数量以控制计算量；所有帧的射线合并后
+        逐步进（全体射线向量化），步长 0.75 格防止对角跳格。
+        """
+        h, w = shape
+        ray_free = np.zeros((h, w), dtype=bool)
+        ray_votes = np.zeros((h, w), dtype=np.int32)
+        if fids is None or cam_fids is None:
+            return ray_free, ray_votes
+        fids = np.asarray(fids)
+        cam_map = {int(f): np.asarray(c, dtype=np.float64)
+                   for f, c in zip(cam_fids, cam_centers)}
+        rays_o, rays_d, rays_n, rays_oz, rays_dz = [], [], [], [], []
+        for fid, cam in cam_map.items():
+            idx = np.flatnonzero(fids == fid)
+            if len(idx) == 0:
+                continue
+            if len(idx) > max_rays_per_frame:
+                idx = idx[np.linspace(0, len(idx) - 1,
+                                      max_rays_per_frame).astype(np.int64)]
+            d = xy[idx] - cam[:2]
+            dist = np.hypot(d[:, 0], d[:, 1])
+            ok = dist > res
+            d, dist, idx = d[ok], dist[ok], idx[ok]
+            if len(idx) == 0:
+                continue
+            rays_o.append(np.tile(cam[:2], (len(idx), 1)))
+            rays_d.append(d)
+            rays_n.append(
+                np.maximum((dist / (res * 0.75)).astype(np.int64), 1))
+            rays_oz.append(np.full(len(idx), cam[2]))
+            rays_dz.append(z[idx] - cam[2])
+        if not rays_n:
+            return ray_free, ray_votes
+        O = np.concatenate(rays_o)
+        D = np.concatenate(rays_d)
+        N = np.concatenate(rays_n)
+        OZ = np.concatenate(rays_oz)
+        DZ = np.concatenate(rays_dz)
+        lo = floor_z + torso_low_m * u
+        hi = floor_z + torso_high_m * u
+        for t in range(1, int(N.max())):
+            active = t < N - 1          # 端点（表面）格不算自由
+            if not active.any():
+                break
+            frac = t / N[active]
+            pos = O[active] + D[active] * frac[:, None]
+            zt = OZ[active] + DZ[active] * frac
+            cell = np.floor((pos - qlo) / res).astype(np.int64)
+            inb = (cell[:, 0] >= 0) & (cell[:, 0] < w) & \
+                  (cell[:, 1] >= 0) & (cell[:, 1] < h)
+            m = inb & (zt >= lo) & (zt <= hi)
+            if m.any():
+                cc = cell[m]
+                ray_free[cc[:, 1], cc[:, 0]] = True
+                np.add.at(ray_votes, (cc[:, 1], cc[:, 0]), 1)
+        return ray_free, ray_votes
+
+    @staticmethod
+    def _classify_layers(xy, z, floor_z, cam_h, u,
+                         floor_band_m, obs_low_m, obs_high_m,
+                         tile_m=0.5, min_tile_points=20):
+        """分块估计地板高度并判定 floor/obstacle 层。
+
+        全局单一 floor_z 在回环涂抹或轻微倾斜下会漏掉大量地板点。
+        这里按 ~0.5m 瓦片取局部 5% 高度分位数并做邻域中位数精修；
+        候选明显高于"相机下方 1m"（瓦片内其实没有地面，被家具占据）
+        或点数不足的瓦片回落到全局 floor_z。
+        """
+        band = floor_band_m * u
+        tile = max(tile_m * u, 1e-6)
+        t0 = np.percentile(xy, 1, axis=0)
+        tidx = np.floor((xy - t0) / tile).astype(np.int64)
+        _uniq, inv = np.unique(tidx, axis=0, return_inverse=True)
+        ref = np.full(len(z), floor_z)
+        for t in range(len(_uniq)):
+            sel = inv == t
+            if int(sel.sum()) < min_tile_points:
+                continue
+            tz = z[sel]
+            # 以全局地板峰为锚，在 ±0.35m 窗口内取局部中位数——吸收
+            # 倾斜/回环涂抹，同时排除全局峰下方的鬼影地板点。
+            near = tz[np.abs(tz - floor_z) <= 0.35 * u]
+            if len(near) >= max(min_tile_points // 2, 1):
+                ref[sel] = float(np.median(near))
+        is_floor = np.abs(z - ref) < band
+        is_obs = (z > ref + obs_low_m * u) & (z < ref + obs_high_m * u)
+        return is_floor, is_obs
 
     # ------------------------------------------------------------------
     def world_to_cell(self, p):

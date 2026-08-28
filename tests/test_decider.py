@@ -30,6 +30,7 @@ def _state(mode="all", found=1, expected=None, instances=None, frontiers=None):
             {"id": 1, "text": "basket near a shelf", "reported": False}],
         "frontiers": frontiers if frontiers is not None else [
             {"id": "f0", "path_cost_m": 3.0}],
+        "navigation": {"active_target": {"type": "instance", "id": 1}},
     }
 
 
@@ -53,55 +54,152 @@ class _ScriptedChat:
 def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
         "arrival", _state())
-    assert "plans an A* path" in prompt
-    assert "12 left turns, four sampled views" in prompt
-    assert "Returns a JSON array of {frame_id, score, caption}" in prompt
-    assert "returns the surviving full instance" in prompt
-    assert '"name": "search_captions"' in prompt
-    assert '"name": "search_instances"' in prompt
-    assert '"name": "look_instance"' in prompt
-    assert "search_instances -> inspect_instance and/or" in prompt
-    assert "Returns the full object {id, point, text," in prompt
+    flat = " ".join(prompt.split())
+    for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
+                 "instantiate_points(frame_id, pixels_1000, label)",
+                 "point_frame(frame_id, query)",
+                 "ground_target(query, frame_id=null, top_k=2)",
+                 "search_instances(",
+                 "get_instance(instance_id)",
+                 "view_instance(instance_id)",
+                 "update_instance(instance_id, text)",
+                 "get_agent_status()", "set_notes(text)",
+                 "get_action_history(before_step, limit)"):
+        assert tool in prompt
+    for action in ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
+                   "SCAN", "FINISH", "START_ADJUST",
+                   "END_ADJUST", "MOVE_FORWARD"):
+        assert action in prompt
+    assert "EXPLORE" not in prompt  # EXPLORE 已从动作集中移除
+    assert "12 left turns" in flat
+    assert "bird's-eye map image" in prompt
+    assert "blank pixels mean" in flat
+    # world-state 新字段与冷启动
+    assert "new_keyframes" in prompt
+    assert "recent_actions" in prompt
+    assert "Cold start" in prompt
+    # 工具调用 JSON 格式必须写进 prompt（VLM 才能正确发起调用）
+    assert '"tool_call":' in prompt
+    assert '"name": "<tool_name>"' in prompt
+    # 报告亲见约束 + takeover 禁工具
+    assert "never from captions, memory text, or tool-returned" in flat
+    assert "tools are disabled" in flat
+    # 写工具后状态刷新说明
+    assert "the refreshed world state is" in flat
+    # 已删除的工具不得再出现
     assert "look_at" not in prompt
+    assert "merge_instances" not in prompt
+    assert "undo_merge" not in prompt
+    assert "automatically" in prompt
+    assert "observation_count" in prompt
     assert "query_memory" not in prompt
     assert "list_instances" not in prompt
-    assert '"confidence"' not in prompt
-    assert "this is not\n  random wandering" in prompt
-    assert "short local active exploration" in prompt
-    assert "RGB point-cloud" in prompt
-    assert "contains no trajectory" in prompt
-    assert "raw unified frontier boundary" not in prompt
-    assert "reason=semantic" in prompt
+    # 决策输出 JSON 不含 confidence 字段（confidence 只出现在工具返回里）
+    tail = prompt.split("Finally reply with exactly one JSON object")[-1]
+    assert "confidence" not in tail
 
 
-def test_search_captions_tool_call():
+def test_default_tool_limit_is_seven_and_prompt_discloses_hard_limit():
+    loop = DecisionLoop(_ScriptedChat([]))
+    assert loop.max_tool_rounds == 7
+    assert DecisionLoop(
+        _ScriptedChat([]), max_tool_rounds=99).max_tool_rounds == 7
+    prompt = " ".join(loop._build_prompt(
+        "world_state_updated", _state()).split())
+    assert "most 7 calls per decision" in prompt
+    assert "HARD per-decision limit" in prompt
+
+
+def test_search_frames_tool_call_uses_standard_result_envelope():
     seen = []
 
-    def search_captions(text):
-        seen.append(text)
+    def search_frames(query, top_k=5):
+        seen.append((query, top_k))
         return [{"frame_id": 7, "score": 0.8, "caption": "red cup"}]
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "search_captions", "text": "red cup"}},
-        {"action": "EXPLORE"},
+        {"tool_call": {"name": "search_frames", "query": "red cup",
+                       "top_k": 3}},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
     ])
     result = DecisionLoop(
-        chat, tools={"search_captions": search_captions}).decide(
+        chat, tools={"search_frames": search_frames}).decide(
             "world_state_updated", _state())
-    assert seen == ["red cup"]
-    assert result.action == "EXPLORE" and result.tool_calls == 1
+    assert seen == [("red cup", 3)]
+    assert result.action == "GOTO_FRONTIER" and result.tool_calls == 1
+    feedback = chat.calls[1][0].split("Tool result:")[-1]
+    assert '"ok": true' in feedback
+    assert '"tool": "search_frames"' in feedback
+    assert '"state_changed": false' in feedback
 
 
-def test_look_instance_attaches_instance_evidence_image():
+def test_view_instance_attaches_labeled_instance_evidence_image():
     chat = _ScriptedChat([
-        {"tool_call": {"name": "look_instance", "instance_id": 3}},
-        {"action": "EXPLORE"},
+        {"tool_call": {"name": "view_instance", "instance_id": 3}},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
     ])
     result = DecisionLoop(
-        chat, tools={"look_instance": lambda instance_id: b"instance-jpeg"}) \
+        chat, tools={"view_instance": lambda instance_id: b"instance-jpeg"}) \
         .decide("world_state_updated", _state())
-    assert result.action == "EXPLORE"
-    assert ("tool_instance_evidence", b"instance-jpeg") in chat.calls[1][1]
+    assert result.action == "GOTO_FRONTIER"
+    label = "tool_instance_3_evidence"
+    assert (label, b"instance-jpeg") in chat.calls[1][1]
+    assert f'"image_ref": "{label}"' in chat.calls[1][0]
+
+
+def test_tool_budget_disables_more_tools_and_forces_final_action():
+    called = []
+    chat = _ScriptedChat([
+        {"tool_call": {"name": "search_frames", "query": "red cup"}},
+        {"tool_call": {"name": "search_frames", "query": "blue cup"}},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
+    ])
+    result = DecisionLoop(
+        chat, tools={"search_frames": lambda query: called.append(query) or []},
+        max_tool_rounds=1).decide("world_state_updated", _state())
+    assert result.action == "GOTO_FRONTIER"
+    assert result.tool_calls == 1
+    assert called == ["red cup"]
+    assert "# FINAL ACTION ONLY" in chat.calls[1][0]
+    assert "hard tool-call limit is 1" in chat.calls[1][0]
+    assert "1/1 calls have been used" in chat.calls[1][0]
+    assert "tool_call is disabled after the hard limit" in chat.calls[2][0]
+
+
+def test_default_limit_executes_seven_tools_then_requests_final_action():
+    called = []
+    replies = [
+        {"tool_call": {"name": "search_frames", "query": f"q{i}"}}
+        for i in range(7)
+    ] + [{"action": "GOTO_FRONTIER", "target_id": "f0"}]
+    chat = _ScriptedChat(replies)
+    result = DecisionLoop(
+        chat, tools={"search_frames": lambda query:
+                     called.append(query) or []}).decide(
+                         "world_state_updated", _state())
+    assert result.action == "GOTO_FRONTIER"
+    assert result.tool_calls == 7
+    assert called == [f"q{i}" for i in range(7)]
+    assert "Tool usage: 1/7; 6 calls remain." in chat.calls[1][0]
+    assert "# FINAL ACTION ONLY" in chat.calls[7][0]
+    assert "7/7 calls have been used" in chat.calls[7][0]
+
+
+def test_repeated_residual_tool_calls_never_become_empty_action_fallback():
+    called = []
+    chat = _ScriptedChat([
+        {"tool_call": {"name": "search_frames", "query": "first"}},
+        {"tool_call": {"name": "search_frames", "query": "residual-1"}},
+        {"tool_call": {"name": "search_frames", "query": "residual-2"}},
+    ])
+    result = DecisionLoop(
+        chat, tools={"search_frames": lambda query: called.append(query) or []},
+        max_tool_rounds=1).decide("world_state_updated", _state())
+    assert result.action == "GOTO_INSTANCE"
+    assert result.target_id == "1"
+    assert result.validation == "forced_after_tool_limit"
+    assert result.tool_calls == 1
+    assert called == ["first"]
 
 
 def test_goto_accepts_any_unreported_instance():
@@ -125,17 +223,26 @@ def test_verify_and_reject_are_not_actions():
     for removed in ("VERIFY", "REJECT"):
         chat = _ScriptedChat([
             {"action": removed},
-            {"action": "EXPLORE"},
+            {"action": "GOTO_FRONTIER", "target_id": "f0"},
         ])
         result = DecisionLoop(chat).decide("world_state_updated", _state())
-        assert result.action == "EXPLORE"
+        assert result.action == "GOTO_FRONTIER"
 
 
 def test_arrival_actions_are_report_scan_or_explore():
-    for action in ("REPORT_FOUND", "SCAN", "EXPLORE"):
+    for action in ("REPORT_FOUND", "SCAN"):
+        target_id = "1" if action == "REPORT_FOUND" else None
         result = DecisionLoop(_ScriptedChat([
-            {"action": action}])).decide("arrival", _state())
+            {"action": action, "target_id": target_id}])).decide(
+                "arrival", _state())
         assert result.action == action
+    # EXPLORE 已从动作集移除：会被拒绝并走重试
+    chat = _ScriptedChat([
+        {"action": "EXPLORE"},
+        {"action": "SCAN"},
+    ])
+    result = DecisionLoop(chat).decide("arrival", _state())
+    assert result.action == "SCAN"
 
 
 def test_arrival_can_choose_another_instance_or_frontier():
@@ -163,10 +270,10 @@ def test_vlm_explicitly_controls_adjustment_state_transitions():
 def test_atomic_motion_is_rejected_outside_adjustment():
     chat = _ScriptedChat([
         {"action": "MOVE_FORWARD"},
-        {"action": "EXPLORE"},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
     ])
     result = DecisionLoop(chat).decide("world_state_updated", _state())
-    assert result.action == "EXPLORE"
+    assert result.action == "GOTO_FRONTIER"
 
 
 def test_adjustment_rejects_high_level_actions_until_end_adjust():
@@ -180,16 +287,39 @@ def test_adjustment_rejects_high_level_actions_until_end_adjust():
 
 def test_scan_complete_reselects_globally_instead_of_reporting():
     for action, target_id in (("GOTO_INSTANCE", "1"),
-                              ("GOTO_FRONTIER", "f0"),
-                              ("EXPLORE", None)):
+                              ("GOTO_FRONTIER", "f0")):
         result = DecisionLoop(_ScriptedChat([{
             "action": action, "target_id": target_id
         }])).decide("scan_complete", _state())
         assert result.action == action
+    # EXPLORE 已移除：被拒后重试
     chat = _ScriptedChat([
-        {"action": "REPORT_FOUND"}, {"action": "EXPLORE"}])
-    assert DecisionLoop(chat).decide(
-        "scan_complete", _state()).action == "EXPLORE"
+        {"action": "EXPLORE"},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
+    ])
+    result = DecisionLoop(chat).decide("scan_complete", _state())
+    assert result.action == "GOTO_FRONTIER"
+    # 白名单放宽后 scan_complete 也允许 REPORT_FOUND
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "REPORT_FOUND", "target_id": "1"}])).decide(
+            "scan_complete", _state())
+    assert result.action == "REPORT_FOUND"
+
+
+def test_report_found_requires_active_canonical_instance_id():
+    state = _state(instances=[
+        {"id": 1, "text": "basket", "reported": False},
+        {"id": 2, "text": "other basket", "reported": False},
+    ])
+    for invalid in (
+            {"action": "REPORT_FOUND"},
+            {"action": "REPORT_FOUND", "target_id": "2"}):
+        chat = _ScriptedChat([
+            invalid,
+            {"action": "REPORT_FOUND", "target_id": "1"},
+        ])
+        result = DecisionLoop(chat).decide("arrival", state)
+        assert result.action == "REPORT_FOUND" and result.target_id == "1"
 
 
 def test_generic_memory_tool_call():
@@ -211,35 +341,27 @@ def test_generic_memory_tool_call():
 
 
 def test_write_tool_refreshes_world_state_before_validation():
-    stale = _state(instances=[
-        {"id": 1, "text": "red cup on table", "reported": False},
-        {"id": 2, "text": "same red cup, other view", "reported": False},
-    ])
+    stale = _state(instances=[])
     fresh = _state(instances=[
-        {"id": 1, "text": "merged red cup", "reported": False},
+        {"id": 2, "text": "resolved red cup", "reported": False},
     ])
 
-    def merge_instances(instance_ids, text=""):
-        return {"id": 1, "text": text, "merged": list(instance_ids)}
+    def ground_target(query, frame_id=None, top_k=2):
+        return [{"instance_id": 2, "observation_id": 9,
+                 "association": "visual_relation"}]
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "merge_instances", "instance_ids": [1, 2],
-                       "text": "merged red cup"}},
-        # 合并后实例 2 已删除；基于旧状态的目标必须被拒绝
+        {"tool_call": {"name": "ground_target", "query": "red cup"}},
         {"action": "GOTO_INSTANCE", "target_id": "2"},
-        {"action": "GOTO_INSTANCE", "target_id": "1"},
     ])
     result = DecisionLoop(
-        chat, tools={"merge_instances": merge_instances}).decide(
+        chat, tools={"ground_target": ground_target}).decide(
             "world_state_updated", stale, state_fn=lambda: fresh)
-    assert result.action == "GOTO_INSTANCE" and result.target_id == "1"
+    assert result.action == "GOTO_INSTANCE" and result.target_id == "2"
     assert result.tool_calls == 1
-    # 重试 prompt 中应包含刷新后的 world-state（不再有实例 2 的文本）
-    retry_prompt = chat.calls[2][0]
+    retry_prompt = chat.calls[1][0]
     assert "World state after your write" in retry_prompt
-    assert "merged red cup" in retry_prompt
-    assert "same red cup, other view" not in retry_prompt.split(
-        "World state after your write")[-1]
+    assert "resolved red cup" in retry_prompt
 
 
 def test_write_tool_refreshes_topdown_map_image():
@@ -276,15 +398,15 @@ def test_topdown_map_is_prioritized_after_current_rgb():
 def test_failed_write_tool_does_not_refresh_state():
     calls = []
 
-    def merge_instances(instance_ids, text=""):
-        return {"error": "merge requires at least two existing instances"}
+    def ground_target(query, frame_id=None, top_k=2):
+        return {"error": "no valid pointing result"}
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "merge_instances", "instance_ids": [1, 9]}},
+        {"tool_call": {"name": "ground_target", "query": "basket"}},
         {"action": "GOTO_INSTANCE", "target_id": "1"},
     ])
     result = DecisionLoop(
-        chat, tools={"merge_instances": merge_instances}).decide(
+        chat, tools={"ground_target": ground_target}).decide(
             "world_state_updated", _state(),
             state_fn=lambda: calls.append(1) or _state())
     assert result.action == "GOTO_INSTANCE" and result.target_id == "1"
@@ -555,6 +677,15 @@ def test_world_state_summarizes_instances_beyond_k():
     assert state["instances_total"] == 36
     assert len(state["instances_omitted_ids"]) == 5
     assert state["reported_instance_ids"] == [reported.iid]
+    assert state["reported_instances"] == [{
+        "id": reported.iid,
+        "text": "already reported",
+        "observation_count": 1,
+        "report_claim_id": 1,
+    }]
+    assert state["report_claims"][0]["instance_id"] == reported.iid
+    assert all(row["observation_count"] == 1
+               for row in state["instances"])
     # 摘要按距离排序，最近的一定入选；reported 不在表中
     ids = [row["id"] for row in state["instances"]]
     assert 1 in ids and reported.iid not in ids
@@ -599,44 +730,11 @@ def test_omitted_instance_is_valid_goto_target():
     assert result.action == "GOTO_INSTANCE" and result.target_id == "42"
 
 
-def test_navagent_memory_tools_update_and_merge():
+def test_navagent_memory_tool_updates_canonical_instance():
     agent = _make_agent()
     a = agent.memory.add([0, 0, 0], "view A")
-    b = agent.memory.add([2, 0, 0], "view B")
     updated = agent._tool_update_instance(a.iid, "same basket, front view")
     assert updated["text"] == "same basket, front view"
-    merged = agent._tool_merge_instances([a.iid, b.iid], "one basket")
-    assert merged["id"] == a.iid and len(agent.memory.nodes) == 1
-
-
-def test_navagent_undo_merge_restores_originals():
-    agent = _make_agent()
-    a = agent.memory.add([0, 0, 0], "view A", evidence=[{"frame_id": 1}])
-    b = agent.memory.add([2, 0, 0], "view B", evidence=[{"frame_id": 2}])
-    agent._tool_merge_instances([a.iid, b.iid], "one basket")
-    assert len(agent.memory.nodes) == 1
-    out = agent._tool_undo_merge()
-    assert out["kept"]["text"] == "view A"
-    assert out["restored"][0]["text"] == "view B"
-    assert [n.iid for n in agent.memory.nodes] == [a.iid, b.iid]
-    assert list(agent.memory.get(a.iid).point) == [0, 0, 0]
-    assert agent.memory.get(b.iid).evidence == [{"frame_id": 2}]
-    assert "error" in agent._tool_undo_merge()
-
-
-def test_navagent_undo_merge_restores_removed_navigation_target():
-    agent = _make_agent()
-    a = agent.memory.add([0, 0, 0], "view A", candidate_id="ca")
-    b = agent.memory.add([2, 0, 0], "view B", candidate_id="cb")
-    agent.target_instance_id = b.iid
-    agent.target_point = np.asarray(b.point)
-    agent.target_candidate_id = b.candidate_id
-    agent._tool_merge_instances([a.iid, b.iid], "one basket")
-    assert agent.target_instance_id == a.iid
-    agent._tool_undo_merge()
-    assert agent.target_instance_id == b.iid
-    assert np.allclose(agent.target_point, b.point)
-    assert agent.target_candidate_id == "cb"
 
 
 def test_report_found_does_not_emit_duplicate_target_found():
@@ -646,44 +744,49 @@ def test_report_found_does_not_emit_duplicate_target_found():
     agent.target_instance_id = node.iid
     agent.target_point = np.asarray(node.point)
     before = agent._reported_count
-    action = agent._report_found()
+    action = agent._report_found(node.iid)
     assert action != int(Action.TARGET_FOUND)
     assert agent._reported_count == before
     assert agent.target_instance_id is None
 
 
-def test_undo_merge_never_revokes_report():
+def test_report_claim_records_supporting_observations_once():
     agent = _make_agent()
-    a = agent.memory.add([0, 0, 0], "A")
-    b = agent.memory.add([2, 0, 0], "B")
-    agent.memory.merge([a.iid, b.iid], "merged")
-    agent.memory.mark_reported(agent.memory.get(a.iid))
-    agent.memory.undo_merge()
-    assert agent.memory.get(a.iid).reported      # 已发生的报告不撤销
-    assert not agent.memory.get(b.iid).reported
+    node = agent.memory.add([0, 0, 0], "basket", candidate_id="c1")
+    claim = agent.memory.claim(node, step=42)
+    assert claim.instance_id == node.iid
+    assert claim.observation_ids == tuple(node.observation_ids)
+    assert node.reported and node.report_claim_id == claim.claim_id
+    assert agent.memory.claim(node, step=43) is None
+    assert len(agent.memory.report_claims) == 1
 
 
-def test_undo_merge_tool_refreshes_state():
-    stale = _state(instances=[
-        {"id": 1, "text": "merged cup", "reported": False}])
-    fresh = _state(instances=[
-        {"id": 1, "text": "cup view A", "reported": False},
-        {"id": 2, "text": "cup view B", "reported": False}])
-    calls = []
+def test_loop_closure_refreshes_observations_then_reselects_canonical_point():
+    agent = _make_agent()
+    first = agent.memory.new_observation(
+        [0, 0, 0], "chair front", evidence={"point_score": 0.2},
+        frame_id=1, candidate_id="c1")
+    node = agent.memory.create_instance(first)
+    second = agent.memory.new_observation(
+        [1, 0, 0], "chair side", evidence={"point_score": 0.9},
+        frame_id=2, candidate_id="c2")
+    agent.memory.attach_observation(node, second)
+    seen = []
 
-    def undo_merge():
-        calls.append(1)
-        return {"kept": {"id": 1}, "restored": [{"id": 2}]}
+    def resolve_candidates(candidate_ids):
+        seen.extend(candidate_ids)
+        return {
+            "c1": {"found": True, "point": [10, 0, 0]},
+            "c2": {"found": True, "point": [2, 0, 0]},
+        }
 
-    chat = _ScriptedChat([
-        {"tool_call": {"name": "undo_merge"}},
-        # 撤销后实例 2 才存在；校验必须基于刷新后的状态
-        {"action": "GOTO_INSTANCE", "target_id": "2"},
-    ])
-    result = DecisionLoop(chat, tools={"undo_merge": undo_merge}).decide(
-        "world_state_updated", stale, state_fn=lambda: fresh)
-    assert result.action == "GOTO_INSTANCE" and result.target_id == "2"
-    assert calls == [1]
+    agent.client = SimpleNamespace(resolve_candidates=resolve_candidates)
+    agent._refresh_memory_candidates([node.iid])
+    assert seen == ["c1", "c2"]
+    assert np.allclose(first.point, [10, 0, 0])
+    assert np.allclose(second.point, [2, 0, 0])
+    assert np.allclose(node.point, [2, 0, 0])
+    assert node.candidate_id == "c2"
 
 
 def _jpeg_bytes(size=(100, 100)):
@@ -692,14 +795,17 @@ def _jpeg_bytes(size=(100, 100)):
     return buffer.getvalue()
 
 
-class _FakeTextVLM:
+class _FakeResolverVLM:
     enabled = True
 
     def __init__(self, reply):
         self.reply = reply
         self.calls = []
 
-    def chat_text(self, prompt, images):
+    def set_trace_context(self, **kwargs):
+        pass
+
+    def chat_json(self, prompt, images, trace_kind="json"):
         self.calls.append((prompt, images))
         return self.reply
 
@@ -713,7 +819,11 @@ def _ingest_hit():
 
 def test_ingest_generates_instance_level_text():
     agent = _make_agent()
-    agent.vlm = _FakeTextVLM("a red ceramic cup beside the sink")
+    agent.vlm = _FakeResolverVLM({
+        "decision": "NEW", "instance_id": None,
+        "description": "a red ceramic cup beside the sink",
+        "reason": "first observation",
+    })
     agent.client = SimpleNamespace(
         get_candidate_evidence=lambda cid: ({"found": True}, b"overlay-jpeg"),
         get_frame_image=lambda fid: ({"found": True}, _jpeg_bytes()))
@@ -724,8 +834,7 @@ def test_ingest_generates_instance_level_text():
     prompt, images = agent.vlm.calls[0]
     assert "basket" in prompt          # 任务上下文进入描述 prompt
     assert "kitchen counter" in prompt  # 关键帧 caption 作为上下文
-    assert [name for name, _ in images] == \
-        ["pointing_overlay", "instance_crop"]
+    assert [name for name, _ in images] == ["new_observation"]
 
 
 def test_ingest_keeps_caption_text_when_vlm_unavailable():
@@ -736,7 +845,7 @@ def test_ingest_keeps_caption_text_when_vlm_unavailable():
         "a kitchen counter with several objects on it"
     # VLM 可用但调用失败：同样保留 caption 文本
     agent2 = _make_agent()
-    agent2.vlm = _FakeTextVLM(None)
+    agent2.vlm = _FakeResolverVLM(None)
     agent2.client = SimpleNamespace(
         get_candidate_evidence=lambda cid: ({"found": True}, b"x"),
         get_frame_image=lambda fid: ({"found": False}, b""))
@@ -747,7 +856,10 @@ def test_ingest_keeps_caption_text_when_vlm_unavailable():
 
 def test_ingest_does_not_redescribe_existing_instance():
     agent = _make_agent()
-    agent.vlm = _FakeTextVLM("new description")
+    agent.vlm = _FakeResolverVLM({
+        "decision": "NEW", "instance_id": None,
+        "description": "new description", "reason": "first",
+    })
     agent.client = SimpleNamespace(
         get_candidate_evidence=lambda cid: ({"found": True}, b"overlay-jpeg"),
         get_frame_image=lambda fid: ({"found": True}, _jpeg_bytes()))
@@ -756,6 +868,81 @@ def test_ingest_does_not_redescribe_existing_instance():
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
     assert len(agent.memory.nodes) == 1      # 同 candidate_id 只更新
     assert len(agent.vlm.calls) == 1         # 已有实例不重复生成
+
+
+def test_ingest_visual_relation_attaches_cross_frame_observation():
+    agent = _make_agent()
+    replies = [
+        {"decision": "NEW", "instance_id": None,
+         "description": "dark wooden chair", "reason": "first view"},
+        {"decision": "SAME", "instance_id": 1,
+         "description": "dark wooden chair, two views",
+         "reason": "same distinctive slatted back"},
+    ]
+
+    class SequencedVLM(_FakeResolverVLM):
+        def chat_json(self, prompt, images, trace_kind="json"):
+            self.calls.append((prompt, images))
+            return replies.pop(0)
+
+    agent.vlm = SequencedVLM(None)
+    agent.client = SimpleNamespace(
+        get_candidate_evidence=lambda cid:
+            ({"found": True}, f"overlay-{cid}".encode()),
+        get_frame_image=lambda fid: ({"found": False}, b""))
+    obs = SimpleNamespace(step_count=50)
+    first = _ingest_hit()
+    second = dict(first, frame_id=6, candidate_id="c6",
+                  point=[1.05, 2.02, 0.0], pixel=[14, 14])
+    agent._ingest_semantic_hits(obs, [first], select=False)
+    agent._ingest_semantic_hits(obs, [second], select=False)
+    assert len(agent.memory.nodes) == 1
+    node = agent.memory.nodes[0]
+    assert len(node.observation_ids) == 2
+    assert node.text == "dark wooden chair, two views"
+    assert [name for name, _ in agent.vlm.calls[1][1]] == \
+        ["new_observation", "candidate_instance_1"]
+
+
+def test_ingest_skips_identity_vlm_without_new_marked_photo():
+    agent = _make_agent()
+    agent.memory.add(
+        [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
+        candidate_id="c4")
+    agent.vlm = _FakeResolverVLM({
+        "decision": "SAME", "instance_id": 1,
+        "description": "same chair", "reason": "unsupported",
+    })
+    agent.client = SimpleNamespace(
+        get_candidate_evidence=lambda cid: ({"found": False}, b""),
+        get_frame_image=lambda fid: ({"found": False}, b""))
+    second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
+                  point=[1.05, 2.02, 0.0])
+    agent._ingest_semantic_hits(
+        SimpleNamespace(step_count=50), [second], select=False)
+    assert len(agent.memory.nodes) == 2
+    assert agent.vlm.calls == []
+
+
+def test_ingest_rejects_same_for_candidate_without_visual_evidence():
+    agent = _make_agent()
+    agent.memory.add(
+        [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
+        candidate_id="c4")
+    agent.vlm = _FakeResolverVLM({
+        "decision": "SAME", "instance_id": 1,
+        "description": "same chair", "reason": "unsupported",
+    })
+    agent.client = SimpleNamespace(
+        get_candidate_evidence=lambda cid:
+            ({"found": cid == "c6"}, b"new" if cid == "c6" else b""),
+        get_frame_image=lambda fid: ({"found": False}, b""))
+    second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
+                  point=[1.05, 2.02, 0.0])
+    agent._ingest_semantic_hits(
+        SimpleNamespace(step_count=50), [second], select=False)
+    assert len(agent.memory.nodes) == 2
+    assert len(agent.vlm.calls) == 1
 
 
 def test_wait_for_captions_logs_timeout_and_swallows_errors():
@@ -802,7 +989,7 @@ def test_navagent_search_instances_uses_vlm_keywords():
     assert all(not row["reported"] for row in rows)
 
 
-def test_navagent_look_instance_prefers_candidate_overlay():
+def test_navagent_view_instance_prefers_candidate_overlay():
     agent = _make_agent()
     node, _ = agent.memory.remember(
         [1, 2, 0], "red cup", frame_id=7, candidate_id="c7")
@@ -810,14 +997,14 @@ def test_navagent_look_instance_prefers_candidate_overlay():
         get_candidate_evidence=lambda candidate_id:
             ({"found": True}, b"overlay"),
         get_frame_image=lambda frame_id: ({"found": True}, b"frame"))
-    assert agent._tool_look_instance(node.iid) == b"overlay"
+    assert agent._tool_view_instance(node.iid) == b"overlay"
 
 
 if __name__ == "__main__":
     test_goto_accepts_any_unreported_instance()
     test_prompt_documents_action_effects_tool_returns_and_no_confidence()
-    test_search_captions_tool_call()
-    test_look_instance_attaches_instance_evidence_image()
+    test_search_frames_tool_call_uses_standard_result_envelope()
+    test_view_instance_attaches_labeled_instance_evidence_image()
     test_reported_instance_is_not_a_navigation_target()
     test_verify_and_reject_are_not_actions()
     test_arrival_actions_are_report_scan_or_explore()
@@ -844,17 +1031,18 @@ if __name__ == "__main__":
     test_world_state_summary_prefers_nearest_newest_relevant()
     test_world_state_truncates_instance_text()
     test_omitted_instance_is_valid_goto_target()
-    test_navagent_memory_tools_update_and_merge()
-    test_navagent_undo_merge_restores_originals()
-    test_navagent_undo_merge_restores_removed_navigation_target()
+    test_navagent_memory_tool_updates_canonical_instance()
     test_report_found_does_not_emit_duplicate_target_found()
-    test_undo_merge_never_revokes_report()
-    test_undo_merge_tool_refreshes_state()
+    test_report_claim_records_supporting_observations_once()
+    test_loop_closure_refreshes_observations_then_reselects_canonical_point()
     test_ingest_generates_instance_level_text()
     test_ingest_keeps_caption_text_when_vlm_unavailable()
     test_ingest_does_not_redescribe_existing_instance()
+    test_ingest_visual_relation_attaches_cross_frame_observation()
+    test_ingest_skips_identity_vlm_without_new_marked_photo()
+    test_ingest_rejects_same_for_candidate_without_visual_evidence()
     test_wait_for_captions_logs_timeout_and_swallows_errors()
     test_scan_flushes_tail_map_before_waiting_and_retrieving()
     test_navagent_search_instances_uses_vlm_keywords()
-    test_navagent_look_instance_prefers_candidate_overlay()
+    test_navagent_view_instance_prefers_candidate_overlay()
     print("decider tests passed")

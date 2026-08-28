@@ -213,15 +213,24 @@ class MappingServer:
         caption_api_model = os.environ.get("NAV_CAPTION_API_MODEL", "").strip()
         caption_api_url = (os.environ.get("NAV_CAPTION_API_URL")
                            or os.environ.get("NAV_VLM_API_URL", "")).strip()
+        # caption 走远端 API 不占 GPU，可并发消化积压（DashScope 按 QPS
+        # 限流，超限返回 429，网关会退避重试）；本地 vLLM 保持串行。
+        caption_workers = int(os.environ.get("NAV_CAPTION_WORKERS", "4"))
+        caption_thinking = os.environ.get(
+            "NAV_CAPTION_ENABLE_THINKING", "0").strip().lower() in {
+            "1", "true", "yes", "on"}
         if caption_api_model and caption_api_url:
             self.vllm_caption = VLLMGateway(
                 url=caption_api_url,
                 api_key=(os.environ.get("NAV_CAPTION_API_KEY")
                          or os.environ.get("NAV_VLM_API_KEY", "")),
                 trace_fn=lambda record: self._diag_write(
-                    {"cmd": "vlm_call", **record}))
+                    {"cmd": "vlm_call", **record}),
+                workers=caption_workers,
+                enable_thinking=caption_thinking)
             print(f"[server] caption 走独立 API: {caption_api_model} @ "
-                  f"{caption_api_url}", flush=True)
+                  f"{caption_api_url} (workers={caption_workers}, "
+                  f"thinking={caption_thinking})", flush=True)
         else:
             self.vllm_caption = None
         store_path = os.environ.get(
@@ -248,7 +257,9 @@ class MappingServer:
                 model=caption_model,
                 busy_fn=lambda: self.gpu_lock.locked()
                 or self.solver_lock.locked(),
-                result_fn=self._caption_diag_result)
+                result_fn=self._caption_diag_result,
+                workers=(caption_workers
+                         if self.vllm_caption is not None else 1))
             print("[server] caption worker 已启动 "
                   f"(model={caption_model})", flush=True)
         else:
@@ -526,6 +537,13 @@ class MappingServer:
             "enabled": self.caption_worker is not None,
             "frame_ids": [int(fid) for fid in self.caption_store.frame_ids],
         }
+
+    def get_captions(self, frame_ids):
+        """按 frame_id 批量取回 caption（决策层新关键帧编号通知用）。
+        未入库的帧跳过。"""
+        if self.caption_store is None:
+            return {"captions": []}
+        return {"captions": self.caption_store.get_captions(frame_ids)}
 
     def _collect_poses(self):
         """返回 (frame_ids, poses cam2world (N,4,4))，需持有 data_lock。"""
@@ -813,6 +831,111 @@ class MappingServer:
         """文本 -> caption 检索 + VLM pointing -> 3D 目标点。"""
         return self._ground_object_semantic(text, top_k)
 
+    def point_frame(self, frame_id, text):
+        """对指定关键帧直接 pointing + 3D 采样（跳过 caption 检索）。
+
+        决策层定帧 ground_target 的服务端实现：VLM 已通过 view_frame/
+        search_frames 选定帧，这里只做定位与实例化。
+        """
+        if self.pointer is None:
+            return {"results": [], "error": "semantic memory disabled"}
+        from torchvision.transforms.functional import to_pil_image
+
+        located = self._locate_frame(frame_id)
+        if located is None:
+            return {"results": [], "error": f"unknown frame_id {frame_id}"}
+        sid, idx = located
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            frame = submap.get_frame_at_index(idx)
+        pil = to_pil_image(frame)
+        fid = int(frame_id)
+        frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}_direct"
+        pts = self.pointer.point(pil, text, frame_key=frame_key)
+        results = []
+        for pt in pts:
+            resolved = self._resolve_point(sid, idx, fid, pt)
+            resolved["frame_id"] = fid
+            results.append(resolved)
+        self._diag_write({
+            "cmd": "point_frame", "text": text, "frame_id": fid,
+            "num_points": len(results),
+            "points": [{"pixel": list(pt["pixel"]),
+                        "point_score": pt["confidence"],
+                        "found": r.get("found", False)}
+                       for pt, r in zip(pts, results)],
+        })
+        return {"results": results}
+
+
+    def point_pixels(self, frame_id, text):
+        """仅指向：对指定关键帧 pointing，返回像素坐标，不做 3D 采样。
+
+        供决策层 point 工具使用；结果中的像素为原图坐标系。
+        """
+        if self.pointer is None:
+            return {"points": [], "error": "semantic memory disabled"}
+        from torchvision.transforms.functional import to_pil_image
+
+        located = self._locate_frame(frame_id)
+        if located is None:
+            return {"points": [], "error": f"unknown frame_id {frame_id}"}
+        sid, idx = located
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            frame = submap.get_frame_at_index(idx)
+        pil = to_pil_image(frame)
+        fid = int(frame_id)
+        frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}_direct"
+        pts = self.pointer.point(pil, text, frame_key=frame_key)
+        self._diag_write({
+            "cmd": "point_pixels", "text": text, "frame_id": fid,
+            "num_points": len(pts),
+            "points": [{"pixel": list(pt["pixel"]),
+                        "point_score": pt["confidence"]} for pt in pts],
+        })
+        return {"width": int(pil.size[0]), "height": int(pil.size[1]),
+                "points": [
+            {"pixel": [float(pt["pixel"][0]), float(pt["pixel"][1])],
+             "confidence": float(pt["confidence"]),
+             "bbox": pt.get("bbox")} for pt in pts]}
+
+    def instantiate_pixels(self, frame_id, pixels, normalized=True):
+        """按给定像素实例化：patch 深度采样 + 候选注册。
+
+        pixels: [[x, y], ...]；normalized=True 时为 0-1000 归一化坐标
+        （决策 VLM 与 harness 之间的统一坐标约定），按点云网格宽高换算。
+        """
+        located = self._locate_frame(frame_id)
+        if located is None:
+            return {"results": [], "error": f"unknown frame_id {frame_id}"}
+        sid, idx = located
+        fid = int(frame_id)
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            h, w = submap.pointclouds[idx].shape[:2]
+        results = []
+        for px in list(pixels or [])[:16]:
+            try:
+                x, y = float(px[0]), float(px[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if normalized:
+                x, y = x / 1000.0 * w, y / 1000.0 * h
+            x = min(max(x, 0.0), w - 1)
+            y = min(max(y, 0.0), h - 1)
+            pt = {"pixel": (x, y), "confidence": 1.0, "bbox": None}
+            resolved = self._resolve_point(sid, idx, fid, pt)
+            resolved["frame_id"] = fid
+            results.append(resolved)
+        self._diag_write({
+            "cmd": "instantiate_pixels", "frame_id": fid,
+            "num_points": len(results),
+            "points": [{"pixel": r.get("pixel"),
+                        "found": r.get("found", False)} for r in results],
+        })
+        return {"results": results}
+
     def _ground_object_semantic(self, text, top_k):
         """caption 检索 -> pointing -> patch 深度采样。
 
@@ -1081,6 +1204,9 @@ class MappingServer:
             return {"ok": True, **self.get_state()}, b""
         if cmd == "get_captioned_frame_ids":
             return {"ok": True, **self.get_captioned_frame_ids()}, b""
+        if cmd == "get_captions":
+            return {"ok": True, **self.get_captions(
+                header.get("frame_ids", []))}, b""
         if cmd == "set_episode":
             self._set_episode(header.get("episode_id"))
             return {"ok": True}, b""
@@ -1106,6 +1232,16 @@ class MappingServer:
         if cmd == "ground_object":
             return {"ok": True, **self.ground_object(
                 header["text"], int(header.get("top_k", 2)))}, b""
+        if cmd == "point_frame":
+            return {"ok": True, **self.point_frame(
+                int(header["frame_id"]), header["text"])}, b""
+        if cmd == "point_pixels":
+            return {"ok": True, **self.point_pixels(
+                int(header["frame_id"]), header["text"])}, b""
+        if cmd == "instantiate_pixels":
+            return {"ok": True, **self.instantiate_pixels(
+                int(header["frame_id"]), header.get("pixels", []),
+                bool(header.get("normalized", True)))}, b""
         if cmd == "resolve_candidate":
             return {"ok": True, **self.resolve_candidate(
                 header["candidate_id"])}, b""

@@ -52,7 +52,8 @@ def test_arrival_decision_goes_directly_to_vlm_without_grounding():
     agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
     agent._build_decider_input = lambda obs: ({"instances": [], "task": {}}, None)
     agent.decision_loop = SimpleNamespace(decide=lambda *a, **k:
-        DecisionResult("REPORT_FOUND", reason="current evidence is sufficient"))
+        DecisionResult("REPORT_FOUND", str(node.iid),
+                       reason="current evidence is sufficient"))
     result, action = agent._arrival_vlm_decision(_obs())
     assert result.action == "REPORT_FOUND"
     assert action is None
@@ -75,7 +76,7 @@ def test_adjustment_executes_one_vlm_motion_per_observation_then_resumes():
         "adjustment": [DecisionResult("MOVE_FORWARD"),
                        DecisionResult("END_ADJUST")],
         "arrival": [DecisionResult(
-            "REPORT_FOUND", reason="view is now sufficient")],
+            "REPORT_FOUND", str(node.iid), reason="view is now sufficient")],
     }
     decision_inputs = []
 

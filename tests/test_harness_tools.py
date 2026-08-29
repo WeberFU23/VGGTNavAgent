@@ -53,7 +53,9 @@ class _ScriptedChat:
 
 def _hit():
     return {"found": True, "point": [1.0, 2.0, 0.0], "text": "a basket",
-            "frame_id": 5, "candidate_id": "c5", "point_score": 0.9}
+            "frame_id": 5, "candidate_id": "c5", "point_score": 0.9,
+            "semantic_validation": {"valid": True, "confidence": 0.99,
+                                    "reason": "test fixture"}}
 
 
 # ---------------------------------------------------------------- 工具：notes
@@ -178,7 +180,7 @@ def test_ground_target_without_frame_retrieves_and_ingests_hits():
     rows = agent._tool_ground_target("basket")
     assert len(agent.memory.nodes) == 1
     node = agent.memory.nodes[0]
-    assert rows == [{"instance_id": node.iid, "observation_id": 1,
+    assert rows["instances"] == [{"instance_id": node.iid, "observation_id": 1,
                      "frame_id": 5, "confidence": 0.9,
                      "association": "new_without_visual_relation",
                      "reported": False}]
@@ -199,7 +201,7 @@ def test_ground_target_with_frame_skips_retrieval_and_uses_exact_frame():
             AssertionError("ground_object must not run for a fixed frame")))
     rows = agent._tool_ground_target("basket by the sink", frame_id=5)
     assert seen == [(5, "basket by the sink")]
-    assert rows[0]["frame_id"] == 5
+    assert rows["instances"][0]["frame_id"] == 5
 
 
 def test_ground_target_requires_observation_and_handles_errors():
@@ -212,7 +214,8 @@ def test_ground_target_requires_observation_and_handles_errors():
     assert "error" in agent._tool_ground_target("basket")
     agent.client = SimpleNamespace(
         ground_object=lambda text, top_k: [{"found": False}])
-    assert agent._tool_ground_target("basket") == []
+    assert agent._tool_ground_target("basket") == {
+        "instances": [], "semantic_rejections": []}
 
 
 def test_instantiate_points_uses_normalized_pixels_and_ingests():
@@ -227,10 +230,10 @@ def test_instantiate_points_uses_normalized_pixels_and_ingests():
     agent.client = SimpleNamespace(instantiate_pixels=instantiate_pixels)
     rows = agent._tool_instantiate_points(5, [[500, 500]], "basket")
     assert seen == [(5, [[500, 500]], True)]
-    assert rows[0]["instance_id"] == agent.memory.nodes[0].iid
-    assert rows[0]["observation_id"] == 1
-    assert rows[0]["association"] == "new_without_visual_relation"
-    assert rows[0]["frame_id"] == 5
+    assert rows["instances"][0]["instance_id"] == agent.memory.nodes[0].iid
+    assert rows["instances"][0]["observation_id"] == 1
+    assert rows["instances"][0]["association"] == "new_without_visual_relation"
+    assert rows["instances"][0]["frame_id"] == 5
     assert agent.memory.nodes[0].text == "a basket"
 
 
@@ -263,6 +266,49 @@ def test_instantiate_points_propagates_server_error():
             {"results": [], "error": "unknown frame_id 99"})
     out = agent._tool_instantiate_points(99, [[500, 500]], "basket")
     assert "error" in out
+
+
+def test_instantiation_semantic_validation_rejects_wrong_surface():
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(
+        step_count=50, episode_id="semantic-test")
+    hit = _hit()
+    hit.pop("semantic_validation")
+
+    class VLM:
+        enabled = True
+
+        def set_trace_context(self, **_kwargs):
+            pass
+
+        def chat_json(self, prompt, images, trace_kind=None):
+            assert "crosshair" in prompt.lower()
+            assert images == [("marked_instantiation", b"marked-jpeg")]
+            assert trace_kind == "instance_semantic_validation"
+            return {"valid": False, "confidence": 0.98,
+                    "reason": "crosshair center is on the wall"}
+
+    agent.vlm = VLM()
+    agent.client = SimpleNamespace(
+        instantiate_pixels=lambda *_args, **_kwargs: {"results": [hit]},
+        get_candidate_evidence=lambda _cid:
+            ({"found": True}, b"marked-jpeg"))
+    out = agent._tool_instantiate_points(5, [[500, 500]], "basket")
+    assert out["instances"] == []
+    assert out["semantic_rejections"][0]["valid"] is False
+    assert "wall" in out["semantic_rejections"][0]["reason"]
+    assert agent.memory.nodes == []
+
+
+def test_pointing_backend_error_code_reaches_decision_tool():
+    agent = _make_agent()
+    agent.client = SimpleNamespace(point_pixels=lambda *_args, **_kwargs: {
+        "points": [], "error_code": "POINTING_BACKEND_UNAVAILABLE",
+        "error": "connection refused"})
+    out = agent._tool_point_frame(7, "basket")
+    assert out == {"error": {
+        "code": "POINTING_BACKEND_UNAVAILABLE",
+        "message": "connection refused"}}
 
 
 def test_point_frame_returns_normalized_pixels():

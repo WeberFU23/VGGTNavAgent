@@ -50,7 +50,7 @@ pointing bbox 约束采样。
 |---|---|---|
 | `view_instance(instance_id)` | 返回 pointing evidence crop | 保留，证据图带可追踪 image label |
 | `SCAN` | 固定 12 步环视动作 | 保留为**动作**（改变朝向，不是纯信息工具），但不再有任何路径强制触发，VLM 自主决定何时环视 |
-| `START_ADJUST` | 事件内进入微调 | 保留名称：VLM 显式接管，进入有界离散动作模式（白名单 `MOVE_FORWARD/TURN_LEFT/TURN_RIGHT/END_ADJUST`，`NAV_ADJUST_MAX_STEPS` 上限不变）。**adjustment 期间禁止工具调用**：每轮只出动作+收新 RGB，保持反应式控制节奏 |
+| `START_ADJUST` | 事件内进入微调 | 保留名称：VLM 显式接管，进入有界离散动作模式（白名单 `MOVE_FORWARD/TURN_LEFT/TURN_RIGHT/LOOK_UP/LOOK_DOWN/END_ADJUST`，`NAV_ADJUST_MAX_STEPS` 上限不变）。`LOOK_UP/LOOK_DOWN` 是 benchmark 原生 30° 俯仰动作，默认只允许相对中性姿态 ±1 档并在退出时自动回正。**adjustment 期间禁止工具调用**：每轮只出动作+收新 RGB，保持反应式控制节奏 |
 
 ### 3.3 新增工具（本方案的核心）
 

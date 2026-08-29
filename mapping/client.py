@@ -237,7 +237,15 @@ class MappingClient:
         返回 [{found, point, point_score, frame_id, ...}]。"""
         resp, _ = self._request({"cmd": "ground_object", "text": text,
                                  "top_k": top_k})
-        return resp.get("results", [])
+        # Preserve server error_code/error so an inference outage cannot be
+        # mistaken for a legitimate empty pointing result.
+        return resp
+
+    def ground_object_pixels(self, text, top_k=2):
+        """caption 检索 + pointing，仅返回像素，不采样 3D。"""
+        resp, _ = self._request({"cmd": "ground_object_pixels", "text": text,
+                                 "top_k": top_k})
+        return resp
 
 
     def point_frame(self, frame_id, text):
@@ -258,6 +266,14 @@ class MappingClient:
         返回 {results: [{found, point, candidate_id, ...}]}。"""
         resp, _ = self._request({
             "cmd": "instantiate_pixels", "frame_id": int(frame_id),
+            "pixels": [[float(p[0]), float(p[1])] for p in (pixels or [])],
+            "normalized": bool(normalized)})
+        return resp
+
+    def prepare_pixels(self, frame_id, pixels, normalized=True):
+        """为像素生成视觉审核候选，但不做深度采样或 3D 注册。"""
+        resp, _ = self._request({
+            "cmd": "prepare_pixels", "frame_id": int(frame_id),
             "pixels": [[float(p[0]), float(p[1])] for p in (pixels or [])],
             "normalized": bool(normalized)})
         return resp

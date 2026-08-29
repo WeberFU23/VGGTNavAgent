@@ -15,12 +15,16 @@ except ImportError:
     _stub = types.ModuleType("benchmark_api")
 
     class Action(enum.IntEnum):
+        FINISH = 0
         STOP = 0
         MOVE_FORWARD = 1
         TURN_LEFT = 2
         TURN_RIGHT = 3
-        TARGET_FOUND = 4
-        FINISH = 5
+        LOOK_UP = 4
+        LOOK_DOWN = 5
+        TARGET_FOUND = 6
+        SUBTASK_STOP = 6
+        LEGACY_FINISH = 9
 
     _stub.Action = Action
     sys.modules["benchmark_api"] = _stub

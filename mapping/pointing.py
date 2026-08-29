@@ -23,6 +23,10 @@ import numpy as np
 
 from mapping.vllm_client import Priority, VLLMError
 
+
+class PointingBackendUnavailable(RuntimeError):
+    """The configured pointing inference service cannot serve requests."""
+
 VERIFY_PROMPT = """You are verifying a retrieval candidate for an embodied
 navigation agent. Target description: {goal_text}
 
@@ -107,10 +111,22 @@ class PointingGrounder:
         self.parse_retries = int(parse_retries)
         self.max_tokens = int(max_tokens)
 
+    def check_health(self, timeout=10.0):
+        """Fail fast unless the endpoint is reachable and model is loaded."""
+        try:
+            return self.gateway.healthcheck(self.model, timeout=timeout)
+        except VLLMError as exc:
+            raise PointingBackendUnavailable(str(exc)) from exc
+
     def verify_frame(self, pil_img, goal_text, frame_key=None):
         """诊断用条件化复核；模型持续非法输出时保守返回 match=False。"""
         prompt = VERIFY_PROMPT.format(goal_text=str(goal_text))
-        data = self._chat_checked(prompt, pil_img, frame_key, "verify")
+        try:
+            data = self._chat_checked(prompt, pil_img, frame_key, "verify")
+        except PointingBackendUnavailable:
+            # verify_frame is a legacy diagnostic API, not the production
+            # pointing/instantiation path. Keep its conservative contract.
+            data = None
         if data is None:
             return {"match": False, "checked_attributes": [],
                     "confidence": 0.0, "reason": "model output invalid"}
@@ -160,33 +176,41 @@ class PointingGrounder:
     def _point_molmo(self, pil_img, goal_text, frame_key, w, h):
         """Molmo pointing：纯文本 <point> 标签输出，无 bbox/confidence。"""
         prompt = MOLMO_POINT_PROMPT.format(goal_text=str(goal_text))
+        last_error = None
         for _ in range(self.parse_retries + 1):
             try:
                 text = self.gateway.chat(
                     self.model, prompt, [pil_img], kind="point",
                     cache_key=frame_key, priority=Priority.POINTING,
                     max_tokens=self.max_tokens)
-            except VLLMError:
+            except VLLMError as exc:
+                last_error = exc
                 continue
             out = _parse_molmo_points(text, w, h)
             if out or not re.search(r"<points?\b", str(text)):
                 # 解析到点，或模型明确没有输出任何 point 标签（即没有目标）
                 return out
+        if last_error is not None:
+            raise PointingBackendUnavailable(str(last_error)) from last_error
         return []
 
     def _chat_checked(self, prompt, pil_img, frame_key, kind):
         """调模型并解析 JSON；失败时带错误提示重试 parse_retries 次。"""
         retry_note = ""
+        last_error = None
         for _ in range(self.parse_retries + 1):
             try:
                 return self.gateway.chat_json(
                     self.model, prompt + retry_note, [pil_img], kind=kind,
                     cache_key=frame_key if not retry_note else None,
                     priority=Priority.POINTING, max_tokens=self.max_tokens)
-            except VLLMError:
+            except VLLMError as exc:
+                last_error = exc
                 retry_note = (
                     "\nYour previous output was not valid JSON. "
                     "Return exactly one JSON object and nothing else.")
+        if last_error is not None:
+            raise PointingBackendUnavailable(str(last_error)) from last_error
         return None
 
 

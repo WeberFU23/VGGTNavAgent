@@ -134,12 +134,44 @@ def test_adjustment_state_has_pose_target_collision_and_local_map():
     assert adjustment["previous_action"] == {
         "id": int(Action.MOVE_FORWARD), "name": "MOVE_FORWARD"}
     assert adjustment["collision"]["detected"] is True
+    assert adjustment["pitch_offset_steps"] == 0
+    assert adjustment["max_pitch_offset_steps"] == 1
     assert adjustment["local_topdown_map"]["attached"] is True
     image = Image.open(io.BytesIO(map_png))
     assert image.size == (20, 20)
     colors = {tuple(pixel) for pixel in np.asarray(image).reshape(-1, 3)}
     assert (40, 80, 220) in colors       # YOU
     assert (245, 145, 25) in colors      # active TARGET
+
+
+def test_adjustment_can_tilt_camera_and_auto_levels_before_resume():
+    agent = _make_agent()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"tilted-evidence")
+    agent._build_decider_input = lambda obs, **kwargs: (
+        {"instances": [], "task": {}, "step": obs.step_count}, None)
+    replies = {
+        "adjustment": [DecisionResult("LOOK_DOWN"),
+                       DecisionResult("END_ADJUST")],
+        "world_state_updated": [DecisionResult("SCAN")],
+    }
+    resumed_images = []
+
+    def decide(event, *args, **kwargs):
+        if event == "world_state_updated":
+            resumed_images.extend(kwargs.get("images") or [])
+        return replies[event].pop(0)
+
+    agent.decision_loop = SimpleNamespace(decide=decide, logger=None)
+    assert agent._start_adjustment(
+        _obs(step=200), "world_state_updated") == int(Action.LOOK_DOWN)
+    assert agent._adjust_pitch_steps == -1
+    # END_ADJUST first emits the inverse benchmark action; the original event
+    # resumes only after a fresh neutral-camera observation arrives.
+    assert agent._adjustment_action(_obs(step=201)) == int(Action.LOOK_UP)
+    assert agent._adjusting and agent._adjust_pitch_steps == 0
+    assert agent._adjustment_action(_obs(step=202)) == int(Action.TURN_LEFT)
+    assert not agent._adjusting
+    assert ("adjustment_direct_evidence", b"tilted-evidence") in resumed_images
 
 
 def test_active_exploration_refreshes_frontiers_after_end_adjust():

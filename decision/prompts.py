@@ -97,22 +97,29 @@ Perception and retrieval:
   Skip this tool when you can already see the target in a viewed frame
   and can read its pixel position yourself.
 - instantiate_points(frame_id, pixels_1000, label) ->
-  [{{instance_id, observation_id, frame_id, confidence, association,
-  reported}}]: turn pixel coordinates in ONE keyframe into observations and
-  automatically resolve them to canonical navigable instances. pixels_1000 is
+  {{instances: [{{instance_id, observation_id, frame_id, confidence,
+  association, reported}}], semantic_rejections: [...],
+  geometry_rejections: [...]}}: first ask a second VLM to audit the marked
+  RGB pixel, then resolve depth/3D only for accepted pixels. pixels_1000 is
   a list of [x, y]
   in the 0-1000 normalized space, taken from point_frame results or your
-  own reading of the frame; label is short instance text. Once you have SEEN a
-  matching object in a frame, instantiate it right away: only a
+  own reading of the frame; label is the full target description.
+  semantic_rejections are wrong-object marks; geometry_rejections are marks
+  with invalid or missing 3D depth. Once you have SEEN a matching
+  object in a frame, instantiate it right away: only a
   registered instance is navigable. Never try to walk toward an object
   that exists only in an image.
 - ground_target(query, frame_id=null, top_k=2) ->
-  [{{instance_id, observation_id, frame_id, confidence, association,
-  reported}}]: pointing, 3D instantiation and automatic entity resolution.
+  {{instances: [...], semantic_rejections: [...]}}: pointing, marked-image
+  2D semantic audit, 3D geometry validation and automatic entity resolution.
   When frame_id is supplied, it MUST use exactly that frame and performs no
   caption retrieval. Use this after view_frame confirms a target. Only when
   frame_id is null does it retrieve candidate frames automatically; use that
   mode when you do not know which frame matters.
+  If pointing infrastructure is unavailable, point_frame/ground_target returns
+  error code POINTING_BACKEND_UNAVAILABLE. This is not evidence that the target
+  is absent: inspect a retrieved frame and use your own pixel coordinates with
+  instantiate_points, or continue exploration.
 
 Instance memory:
 - search_instances(query, reported=null, top_k=10) -> compact rows: keyword
@@ -158,10 +165,13 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   needs refinement, or a small turn/step would reveal unseen space. Prefer
   it when no frontier or instance looks promising. During takeover tools
   are disabled: reply with exactly one of MOVE_FORWARD, TURN_LEFT,
-  TURN_RIGHT, END_ADJUST per turn; the action executes once, then you
-  receive a fresh RGB image. END_ADJUST as soon as the view or position is
-  sufficient. Never emit movement actions outside takeover, and never
-  START_ADJUST while already adjusting.
+  TURN_RIGHT, LOOK_UP, LOOK_DOWN, END_ADJUST per turn; the action executes
+  once, then you receive a fresh RGB image. LOOK_UP/LOOK_DOWN tilt the camera
+  by 30 degrees without moving the robot and are useful for high/low or
+  occluded targets. The harness bounds relative pitch and automatically
+  returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
+  as soon as the view or position is sufficient. Never emit movement actions
+  outside takeover, and never START_ADJUST while already adjusting.
 - REPORT_FOUND instance_id: report the active canonical instance you are
   currently standing next to. target_id is REQUIRED and must equal
   navigation.active_target.id.
@@ -178,7 +188,7 @@ observations have been collected, so retrieval tools will return nothing.
 SCAN to look around, or pick a frontier to move to first.
 
 Finally reply with exactly one JSON object and nothing else:
-  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT",
+  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
     "target_id": "<instance id for GOTO_INSTANCE/REPORT_FOUND, frontier id for GOTO_FRONTIER, otherwise null>",
     "reason": "short reason (log only)"}}"""
 
@@ -229,13 +239,17 @@ EVENT_GUIDANCE = {
         "ACTIVE star. It has no trajectory or occupancy-region coloring; blank "
         "pixels are not proof of free space. Read "
         "world_state.adjustment, especially current_pose, active_target, "
-        "previous_action, collision, and remaining-step information. A detected "
+        "previous_action, collision, pitch_offset_steps, and remaining-step "
+        "information. A detected "
         "collision means the previous forward action produced no motion; do not "
         "immediately repeat it. active_target "
         "may be null when adjustment was entered for local active exploration; "
         "in that case use fresh RGB and the local map to reveal nearby space, "
         "then END_ADJUST instead of attempting long-range travel. Choose: "
-        "MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, or END_ADJUST. Execute only one "
+        "MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN, or "
+        "END_ADJUST. Use LOOK_UP/LOOK_DOWN for vertical framing, not as a "
+        "substitute for changing viewpoint; stay within the pitch limit in "
+        "world_state.adjustment. Execute only one "
         "motion per observation. Choose END_ADJUST immediately when the "
         "view/position is sufficient or further adjustment is unsafe or unhelpful."),
 }

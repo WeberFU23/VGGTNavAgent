@@ -126,6 +126,43 @@ class VLLMGateway:
         with self._cache_lock:
             self._cache.clear()
 
+    def healthcheck(self, model=None, timeout=10.0, get_fn=None):
+        """Probe the OpenAI-compatible models endpoint before serving work.
+
+        This deliberately does not use the queued chat worker: startup must
+        fail fast when the endpoint is unreachable or the requested model is
+        not loaded, rather than turning every later pointing request into an
+        empty detection.
+        """
+        if get_fn is None:
+            import requests
+            get_fn = requests.get
+        base = self.url
+        if base.endswith("/chat/completions"):
+            base = base[:-len("/chat/completions")]
+        models_url = base.rstrip("/") + "/models"
+        try:
+            response = get_fn(
+                models_url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=float(timeout))
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            raise VLLMError(
+                f"pointing endpoint health check failed at {models_url}: {exc}"
+            ) from exc
+        loaded = [str(item.get("id")) for item in payload.get("data", [])
+                  if isinstance(item, dict) and item.get("id")]
+        requested = str(model or "").strip()
+        requested_aliases = {requested, os.path.basename(requested.rstrip("/"))}
+        loaded_aliases = set(loaded)
+        loaded_aliases.update(os.path.basename(item.rstrip("/")) for item in loaded)
+        if requested and requested_aliases.isdisjoint(loaded_aliases):
+            raise VLLMError(
+                f"pointing model {requested!r} is not loaded; available={loaded}")
+        return {"url": models_url, "models": loaded}
+
     def chat(self, model, prompt, images=None, *, kind="generic",
              cache_key=None, priority=Priority.POINTING, max_tokens=1024):
         """同步调用，返回模型文本输出。"""

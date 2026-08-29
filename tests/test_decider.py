@@ -260,11 +260,24 @@ def test_vlm_explicitly_controls_adjustment_state_transitions():
             "action": "START_ADJUST"
         }])).decide(event, _state())
         assert result.action == "START_ADJUST"
-    for action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "END_ADJUST"):
+    for action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
+                   "LOOK_DOWN", "END_ADJUST"):
         result = DecisionLoop(_ScriptedChat([{
             "action": action
         }])).decide("adjustment", _state())
         assert result.action == action
+
+
+def test_adjustment_pitch_actions_obey_configured_relative_limit():
+    state = _state()
+    state["adjustment"] = {
+        "pitch_offset_steps": 1, "max_pitch_offset_steps": 1}
+    chat = _ScriptedChat([
+        {"action": "LOOK_UP"},
+        {"action": "LOOK_DOWN"},
+    ])
+    result = DecisionLoop(chat).decide("adjustment", state)
+    assert result.action == "LOOK_DOWN"
 
 
 def test_atomic_motion_is_rejected_outside_adjustment():

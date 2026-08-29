@@ -32,6 +32,7 @@ decision_trace*.jsonl
 /remote_runs/
 /*_diagnostics_*.tar
 /diag_code_sync_*.tar
+.diagnostics/
 
 # ===== 数据文件 / 权重 =====
 /_benchmark_*/

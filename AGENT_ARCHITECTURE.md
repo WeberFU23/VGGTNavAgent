@@ -73,11 +73,11 @@ flowchart LR
    返回给决策 VLM 的坐标统一为 0-1000 归一化（x 向右、y 向下）；
 5. **instantiate_points(frame_id, pixels_1000, label)**：把 0-1000 归一化像素
    坐标变成可导航 3D 实例。`pixels_1000` 可来自 point_frame 工具，也可以是
-   VLM 看过帧图像后自己给出的坐标——已经看清目标时跳过 point_frame 直接实例化是
-   被鼓励的。服务端将坐标换算回帧像素后做 patch 深度采样（先按 VGGT
-   confidence 过滤再取中位数），恢复当前图优化坐标系中的 3D 点并注册
-   候选；每个有效结果先形成 Observation，再由 Entity Resolver 关联到
-   Canonical Instance；
+   VLM 看过帧图像后自己给出的坐标。流程严格分两阶段：先生成标记证据面板，
+   由 Decision VLM 审核十字中心是否落在目标表面；只有通过 2D 语义审核的像素
+   才进行 VGGT confidence 过滤、patch 深度采样和 3D 坐标恢复。深度无效的
+   候选进入 `geometry_rejections`；通过两阶段后才形成 Observation，再由
+   Entity Resolver 关联到 Canonical Instance；
 6. **ground_target(query, frame_id=null, top_k=2)**：pointing + 实例化的复合
    工具。传入 `frame_id` 时严格使用指定帧且不重新检索；仅在 `frame_id=null`
    时执行 caption 检索，供 VLM 不知道哪帧相关时使用；
@@ -189,8 +189,8 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 | `search_frames(query, top_k=5)` | `[{frame_id, score, caption}]`，只读 |
 | `view_frame(frame_id)` | 下一轮附加该关键帧原始 RGB，只读 |
 | `point_frame(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
-| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → Observation → canonical instance，返回 observation/instance ID 与关联结果，写 |
-| `ground_target(query, frame_id=null, top_k=2)` | 指定帧或自动检索后 pointing+实例化，并自动完成实体关联，写 |
+| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 2D 标记语义验证 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
+| `ground_target(query, frame_id=null, top_k=2)` | 指定帧走 2D 语义审核→3D 几何验证；自动检索模式保持兼容并在入库前做语义审核，随后完成实体关联，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
 | `get_instance(instance_id)` | 完整实例记录（无图像），只读 |
 | `view_instance(instance_id)` | 下一轮附加该实例证据图（pointing overlay 优先），只读 |
@@ -205,13 +205,19 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 伪造或直接改写 3D 坐标、路径代价和 `reported` 状态。写工具成功执行后，
 harness 重新生成 world-state 并随工具结果下发。
 
+semantic mapping server 启动时必须调用 `/v1/models` 探测 pointing endpoint，
+并确认 `NAV_POINTING_MODEL_PATH` 对应模型已加载；探测失败直接终止启动。
+运行中 endpoint 失效时，`point_frame`/`ground_target` 返回稳定错误码
+`POINTING_BACKEND_UNAVAILABLE`，不得降级成空 points/results。该错误只表示
+基础设施不可用，不构成“图中没有目标”的语义证据。
+
 ## 7. VLM 最终输出
 
 VLM 必须输出一个 JSON 对象：
 
 ```json
 {
-  "action": "GOTO_INSTANCE | GOTO_FRONTIER | REPORT_FOUND | SCAN | FINISH | START_ADJUST | END_ADJUST | MOVE_FORWARD | TURN_LEFT | TURN_RIGHT",
+  "action": "GOTO_INSTANCE | GOTO_FRONTIER | REPORT_FOUND | SCAN | FINISH | START_ADJUST | END_ADJUST | MOVE_FORWARD | TURN_LEFT | TURN_RIGHT | LOOK_UP | LOOK_DOWN",
   "target_id": "GOTO_INSTANCE/GOTO_FRONTIER/REPORT_FOUND 的目标 id，其他动作使用 null",
   "reason": "简短推理摘要，仅用于日志"
 }
@@ -225,7 +231,7 @@ VLM 必须输出一个 JSON 对象：
 | `arrival` | 同上 |
 | `scan_complete` | 同上 |
 | `finish_check` | `GOTO_INSTANCE`、`GOTO_FRONTIER`、`FINISH` |
-| `adjustment` | `MOVE_FORWARD`、`TURN_LEFT`、`TURN_RIGHT`、`END_ADJUST`（工具禁用） |
+| `adjustment` | `MOVE_FORWARD`、`TURN_LEFT`、`TURN_RIGHT`、`LOOK_UP`、`LOOK_DOWN`、`END_ADJUST`（工具禁用） |
 
 动作语义要点：
 
@@ -239,7 +245,10 @@ VLM 必须输出一个 JSON 对象：
 - `SCAN`：原地 360° 环视（12 次左转、四个采样视角），只能看到当前位置
   可见的东西，无法看到物体另一面，不能用于核实候选；
 - `START_ADJUST`：有界微调/主动观察，每轮一个原子动作，执行后收到新
-  RGB，默认最多 10 步（`NAV_ADJUST_MAX_STEPS`）；
+  RGB，默认最多 10 步（`NAV_ADJUST_MAX_STEPS`）。benchmark 原生支持的
+  `LOOK_UP/LOOK_DOWN` 每次改变俯仰 30°；相对中性姿态默认限制为 ±1 档
+  （`NAV_ADJUST_MAX_TILT_STEPS`），`END_ADJUST` 后 harness 自动逐步回正再
+  恢复导航，倾斜视角作为同一位置的现场观察证据保留；
 - `FINISH`：不可逆。many 模式数量不足时被 harness 拒绝并降级。
 
 `EXPLORE` 已从动作表移除（VLM 曾滥用一键探索）；探索应显式选

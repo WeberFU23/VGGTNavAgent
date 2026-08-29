@@ -12,7 +12,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mapping.pointing import PointingGrounder, sample_point_depth
+from mapping.pointing import (PointingBackendUnavailable, PointingGrounder,
+                              sample_point_depth)
 from mapping.vllm_client import VLLMError
 
 
@@ -97,7 +98,8 @@ def test_point_retries_on_invalid_json():
 def test_point_gives_up_after_retries():
     gw = _MockGateway(errors=[True, True])
     g = PointingGrounder(gw, model="qwen-7b", parse_retries=1)
-    assert g.point(_img(), "basket") == []
+    with pytest.raises(PointingBackendUnavailable):
+        g.point(_img(), "basket")
 
 
 def test_requires_model():

@@ -5,9 +5,9 @@ import sys
 import paramiko
 
 HOST = "connect.bjb1.seetacloud.com"
-PORT = 39359
+PORT = 31341
 USER = "root"
-PASS = "grryKuINrbKQ"
+PASS = "9fX4fBntQ4nW"
 
 
 def _rp(path):

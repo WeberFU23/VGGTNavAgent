@@ -265,13 +265,12 @@ class MappingServer:
         else:
             print("[server] WARNING: caption worker 未启动（缺 embedder 或 "
                   "NAV_CAPTION_MODEL_PATH）", flush=True)
-        try:
-            self.pointer = PointingGrounder(
-                self.vllm, model=os.environ.get("NAV_POINTING_MODEL_PATH", ""))
-            print("[server] pointing grounder 就绪", flush=True)
-        except RuntimeError as exc:
-            print(f"[server] WARNING: {exc}；pointing 不可用", flush=True)
-            self.pointer = None
+        self.pointer = PointingGrounder(
+            self.vllm, model=os.environ.get("NAV_POINTING_MODEL_PATH", ""))
+        health = self.pointer.check_health(timeout=float(os.environ.get(
+            "NAV_POINTING_HEALTH_TIMEOUT", "10")))
+        print("[server] pointing grounder 就绪: "
+              f"{health['url']} model={self.pointer.model}", flush=True)
 
     # ------------------------------------------------------------------
     # 帧输入与子图处理
@@ -831,6 +830,45 @@ class MappingServer:
         """文本 -> caption 检索 + VLM pointing -> 3D 目标点。"""
         return self._ground_object_semantic(text, top_k)
 
+    def ground_object_pixels(self, text, top_k):
+        """文本 -> caption 检索 + pointing，仅返回待审核像素。"""
+        if self.pointer is None or self.embedder is None:
+            return {"results": [], "error": "semantic memory disabled"}
+        from torchvision.transforms.functional import to_pil_image
+        results = []
+        for item in self.retrieve_captions(text, max(int(top_k),
+                                                     self.retrieve_top_k))["results"]:
+            fid = int(item["frame_id"])
+            located = self._locate_frame(fid)
+            if located is None:
+                continue
+            sid, idx = located
+            with self.data_lock:
+                submap = self.solver.map.get_submap(sid)
+                frame = submap.get_frame_at_index(idx)
+            pil = to_pil_image(frame)
+            frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}"
+            try:
+                pts = self.pointer.point(pil, text, frame_key=frame_key)
+            except Exception as exc:
+                from mapping.pointing import PointingBackendUnavailable
+                if isinstance(exc, PointingBackendUnavailable):
+                    return {"results": [],
+                            "error_code": "POINTING_BACKEND_UNAVAILABLE",
+                            "error": str(exc)[:300]}
+                raise
+            w, h = pil.size
+            for pt in pts:
+                x, y = pt["pixel"]
+                results.append({
+                    "found": True, "frame_id": fid,
+                    "pixel": [float(x) / w * 1000.0,
+                               float(y) / h * 1000.0],
+                    "point_score": float(pt["confidence"]),
+                    "bbox": pt.get("bbox"), "text": item.get("caption", text),
+                })
+        return {"results": results}
+
     def point_frame(self, frame_id, text):
         """对指定关键帧直接 pointing + 3D 采样（跳过 caption 检索）。
 
@@ -851,7 +889,15 @@ class MappingServer:
         pil = to_pil_image(frame)
         fid = int(frame_id)
         frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}_direct"
-        pts = self.pointer.point(pil, text, frame_key=frame_key)
+        try:
+            pts = self.pointer.point(pil, text, frame_key=frame_key)
+        except Exception as exc:
+            from mapping.pointing import PointingBackendUnavailable
+            if isinstance(exc, PointingBackendUnavailable):
+                return {"results": [],
+                        "error_code": "POINTING_BACKEND_UNAVAILABLE",
+                        "error": str(exc)[:300]}
+            raise
         results = []
         for pt in pts:
             resolved = self._resolve_point(sid, idx, fid, pt)
@@ -887,7 +933,15 @@ class MappingServer:
         pil = to_pil_image(frame)
         fid = int(frame_id)
         frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}_direct"
-        pts = self.pointer.point(pil, text, frame_key=frame_key)
+        try:
+            pts = self.pointer.point(pil, text, frame_key=frame_key)
+        except Exception as exc:
+            from mapping.pointing import PointingBackendUnavailable
+            if isinstance(exc, PointingBackendUnavailable):
+                return {"points": [],
+                        "error_code": "POINTING_BACKEND_UNAVAILABLE",
+                        "error": str(exc)[:300]}
+            raise
         self._diag_write({
             "cmd": "point_pixels", "text": text, "frame_id": fid,
             "num_points": len(pts),
@@ -936,6 +990,37 @@ class MappingServer:
         })
         return {"results": results}
 
+    def prepare_pixels(self, frame_id, pixels, normalized=True):
+        """仅准备视觉审核候选；审核通过后才允许解析 3D 深度。"""
+        located = self._locate_frame(frame_id)
+        if located is None:
+            return {"candidates": [], "error": f"unknown frame_id {frame_id}"}
+        sid, idx = located
+        fid = int(frame_id)
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            h, w = submap.pointclouds[idx].shape[:2]
+        candidates = []
+        for px in list(pixels or [])[:16]:
+            try:
+                x, y = float(px[0]), float(px[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if normalized:
+                x, y = x / 1000.0 * w, y / 1000.0 * h
+            x = min(max(x, 0.0), w - 1)
+            y = min(max(y, 0.0), h - 1)
+            meta = self._register_point_candidate(
+                sid, idx, fid, (x, y), None, 1.0)
+            candidates.append({
+                "candidate_id": meta["candidate_id"],
+                "frame_id": fid,
+                "pixel": [x, y],
+                "point_score": 1.0,
+                "bbox": meta.get("bbox"),
+            })
+        return {"candidates": candidates}
+
     def _ground_object_semantic(self, text, top_k):
         """caption 检索 -> pointing -> patch 深度采样。
 
@@ -966,7 +1051,15 @@ class MappingServer:
             frame_diag = {"frame_id": fid, "retrieve_score": item["score"],
                           "dump": dump_name, "points": []}
             frame_key = f"{self._current_episode or 'unknown'}_frame_{fid}"
-            pts = self.pointer.point(pil, text, frame_key=frame_key)
+            try:
+                pts = self.pointer.point(pil, text, frame_key=frame_key)
+            except Exception as exc:
+                from mapping.pointing import PointingBackendUnavailable
+                if isinstance(exc, PointingBackendUnavailable):
+                    return {"results": [],
+                            "error_code": "POINTING_BACKEND_UNAVAILABLE",
+                            "error": str(exc)[:300]}
+                raise
             if not pts:
                 entry["found"] = False
                 results.append(entry)
@@ -1110,6 +1203,18 @@ class MappingServer:
         overlay = rgb.copy()
         overlay[mask] = (0.45 * overlay[mask] +
                          0.55 * np.array([255, 32, 32])).astype(np.uint8)
+        # Keep the exact sampling location visible without covering a small
+        # object: a high-contrast crosshair is clearer to the verifier than a
+        # translucent patch alone.
+        px, py = (int(round(value)) for value in cand["pixel"])
+        radius = max(10, self.point_patch)
+        for thickness, color in ((5, (0, 0, 0)), (2, (255, 255, 0))):
+            cv2.line(overlay, (max(0, px - radius), py),
+                     (min(overlay.shape[1] - 1, px + radius), py),
+                     color, thickness, cv2.LINE_AA)
+            cv2.line(overlay, (px, max(0, py - radius)),
+                     (px, min(overlay.shape[0] - 1, py + radius)),
+                     color, thickness, cv2.LINE_AA)
         x0, y0, x1, y1 = np.asarray(cand["bbox"], dtype=int)
         h, w = overlay.shape[:2]
         margin = max(8, int(0.1 * max(x1 - x0, y1 - y0)))
@@ -1232,6 +1337,9 @@ class MappingServer:
         if cmd == "ground_object":
             return {"ok": True, **self.ground_object(
                 header["text"], int(header.get("top_k", 2)))}, b""
+        if cmd == "ground_object_pixels":
+            return {"ok": True, **self.ground_object_pixels(
+                header["text"], int(header.get("top_k", 2)))}, b""
         if cmd == "point_frame":
             return {"ok": True, **self.point_frame(
                 int(header["frame_id"]), header["text"])}, b""
@@ -1240,6 +1348,10 @@ class MappingServer:
                 int(header["frame_id"]), header["text"])}, b""
         if cmd == "instantiate_pixels":
             return {"ok": True, **self.instantiate_pixels(
+                int(header["frame_id"]), header.get("pixels", []),
+                bool(header.get("normalized", True)))}, b""
+        if cmd == "prepare_pixels":
+            return {"ok": True, **self.prepare_pixels(
                 int(header["frame_id"]), header.get("pixels", []),
                 bool(header.get("normalized", True)))}, b""
         if cmd == "resolve_candidate":

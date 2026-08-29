@@ -17,7 +17,8 @@ from decision.prompts import build_decision_prompt, build_final_decision_prompt
 
 ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND", "SCAN",
            "EXPLORE", "FINISH", "START_ADJUST", "END_ADJUST",
-           "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
+           "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
+           "LOOK_DOWN")
 
 DEFAULT_MAX_TOOL_ROUNDS = 7
 FINAL_ACTION_ATTEMPTS = 2
@@ -37,7 +38,8 @@ EVENT_ACTIONS = {
     "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
                       "SCAN", "FINISH", "START_ADJUST"},
     "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "FINISH"},
-    "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "END_ADJUST"},
+    "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
+                   "LOOK_DOWN", "END_ADJUST"},
 }
 
 class DecisionResult:
@@ -250,7 +252,8 @@ class DecisionLoop:
                     validation="forced_after_tool_limit",
                     tool_calls=tool_calls)
         for action in ("SCAN", "START_ADJUST", "FINISH", "END_ADJUST",
-                       "TURN_LEFT", "TURN_RIGHT", "MOVE_FORWARD"):
+                       "TURN_LEFT", "TURN_RIGHT", "MOVE_FORWARD", "LOOK_UP",
+                       "LOOK_DOWN"):
             if action in allowed:
                 return DecisionResult(
                     action, None,
@@ -381,7 +384,12 @@ class DecisionLoop:
                         (label, out), True)
             out = fn(**{k: v for k, v in tool_call.items() if k != "name"})
             if isinstance(out, dict) and "error" in out:
-                return self._tool_error(name, "TOOL_ERROR", out["error"])
+                error = out["error"]
+                if isinstance(error, dict):
+                    return self._tool_error(
+                        name, error.get("code", "TOOL_ERROR"),
+                        error.get("message", error))
+                return self._tool_error(name, "TOOL_ERROR", error)
             payload = {
                 "ok": True,
                 "tool": name,
@@ -402,6 +410,17 @@ class DecisionLoop:
         allowed = EVENT_ACTIONS.get(str(event))
         if allowed is not None and action not in allowed:
             return None, f"action {action!r} is invalid for event {event!r}"
+        if str(event) == "adjustment" and action in {"LOOK_UP", "LOOK_DOWN"}:
+            adjustment = world_state.get("adjustment", {})
+            offset = int(adjustment.get("pitch_offset_steps", 0) or 0)
+            max_offset = max(
+                0, int(adjustment.get("max_pitch_offset_steps", 1) or 0))
+            next_offset = offset + (1 if action == "LOOK_UP" else -1)
+            if abs(next_offset) > max_offset:
+                return None, (
+                    f"{action} would exceed the camera pitch limit "
+                    f"(+/-{max_offset} steps); reverse pitch or choose another "
+                    "action")
         target_id = data.get("target_id")
         if target_id is not None:
             target_id = str(target_id)

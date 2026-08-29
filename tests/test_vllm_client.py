@@ -16,16 +16,28 @@ from mapping.vllm_client import Priority, VLLMError, VLLMGateway
 
 
 class _FakeResponse:
-    def __init__(self, text="ok", status_code=200):
+    def __init__(self, text="ok", status_code=200, payload=None):
         self._text = text
         self.status_code = status_code
+        self._payload = payload
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self):
+        if self._payload is not None:
+            return self._payload
         return {"choices": [{"message": {"content": self._text}}]}
+
+
+def test_healthcheck_requires_requested_model():
+    gw = _gateway(lambda *a, **k: _FakeResponse(), start_worker=False)
+    get = lambda *a, **k: _FakeResponse(
+        payload={"data": [{"id": "molmo"}]})
+    assert gw.healthcheck("molmo", get_fn=get)["models"] == ["molmo"]
+    with pytest.raises(VLLMError, match="not loaded"):
+        gw.healthcheck("qwen", get_fn=get)
 
 
 def _gateway(post_fn, **kwargs):

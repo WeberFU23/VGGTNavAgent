@@ -59,6 +59,23 @@ Return exactly one JSON object:
 SAME must use an id from the candidate list. NEW and UNCERTAIN must use null."""
 
 
+INSTANCE_SEMANTIC_VALIDATION_PROMPT = """You validate a proposed 3D object
+instantiation for an embodied navigation agent.
+
+Target description: "{label}"
+
+The attached evidence panel contains the full keyframe and a zoomed crop. A
+yellow crosshair with a red center marks the exact image pixel whose depth was
+used. Decide whether the CROSSHAIR CENTER lies on the visible surface of an
+object matching the FULL target description. Nearby objects do not count. A
+marker on wall, floor, window, furniture behind the target, empty space,
+occlusion, or an ambiguous boundary must be rejected.
+
+Return exactly one JSON object:
+{{"valid":true or false, "confidence":0.0,
+  "reason":"short description of what is under the crosshair center"}}"""
+
+
 class NavAgent(MappingAgent):
     def __init__(self):
         super().__init__()
@@ -73,6 +90,8 @@ class NavAgent(MappingAgent):
         self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "2"))
         self.adjust_max_steps = max(1, int(os.environ.get(
             "NAV_ADJUST_MAX_STEPS", "10")))
+        self.adjust_max_tilt_steps = max(0, int(os.environ.get(
+            "NAV_ADJUST_MAX_TILT_STEPS", "1")))
         self.adjust_map_radius_m = max(1.0, float(os.environ.get(
             "NAV_ADJUST_MAP_RADIUS_M", "4.0")))
         # 唯一候选生成语义链路：caption 检索 + pointing + 3D instance memory
@@ -152,6 +171,9 @@ class NavAgent(MappingAgent):
         self._adjust_steps = 0
         self._adjust_source_event = None
         self._adjust_context_images = []
+        self._adjust_pitch_steps = 0
+        self._adjust_leveling = False
+        self._adjust_end_reason = None
         # Prevent START_ADJUST -> END_ADJUST -> START_ADJUST recursion within
         # one benchmark observation when the VLM repeats the same request.
         self._adjust_reentry_blocked_step = None
@@ -772,6 +794,44 @@ class NavAgent(MappingAgent):
         query = str(query or "").strip()
         if not query:
             return {"error": "query must not be empty"}
+        # A fixed-frame ground request can use the same pre-3D audit as the
+        # explicit point/instantiate tool. Keep the old combined RPC as a
+        # compatibility fallback for lightweight test doubles and old servers.
+        if (frame_id is not None
+                and hasattr(self.client, "point_pixels")
+                and hasattr(self.client, "prepare_pixels")):
+            points = self._tool_point_frame(int(frame_id), query)
+            if points.get("error"):
+                return points
+            return self._tool_instantiate_points(
+                int(frame_id), [p["pixel"] for p in points.get("points", [])],
+                query)
+        if (frame_id is None
+                and hasattr(self.client, "ground_object_pixels")
+                and hasattr(self.client, "prepare_pixels")):
+            try:
+                response = self.client.ground_object_pixels(
+                    query, top_k=(self.ground_top_k if top_k is None else int(top_k)))
+            except Exception as exc:
+                return {"error": str(exc)[:200]}
+            error = self._pointing_error(response)
+            if error:
+                return error
+            grouped = {}
+            for row in response.get("results") or []:
+                if row.get("found") and row.get("frame_id") is not None \
+                        and row.get("pixel"):
+                    grouped.setdefault(int(row["frame_id"]), []).append(
+                        row["pixel"])
+            merged = {"instances": [], "semantic_rejections": [],
+                      "geometry_rejections": []}
+            for fid, pixels in grouped.items():
+                out = self._tool_instantiate_points(fid, pixels, query)
+                if out.get("error"):
+                    return out
+                for key in merged:
+                    merged[key].extend(out.get(key) or [])
+            return merged
         try:
             limit = min(20, max(1, int(top_k)))
         except (TypeError, ValueError):
@@ -943,6 +1003,69 @@ class NavAgent(MappingAgent):
             "reported": bool(row.get("reported", False)),
         } for row in changed]
 
+    @staticmethod
+    def _pointing_error(response):
+        """Preserve a stable backend error code across mapping RPC/tools."""
+        if not isinstance(response, dict) or not response.get("error"):
+            return None
+        return {"error": {
+            "code": str(response.get("error_code") or "TOOL_ERROR"),
+            "message": str(response.get("error"))[:300],
+        }}
+
+    def _semantic_validate_hits(self, hits, label):
+        """Validate marked pixels with Decision VLM before memory insertion."""
+        accepted, rejected = [], []
+        target = str(label or self.target_text or "target object").strip()
+        for hit in hits:
+            existing = hit.get("semantic_validation")
+            if isinstance(existing, dict) and existing.get("valid") is True:
+                accepted.append(hit)
+                continue
+            candidate_id = hit.get("candidate_id")
+            reason = "semantic validation evidence unavailable"
+            response = None
+            payload = None
+            if candidate_id:
+                try:
+                    meta, payload = self.client.get_candidate_evidence(candidate_id)
+                    if not meta.get("found"):
+                        payload = None
+                        reason = str(meta.get("error") or reason)
+                except Exception as exc:
+                    reason = f"evidence request failed: {exc}"
+            vlm = getattr(self, "vlm", None)
+            if payload and vlm is not None and getattr(vlm, "enabled", False):
+                try:
+                    obs = self._last_observation
+                    vlm.set_trace_context(
+                        episode=str(getattr(obs, "episode_id", "")),
+                        step=int(getattr(obs, "step_count", 0) or 0),
+                        event="instance_semantic_validation")
+                    response = vlm.chat_json(
+                        INSTANCE_SEMANTIC_VALIDATION_PROMPT.format(label=target),
+                        [("marked_instantiation", payload)],
+                        trace_kind="instance_semantic_validation")
+                    reason = str(response.get("reason") or "")[:240]
+                except Exception as exc:
+                    reason = f"semantic validator unavailable: {exc}"
+            valid = isinstance(response, dict) and response.get("valid") is True
+            record = {
+                "candidate_id": candidate_id,
+                "frame_id": hit.get("frame_id"),
+                "pixel": hit.get("pixel"),
+                "valid": valid,
+                "confidence": (float(response.get("confidence", 0.0))
+                               if isinstance(response, dict) else 0.0),
+                "reason": reason,
+            }
+            hit["semantic_validation"] = record
+            if valid:
+                accepted.append(hit)
+            else:
+                rejected.append(record)
+        return accepted, rejected
+
     def _tool_ground_target(self, query, frame_id=None, top_k=None):
         """文本目标 -> pointing + 3D 实例化。
 
@@ -957,23 +1080,33 @@ class NavAgent(MappingAgent):
         try:
             if frame_id is not None:
                 response = self.client.point_frame(int(frame_id), query)
-                if response.get("error"):
-                    return {"error": str(response["error"])[:200]}
+                error = self._pointing_error(response)
+                if error:
+                    return error
                 results = response.get("results") or []
             else:
                 limit = self.ground_top_k if top_k is None else int(top_k)
                 limit = min(20, max(1, limit))
-                results = self.client.ground_object(query, top_k=limit)
+                response = self.client.ground_object(query, top_k=limit)
+                if isinstance(response, dict):
+                    error = self._pointing_error(response)
+                    if error:
+                        return error
+                    results = response.get("results") or []
+                else:  # compatibility with older clients/test doubles
+                    results = response
         except Exception as exc:
             return {"error": str(exc)[:200]}
         for row in results:
             row.setdefault("text", query)
         hits = [r for r in results if r.get("found")]
         if not hits:
-            return []
+            return {"instances": [], "semantic_rejections": []}
+        hits, rejected = self._semantic_validate_hits(hits, query)
         changed = self._ingest_semantic_hits(
             self._last_observation, hits, select=False) or []
-        return self._ground_rows(changed)
+        return {"instances": self._ground_rows(changed),
+                "semantic_rejections": rejected}
 
     def _tool_point_frame(self, frame_id, query):
         """调用 pointing 模型在指定关键帧定位描述目标；只返回像素坐标。
@@ -986,7 +1119,7 @@ class NavAgent(MappingAgent):
         except Exception as exc:
             return {"error": str(exc)[:200]}
         if resp.get("error"):
-            return {"error": str(resp["error"])[:200]}
+            return self._pointing_error(resp)
         w = float(resp.get("width") or 0)
         h = float(resp.get("height") or 0)
         points = []
@@ -1008,13 +1141,63 @@ class NavAgent(MappingAgent):
         if not isinstance(pixels_1000, (list, tuple)) or not pixels_1000:
             return {"error": "pixels_1000 must be a non-empty list of "
                              "[x, y] in 0-1000 normalized coordinates"}
+        # Two-stage path: first validate the marked RGB pixel, then resolve
+        # depth/3D only for semantically accepted candidates.
+        prepare = getattr(self.client, "prepare_pixels", None)
+        if prepare is not None:
+            try:
+                prepared = prepare(int(frame_id), pixels_1000, normalized=True)
+            except Exception as exc:
+                return {"error": str(exc)[:200]}
+            if prepared.get("error"):
+                return self._pointing_error(prepared)
+            candidates = prepared.get("candidates") or []
+            if not candidates:
+                return {"instances": [], "semantic_rejections": [],
+                        "geometry_rejections": []}
+            desc = str(label or "").strip()
+            hits = [{"found": True, "frame_id": row.get("frame_id"),
+                     "pixel": row.get("pixel"),
+                     "candidate_id": row.get("candidate_id"),
+                     "bbox": row.get("bbox"),
+                     "point_score": row.get("point_score", 1.0),
+                     "text": desc}
+                    for row in candidates]
+            hits, rejected = self._semantic_validate_hits(hits, desc)
+            if not hits:
+                return {"instances": [], "semantic_rejections": rejected,
+                        "geometry_rejections": []}
+            ids = [h.get("candidate_id") for h in hits if h.get("candidate_id")]
+            resolved = self.client.resolve_candidates(ids)
+            geometry_rejections = []
+            valid_hits = []
+            for hit in hits:
+                cid = str(hit.get("candidate_id"))
+                row = resolved.get(cid) or {}
+                if not row.get("found"):
+                    geometry_rejections.append({
+                        "candidate_id": cid, "frame_id": hit.get("frame_id"),
+                        "pixel": hit.get("pixel"), "reason":
+                        str(row.get("error") or "no valid 3D depth")[:240]})
+                    continue
+                hit.update(row)
+                hit["semantic_validation"] = {
+                    "candidate_id": cid, "frame_id": hit.get("frame_id"),
+                    "pixel": hit.get("pixel"), "valid": True,
+                    "confidence": 1.0, "reason": "pre-3D semantic audit passed"}
+                valid_hits.append(hit)
+            changed = self._ingest_semantic_hits(
+                self._last_observation, valid_hits, select=False) or []
+            return {"instances": self._ground_rows(changed),
+                    "semantic_rejections": rejected,
+                    "geometry_rejections": geometry_rejections}
         try:
             resp = self.client.instantiate_pixels(
                 int(frame_id), pixels_1000, normalized=True)
         except Exception as exc:
             return {"error": str(exc)[:200]}
         if resp.get("error"):
-            return {"error": str(resp["error"])[:200]}
+            return self._pointing_error(resp)
         results = resp.get("results") or []
         desc = str(label or "").strip()
         if desc:
@@ -1022,10 +1205,12 @@ class NavAgent(MappingAgent):
                 row.setdefault("text", desc)
         hits = [r for r in results if r.get("found")]
         if not hits:
-            return []
+            return {"instances": [], "semantic_rejections": []}
+        hits, rejected = self._semantic_validate_hits(hits, desc)
         changed = self._ingest_semantic_hits(
             self._last_observation, hits, select=False) or []
-        return self._ground_rows(changed)
+        return {"instances": self._ground_rows(changed),
+                "semantic_rejections": rejected}
 
     def _tool_get_agent_status(self):
         """覆盖/预算快照：服务端建图状态 + 最新 caption 帧号 + 实例计数。"""
@@ -1441,11 +1626,14 @@ class NavAgent(MappingAgent):
                 return result, int(Action.MOVE_FORWARD)
             return result, self._start_adjustment(
                 observation, source_event=event, context_images=images)
-        if result.action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"):
+        if result.action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT",
+                             "LOOK_UP", "LOOK_DOWN"):
             action_map = {
                 "MOVE_FORWARD": int(Action.MOVE_FORWARD),
                 "TURN_LEFT": int(Action.TURN_LEFT),
                 "TURN_RIGHT": int(Action.TURN_RIGHT),
+                "LOOK_UP": int(Action.LOOK_UP),
+                "LOOK_DOWN": int(Action.LOOK_DOWN),
             }
             return result, action_map[result.action]
         if result.action in ("GOTO_INSTANCE", "GOTO_FRONTIER"):
@@ -1468,6 +1656,9 @@ class NavAgent(MappingAgent):
         self._adjusting = True
         self._adjust_steps = 0
         self._adjust_source_event = str(source_event)
+        self._adjust_pitch_steps = 0
+        self._adjust_leveling = False
+        self._adjust_end_reason = None
         # Current RGB must be regenerated after every action. Preserve only
         # historical/context evidence across adjustment rounds.
         self._adjust_context_images = [
@@ -1498,6 +1689,10 @@ class NavAgent(MappingAgent):
             "max_steps": self.adjust_max_steps,
             "steps_remaining": max(
                 0, self.adjust_max_steps - self._adjust_steps),
+            "pitch_offset_steps": self._adjust_pitch_steps,
+            "pitch_offset_degrees": 30 * self._adjust_pitch_steps,
+            "max_pitch_offset_steps": self.adjust_max_tilt_steps,
+            "camera_leveling": self._adjust_leveling,
             "last_motion_failed": bool(self._last_motion_failed),
             "previous_action": {"id": previous_id, "name": previous_name},
             "collision": {
@@ -1541,9 +1736,20 @@ class NavAgent(MappingAgent):
 
     def _adjustment_action(self, observation):
         """Ask the VLM for exactly one atomic motion, then re-observe."""
+        if self._adjust_leveling:
+            if self._adjust_pitch_steps:
+                return self._level_adjustment_camera(observation)
+            reason = self._adjust_end_reason or "camera_leveled"
+            self._adjust_leveling = False
+            self._adjust_end_reason = None
+            return self._end_adjustment_and_resume(observation, reason)
         if self._adjust_steps >= self.adjust_max_steps:
             self._log_event(
                 f"adjustment safety limit reached ({self.adjust_max_steps})")
+            if self._adjust_pitch_steps:
+                self._adjust_leveling = True
+                self._adjust_end_reason = "safety_limit"
+                return self._level_adjustment_camera(observation)
             return self._end_adjustment_and_resume(observation, "safety_limit")
         result, action = self._decider_next(
             observation, "adjustment",
@@ -1551,18 +1757,62 @@ class NavAgent(MappingAgent):
             state_fn=lambda: self._adjustment_state(observation))
         if result is None:
             self._log_event("adjustment decision unavailable")
+            if self._adjust_pitch_steps:
+                self._adjust_leveling = True
+                self._adjust_end_reason = "unavailable"
+                return self._level_adjustment_camera(observation)
             return self._end_adjustment_and_resume(observation, "unavailable")
         if result.action == "END_ADJUST":
+            if self._adjust_pitch_steps:
+                # This is direct visual evidence captured at the current robot
+                # position. Keep it for the resumed arrival/global decision,
+                # then restore the neutral sensor pose before navigation.
+                evidence = self.vlm.encode_rgb(observation.rgb)
+                self._adjust_context_images = [
+                    (label, payload)
+                    for label, payload in self._adjust_context_images
+                    if label != "adjustment_direct_evidence"]
+                self._adjust_context_images.append(
+                    ("adjustment_direct_evidence", evidence))
+                self._adjust_leveling = True
+                self._adjust_end_reason = "vlm"
+                return self._level_adjustment_camera(observation, result)
             return self._end_adjustment_and_resume(observation, "vlm")
         if action is None:
             self._log_event(
                 f"adjustment produced no executable action: {result.action}")
             return self._end_adjustment_and_resume(observation, "invalid")
         self._adjust_steps += 1
+        if result.action == "LOOK_UP":
+            self._adjust_pitch_steps += 1
+        elif result.action == "LOOK_DOWN":
+            self._adjust_pitch_steps -= 1
         self._trace_adjustment_execution(observation, result, action)
         self._log_event(
             f"adjustment step {self._adjust_steps}/{self.adjust_max_steps}: "
             f"{result.action}")
+        return action
+
+    def _level_adjustment_camera(self, observation, result=None):
+        """Return one legal pitch action toward the neutral mapping pose."""
+        if not self._adjust_pitch_steps:
+            self._adjust_leveling = False
+            return self._end_adjustment_and_resume(
+                observation, self._adjust_end_reason or "camera_leveled")
+        if self._adjust_pitch_steps > 0:
+            action_name, action = "LOOK_DOWN", int(Action.LOOK_DOWN)
+            self._adjust_pitch_steps -= 1
+        else:
+            action_name, action = "LOOK_UP", int(Action.LOOK_UP)
+            self._adjust_pitch_steps += 1
+        self._adjust_steps += 1
+        trace_result = result or DecisionResult(
+            action_name, reason="automatic camera leveling",
+            validation="camera_leveling")
+        self._trace_adjustment_execution(observation, trace_result, action)
+        self._log_event(
+            f"adjustment camera leveling: {action_name}; "
+            f"pitch_offset_steps={self._adjust_pitch_steps}")
         return action
 
     def _end_adjustment_and_resume(self, observation, reason):
@@ -1573,6 +1823,9 @@ class NavAgent(MappingAgent):
         self._adjust_steps = 0
         self._adjust_source_event = None
         self._adjust_context_images = []
+        self._adjust_pitch_steps = 0
+        self._adjust_leveling = False
+        self._adjust_end_reason = None
         self._adjust_reentry_blocked_step = observation.step_count
         self._log_event(f"adjustment ended ({reason}); resume {source_event}")
 
@@ -1732,14 +1985,43 @@ class NavAgent(MappingAgent):
         # 环视期间的新关键帧可能还在 caption 队列里；先等语义记忆追上，
         # 否则紧接的检索会漏掉刚看到的场景（有界等待，超时继续）。
         self._wait_for_captions()
+        preflight_result = None
         try:
-            results = self.client.ground_object(
-                phrase, top_k=self.ground_top_k)
-            hits = [item for item in results if item.get("found")]
+            if (hasattr(self.client, "ground_object_pixels")
+                    and hasattr(self.client, "prepare_pixels")):
+                # Keep the periodic refresh on the same pre-3D audit path.
+                preflight_result = self._tool_ground_target(
+                    phrase, top_k=self.ground_top_k)
+                if preflight_result.get("error"):
+                    raise RuntimeError(
+                        str(preflight_result["error"])[:200])
+                hits = None
+            else:
+                response = self.client.ground_object(
+                    phrase, top_k=self.ground_top_k)
+                if isinstance(response, dict):
+                    error = self._pointing_error(response)
+                    if error:
+                        raise RuntimeError(error["error"]["message"])
+                    results = response.get("results") or []
+                else:
+                    results = response
+                hits = [item for item in results if item.get("found")]
         except Exception as exc:
             self._log_event(f"post-scan memory refresh failed: {exc}")
             hits = []
-        if hits:
+        if preflight_result is not None:
+            if preflight_result.get("semantic_rejections"):
+                self._log_event(
+                    "post-scan semantic validation rejected "
+                    f"{len(preflight_result['semantic_rejections'])} hits")
+            if not preflight_result.get("instances"):
+                self._no_hit_queries += 1
+        elif hits:
+            hits, rejected = self._semantic_validate_hits(hits, phrase)
+            if rejected:
+                self._log_event(
+                    f"semantic validation rejected {len(rejected)} post-scan hits")
             self._ingest_semantic_hits(observation, hits, select=False)
         else:
             self._no_hit_queries += 1

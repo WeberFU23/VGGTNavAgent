@@ -99,14 +99,14 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert "confidence" not in tail
 
 
-def test_default_tool_limit_is_seven_and_prompt_discloses_hard_limit():
+def test_default_tool_limit_is_fifteen_and_prompt_discloses_hard_limit():
     loop = DecisionLoop(_ScriptedChat([]))
-    assert loop.max_tool_rounds == 7
+    assert loop.max_tool_rounds == 15
     assert DecisionLoop(
-        _ScriptedChat([]), max_tool_rounds=99).max_tool_rounds == 7
+        _ScriptedChat([]), max_tool_rounds=99).max_tool_rounds == 15
     prompt = " ".join(loop._build_prompt(
         "world_state_updated", _state()).split())
-    assert "most 7 calls per decision" in prompt
+    assert "most 15 calls per decision" in prompt
     assert "HARD per-decision limit" in prompt
 
 
@@ -166,11 +166,11 @@ def test_tool_budget_disables_more_tools_and_forces_final_action():
     assert "tool_call is disabled after the hard limit" in chat.calls[2][0]
 
 
-def test_default_limit_executes_seven_tools_then_requests_final_action():
+def test_default_limit_executes_fifteen_tools_then_requests_final_action():
     called = []
     replies = [
         {"tool_call": {"name": "search_frames", "query": f"q{i}"}}
-        for i in range(7)
+        for i in range(15)
     ] + [{"action": "GOTO_FRONTIER", "target_id": "f0"}]
     chat = _ScriptedChat(replies)
     result = DecisionLoop(
@@ -178,11 +178,11 @@ def test_default_limit_executes_seven_tools_then_requests_final_action():
                      called.append(query) or []}).decide(
                          "world_state_updated", _state())
     assert result.action == "GOTO_FRONTIER"
-    assert result.tool_calls == 7
-    assert called == [f"q{i}" for i in range(7)]
-    assert "Tool usage: 1/7; 6 calls remain." in chat.calls[1][0]
-    assert "# FINAL ACTION ONLY" in chat.calls[7][0]
-    assert "7/7 calls have been used" in chat.calls[7][0]
+    assert result.tool_calls == 15
+    assert called == [f"q{i}" for i in range(15)]
+    assert "Tool usage: 1/15; 14 calls remain." in chat.calls[1][0]
+    assert "# FINAL ACTION ONLY" in chat.calls[15][0]
+    assert "15/15 calls have been used" in chat.calls[15][0]
 
 
 def test_repeated_residual_tool_calls_never_become_empty_action_fallback():

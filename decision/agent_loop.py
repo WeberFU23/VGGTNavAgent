@@ -20,7 +20,7 @@ ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND", "SCAN",
            "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
            "LOOK_DOWN")
 
-DEFAULT_MAX_TOOL_ROUNDS = 7
+DEFAULT_MAX_TOOL_ROUNDS = 15
 FINAL_ACTION_ATTEMPTS = 2
 
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
@@ -140,7 +140,8 @@ class DecisionLoop:
                        if remaining else
                        "\nThe hard tool-call limit has been reached."))
                 if tool_img:
-                    images = self._with_tool_image(images, *tool_img)
+                    for label, payload in tool_img:
+                        images = self._with_tool_image(images, label, payload)
                 if ok and state_fn is not None and \
                         str(tool_call.get("name") or "") in WRITE_TOOLS:
                     state, refreshed_map, has_map = self._refresh_context(
@@ -348,7 +349,10 @@ class DecisionLoop:
         return f"tool_{kind}_{safe or 'unknown'}"
 
     def _run_tool(self, tool_call):
-        """执行工具，返回 (统一 JSON, (image_label, bytes)|None, ok)。"""
+        """执行工具，返回 (统一 JSON, [(label, bytes)]|None, ok)。
+
+        工具返回 dict 中的 "_tool_images"（[[label, bytes], ...] 拒绝证据图）
+        会被弹出转交图像通道，不进入 JSON 反馈。"""
         name = str(tool_call.get("name") or "")
         fn = self.tools.get(name)
         if fn is None:
@@ -368,7 +372,7 @@ class DecisionLoop:
                     "result": {"instance_id": iid, "image_ref": label},
                 }
                 return (self._serialize_tool_feedback(payload),
-                        (label, out), True)
+                        [(label, out)], True)
             if name == "view_frame":
                 out = fn(tool_call.get("frame_id"))
                 if not out:
@@ -381,7 +385,7 @@ class DecisionLoop:
                     "result": {"frame_id": fid, "image_ref": label},
                 }
                 return (self._serialize_tool_feedback(payload),
-                        (label, out), True)
+                        [(label, out)], True)
             out = fn(**{k: v for k, v in tool_call.items() if k != "name"})
             if isinstance(out, dict) and "error" in out:
                 error = out["error"]
@@ -390,13 +394,17 @@ class DecisionLoop:
                         name, error.get("code", "TOOL_ERROR"),
                         error.get("message", error))
                 return self._tool_error(name, "TOOL_ERROR", error)
+            tool_images = None
+            if isinstance(out, dict):
+                tool_images = out.pop("_tool_images", None) or None
             payload = {
                 "ok": True,
                 "tool": name,
                 "state_changed": name in WRITE_TOOLS,
                 "result": out,
             }
-            return self._serialize_tool_feedback(payload), None, True
+            return (self._serialize_tool_feedback(payload),
+                    tool_images, True)
         except Exception as exc:
             return self._tool_error(name, "TOOL_EXCEPTION", exc)
 

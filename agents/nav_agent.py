@@ -66,14 +66,19 @@ Target description: "{label}"
 
 The attached evidence panel contains the full keyframe and a zoomed crop. A
 yellow crosshair with a red center marks the exact image pixel whose depth was
-used. Decide whether the CROSSHAIR CENTER lies on the visible surface of an
-object matching the FULL target description. Nearby objects do not count. A
-marker on wall, floor, window, furniture behind the target, empty space,
-occlusion, or an ambiguous boundary must be rejected.
+used; its pixel coordinate is ({pixel_x}, {pixel_y}) (x is horizontal, y is
+vertical, origin at top-left). Decide whether the CROSSHAIR CENTER lies on the
+visible surface of an object matching the FULL target description. Nearby
+objects do not count. A marker on wall, floor, window, furniture behind the
+target, empty space, occlusion, or an ambiguous boundary must be rejected.
 
 Return exactly one JSON object:
 {{"valid":true or false, "confidence":0.0,
-  "reason":"short description of what is under the crosshair center"}}"""
+  "reason":"short description of what is under the crosshair center"}}
+
+When valid=false, the reason MUST also describe where the target sits relative
+to the crosshair (e.g. "crosshair on the piano body; the bench is below and
+left of the crosshair") so the next attempt can shift the mark."""
 
 
 class NavAgent(MappingAgent):
@@ -129,7 +134,7 @@ class NavAgent(MappingAgent):
                         os.path.join(self.output_dir,
                                      "decision_trace.jsonl"))),
                     max_tool_rounds=int(os.environ.get(
-                        "NAV_DECIDER_MAX_TOOL_ROUNDS", "7")))
+                        "NAV_DECIDER_MAX_TOOL_ROUNDS", "15")))
             else:
                 print("[NavAgent] WARNING: NAV_DECIDER=vlm 但 VLM API 未配置，"
                       "回退规则决策")
@@ -790,48 +795,10 @@ class NavAgent(MappingAgent):
             self._events = self._events[-50:]
 
     def _tool_search_frames(self, query, top_k=5):
-        """决策层只读工具：caption 语义记忆检索。"""
+        """决策层只读工具：caption 语义记忆检索（纯检索，不 ground）。"""
         query = str(query or "").strip()
         if not query:
             return {"error": "query must not be empty"}
-        # A fixed-frame ground request can use the same pre-3D audit as the
-        # explicit point/instantiate tool. Keep the old combined RPC as a
-        # compatibility fallback for lightweight test doubles and old servers.
-        if (frame_id is not None
-                and hasattr(self.client, "point_pixels")
-                and hasattr(self.client, "prepare_pixels")):
-            points = self._tool_point_frame(int(frame_id), query)
-            if points.get("error"):
-                return points
-            return self._tool_instantiate_points(
-                int(frame_id), [p["pixel"] for p in points.get("points", [])],
-                query)
-        if (frame_id is None
-                and hasattr(self.client, "ground_object_pixels")
-                and hasattr(self.client, "prepare_pixels")):
-            try:
-                response = self.client.ground_object_pixels(
-                    query, top_k=(self.ground_top_k if top_k is None else int(top_k)))
-            except Exception as exc:
-                return {"error": str(exc)[:200]}
-            error = self._pointing_error(response)
-            if error:
-                return error
-            grouped = {}
-            for row in response.get("results") or []:
-                if row.get("found") and row.get("frame_id") is not None \
-                        and row.get("pixel"):
-                    grouped.setdefault(int(row["frame_id"]), []).append(
-                        row["pixel"])
-            merged = {"instances": [], "semantic_rejections": [],
-                      "geometry_rejections": []}
-            for fid, pixels in grouped.items():
-                out = self._tool_instantiate_points(fid, pixels, query)
-                if out.get("error"):
-                    return out
-                for key in merged:
-                    merged[key].extend(out.get(key) or [])
-            return merged
         try:
             limit = min(20, max(1, int(top_k)))
         except (TypeError, ValueError):
@@ -1042,14 +1009,23 @@ class NavAgent(MappingAgent):
                         episode=str(getattr(obs, "episode_id", "")),
                         step=int(getattr(obs, "step_count", 0) or 0),
                         event="instance_semantic_validation")
+                    px = hit.get("pixel") or (0, 0)
+                    try:
+                        pixel_x, pixel_y = int(round(float(px[0]))), \
+                            int(round(float(px[1])))
+                    except (TypeError, ValueError, IndexError):
+                        pixel_x, pixel_y = 0, 0
                     response = vlm.chat_json(
-                        INSTANCE_SEMANTIC_VALIDATION_PROMPT.format(label=target),
+                        INSTANCE_SEMANTIC_VALIDATION_PROMPT.format(
+                            label=target, pixel_x=pixel_x, pixel_y=pixel_y),
                         [("marked_instantiation", payload)],
                         trace_kind="instance_semantic_validation")
                     reason = str(response.get("reason") or "")[:240]
                 except Exception as exc:
                     reason = f"semantic validator unavailable: {exc}"
             valid = isinstance(response, dict) and response.get("valid") is True
+            evidence_label = f"reject_{candidate_id}_evidence" \
+                if candidate_id else None
             record = {
                 "candidate_id": candidate_id,
                 "frame_id": hit.get("frame_id"),
@@ -1058,7 +1034,11 @@ class NavAgent(MappingAgent):
                 "confidence": (float(response.get("confidence", 0.0))
                                if isinstance(response, dict) else 0.0),
                 "reason": reason,
+                "evidence_label": evidence_label,
             }
+            if not valid and payload and evidence_label:
+                # 拒绝证据图随工具反馈带回决策 VLM（修正闭环的视觉锚点）
+                record["_evidence_image"] = (evidence_label, payload)
             hit["semantic_validation"] = record
             if valid:
                 accepted.append(hit)
@@ -1105,8 +1085,23 @@ class NavAgent(MappingAgent):
         hits, rejected = self._semantic_validate_hits(hits, query)
         changed = self._ingest_semantic_hits(
             self._last_observation, hits, select=False) or []
+        tool_images = self._pop_rejection_images(rejected)
         return {"instances": self._ground_rows(changed),
-                "semantic_rejections": rejected}
+                "semantic_rejections": rejected,
+                "_tool_images": tool_images}
+
+    @staticmethod
+    def _pop_rejection_images(rejected):
+        """从 rejected 记录收集证据图（_evidence_image）为 _tool_images 列表。
+
+        _evidence_image 是 (label, jpeg_bytes)，不能进 JSON 反馈，由调用方
+        弹出转交给决策循环的图通道（agent_loop._run_tool）。"""
+        images = []
+        for rec in rejected or []:
+            img = rec.pop("_evidence_image", None)
+            if img:
+                images.append(img)
+        return images
 
     def _tool_point_frame(self, frame_id, query):
         """调用 pointing 模型在指定关键帧定位描述目标；只返回像素坐标。
@@ -1166,7 +1161,8 @@ class NavAgent(MappingAgent):
             hits, rejected = self._semantic_validate_hits(hits, desc)
             if not hits:
                 return {"instances": [], "semantic_rejections": rejected,
-                        "geometry_rejections": []}
+                        "geometry_rejections": [],
+                        "_tool_images": self._pop_rejection_images(rejected)}
             ids = [h.get("candidate_id") for h in hits if h.get("candidate_id")]
             resolved = self.client.resolve_candidates(ids)
             geometry_rejections = []
@@ -1190,7 +1186,8 @@ class NavAgent(MappingAgent):
                 self._last_observation, valid_hits, select=False) or []
             return {"instances": self._ground_rows(changed),
                     "semantic_rejections": rejected,
-                    "geometry_rejections": geometry_rejections}
+                    "geometry_rejections": geometry_rejections,
+                    "_tool_images": self._pop_rejection_images(rejected)}
         try:
             resp = self.client.instantiate_pixels(
                 int(frame_id), pixels_1000, normalized=True)
@@ -1210,7 +1207,8 @@ class NavAgent(MappingAgent):
         changed = self._ingest_semantic_hits(
             self._last_observation, hits, select=False) or []
         return {"instances": self._ground_rows(changed),
-                "semantic_rejections": rejected}
+                "semantic_rejections": rejected,
+                "_tool_images": self._pop_rejection_images(rejected)}
 
     def _tool_get_agent_status(self):
         """覆盖/预算快照：服务端建图状态 + 最新 caption 帧号 + 实例计数。"""
@@ -1422,6 +1420,13 @@ class NavAgent(MappingAgent):
                 "y_m": round(float(pose[1]) * scale, 3),
                 "yaw_deg": round(math.degrees(float(pose[2])), 1),
             } if pose is not None else None),
+            # 用"已入 submap 可检索的最大帧号"，而不是最新 feed 帧号：
+            # 最新帧可能还在关键帧缓冲/子图处理中，direct 查询会 unknown。
+            # 旧 server 不返回 last_available_frame_id 时回退 feed 帧号。
+            "current_frame_id": (
+                int(self._last_feed_info["last_available_frame_id"])
+                if self._last_feed_info.get("last_available_frame_id")
+                else self._last_feed_info.get("frame_id")),
             "active_target": active_target,
             "snapshot_age_steps": max(
                 0, int(observation.step_count) - int(self._last_frontier_step)),
@@ -1705,6 +1710,10 @@ class NavAgent(MappingAgent):
             "target_text": self.target_text,
             "active_target": navigation.get("active_target"),
             "current_pose": navigation.get("current_pose"),
+            "current_frame_id": (
+                int(self._last_feed_info["last_available_frame_id"])
+                if self._last_feed_info.get("last_available_frame_id")
+                else self._last_feed_info.get("frame_id")),
             "local_topdown_map": {
                 "attached": map_png is not None,
                 "radius_m": self.adjust_map_radius_m,

@@ -85,6 +85,11 @@ class MappingServer:
         self._closed = False
         self._server_socket = None
         self._frame_save_warned = False
+        # 已处理完 submap 的最大帧号：只有这些帧能被 _locate_frame 检索。
+        # 最新 feed 帧可能仍在 keyframe 缓冲/子图处理中，direct 查询会
+        # "unknown frame_id"，故决策层 current_frame_id 必须用它而不是
+        # feed 帧号。int 读写原子，与 num_frames 同风格不加锁。
+        self._last_available_frame_id = 0
 
         if not torch.cuda.is_available():
             raise RuntimeError("mapping server 需要可用的 CUDA GPU")
@@ -332,6 +337,7 @@ class MappingServer:
 
         return {
             "frame_id": int(self.num_frames),
+            "last_available_frame_id": int(self._last_available_frame_id or 0),
             "is_keyframe": bool(is_keyframe),
             "keyframe_reason": keyframe_reason,
             "frames_since_keyframe": (
@@ -368,6 +374,12 @@ class MappingServer:
             with self.data_lock:
                 self.solver.add_points(predictions)
                 self.solver.graph.optimize()
+                submap = self.solver.map.get_latest_submap()
+                if submap is not None:
+                    fids = submap.get_frame_ids()
+                    if fids:
+                        self._last_available_frame_id = max(
+                            int(f) for f in fids)
             self._enqueue_captions()
             del predictions
             torch.cuda.empty_cache()

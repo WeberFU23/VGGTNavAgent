@@ -274,6 +274,7 @@ def test_instantiation_semantic_validation_rejects_wrong_surface():
         step_count=50, episode_id="semantic-test")
     hit = _hit()
     hit.pop("semantic_validation")
+    hit["pixel"] = [640, 360]
 
     class VLM:
         enabled = True
@@ -283,6 +284,7 @@ def test_instantiation_semantic_validation_rejects_wrong_surface():
 
         def chat_json(self, prompt, images, trace_kind=None):
             assert "crosshair" in prompt.lower()
+            assert "pixel coordinate is (640, 360)" in prompt
             assert images == [("marked_instantiation", b"marked-jpeg")]
             assert trace_kind == "instance_semantic_validation"
             return {"valid": False, "confidence": 0.98,
@@ -297,7 +299,63 @@ def test_instantiation_semantic_validation_rejects_wrong_surface():
     assert out["instances"] == []
     assert out["semantic_rejections"][0]["valid"] is False
     assert "wall" in out["semantic_rejections"][0]["reason"]
+    # 拒绝证据图经 _tool_images 通道带回决策层（修正闭环视觉锚点）
+    assert out["_tool_images"] == [("reject_c5_evidence", b"marked-jpeg")]
     assert agent.memory.nodes == []
+
+
+def test_semantic_rejection_images_reach_decision_prompt():
+    """agent_loop 将 _tool_images 弹出 JSON 并附加到下一轮提示的图像通道。"""
+    import decision.agent_loop as loop_mod
+
+    seen_images = {}
+
+    class Chat:
+        def __init__(self):
+            self.prompts = []
+
+        def decide(self, event, state, state_fn, **kwargs):
+            return None  # 不实际调用
+
+    chat = Chat()
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent.target_text = "basket"
+    agent._target_mode = "all"
+    hit = _hit()
+    hit.pop("semantic_validation")
+
+    class VLM:
+        enabled = True
+
+        def set_trace_context(self, **_kwargs):
+            pass
+
+        def chat_json(self, prompt, images, trace_kind=None):
+            return {"valid": False, "confidence": 0.98,
+                    "reason": "mark on the floor"}
+
+    agent.vlm = VLM()
+    agent.client = SimpleNamespace(
+        instantiate_pixels=lambda *_args, **_kwargs: {"results": [hit]},
+        get_candidate_evidence=lambda _cid:
+            ({"found": True}, b"reject-jpeg"))
+
+    loop = loop_mod.DecisionLoop(
+        chat_fn=chat, tools={
+            "instantiate_points": agent._tool_instantiate_points})
+    payload, images, ok = loop._run_tool(
+        {"name": "instantiate_points", "frame_id": 5,
+         "pixels_1000": [[500, 500]], "label": "basket"})
+    assert ok
+    # 证据图不进 JSON
+    assert "_tool_images" not in payload
+    assert images == [("reject_c5_evidence", b"reject-jpeg")]
+    # 附加到图像通道：重复调用同 label 不累积
+    images2 = loop._with_tool_image(
+        list(images), "reject_c5_evidence", b"reject-jpeg-2")
+    assert len(images2) == 1
+    assert images2[0] == ("reject_c5_evidence", b"reject-jpeg-2")
 
 
 def test_pointing_backend_error_code_reaches_decision_tool():
@@ -389,6 +447,34 @@ def test_build_decider_input_skips_keyframes_when_server_is_old():
     obs = SimpleNamespace(step_count=50, max_steps=500, goal_text="x")
     state, _map = agent._build_decider_input(obs)
     assert "new_keyframes" not in state
+
+
+def test_build_decider_input_exposes_current_frame_id():
+    """最新已喂帧号进入 world state：逼近后可直接 view/instantiate。"""
+    agent = _make_agent()
+    agent.client = SimpleNamespace(
+        get_all_poses=lambda: (np.stack([np.eye(4)] * 3), [0, 1, 2]),
+        get_state=lambda: {"caption_pending": 0})
+    agent._last_feed_info = {"frame_id": 42, "busy": False}
+    obs = SimpleNamespace(step_count=50, max_steps=500, goal_text="x")
+    state, _map = agent._build_decider_input(obs)
+    assert state["navigation"]["current_frame_id"] == 42
+    # 无喂帧记录时安全置 None
+    agent._last_feed_info = {}
+    state, _map = agent._build_decider_input(obs)
+    assert state["navigation"]["current_frame_id"] is None
+    # 回归：最新 feed 帧可能尚未入 submap（异步处理），current_frame_id
+    # 必须用已可检索的 last_available_frame_id 而不是 feed 帧号，
+    # 否则 VLM 按提示词直接 instantiate_points 会 unknown frame_id。
+    agent._last_feed_info = {"frame_id": 131, "busy": False,
+                             "last_available_frame_id": 128}
+    state, _map = agent._build_decider_input(obs)
+    assert state["navigation"]["current_frame_id"] == 128
+    # 尚未处理完任何 submap（0）时回退 feed 帧号（旧 server 无此字段同理）
+    agent._last_feed_info = {"frame_id": 5, "busy": False,
+                             "last_available_frame_id": 0}
+    state, _map = agent._build_decider_input(obs)
+    assert state["navigation"]["current_frame_id"] == 5
 
 
 # ------------------------------------------------------ agent_loop：view_frame
@@ -491,6 +577,29 @@ def test_relaxed_event_whitelists():
 
 
 # ------------------------------------------------------------ get_captions
+def test_search_frames_is_pure_caption_retrieval_and_never_grounds():
+    """回归：_tool_search_frames 曾引用未定义 frame_id 抛 NameError，
+    导致决策层检索全断（远端 ep3 只选 frontier 零上报）。只读契约：
+    仅走 retrieve_captions，绝不触发 pointing/ground 路径。"""
+    agent = _make_agent()
+    retrieved = []
+    grounded = []
+    agent.client = SimpleNamespace(
+        retrieve_captions=lambda query, top_k=5: retrieved.append((query, top_k))
+        or [{"frame_id": 7, "score": 0.8, "caption": "bicycle in hallway"}],
+        # 若误走遗留 ground 分支，旧代码会因未定义 frame_id 抛 NameError，
+        # 或经 ground_object_pixels 触发这些调用。
+        point_pixels=lambda *a, **k: grounded.append("point_pixels") or {"points": []},
+        prepare_pixels=lambda *a, **k: grounded.append("prepare_pixels") or {},
+        ground_object_pixels=lambda *a, **k: grounded.append("ground_object_pixels")
+        or {"results": []},
+    )
+    out = agent._tool_search_frames("bicycle bike cycle wheel", top_k=5)
+    assert retrieved == [("bicycle bike cycle wheel", 5)]
+    assert grounded == []
+    assert out == [{"frame_id": 7, "score": 0.8, "caption": "bicycle in hallway"}]
+
+
 def test_caption_store_get_captions_skips_missing():
     store = CaptionStore()
     store.add(3, None, "a kitchen", np.ones(8, dtype=np.float32))

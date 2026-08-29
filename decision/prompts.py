@@ -33,7 +33,9 @@ FINISH is irreversible: the episode ends immediately.
    - frontiers: reachable exploration candidates, each {{id, path_cost_m}};
      path_cost_m is the precomputed path length in meters — smaller means
      closer.
-   - navigation: current_pose (x, y, yaw) and active_target.
+   - navigation: current_pose (x, y, yaw), current_frame_id (the frame id
+     of the latest RGB just fed to the map server — the current view; usable
+     with view_frame and instantiate_points) and active_target.
    - notes: YOUR persistent working memory (see Memory below).
    - recent_actions: your last 3 high-level actions with outcomes
      (ok / collision / arrived).
@@ -104,11 +106,17 @@ Perception and retrieval:
   a list of [x, y]
   in the 0-1000 normalized space, taken from point_frame results or your
   own reading of the frame; label is the full target description.
-  semantic_rejections are wrong-object marks; geometry_rejections are marks
-  with invalid or missing 3D depth. Once you have SEEN a matching
-  object in a frame, instantiate it right away: only a
+  semantic_rejections are wrong-object marks: each carries the marked
+  evidence image (crosshair overlay showing exactly which pixel was
+  validated) and a reason telling where the target sits relative to the
+  crosshair. Retry by shifting pixels_1000 toward the target in that
+  image and calling instantiate_points again on the same frame.
+  geometry_rejections are marks with invalid or missing 3D depth. Once you
+  have SEEN a matching object in a frame, instantiate it right away: only a
   registered instance is navigable. Never try to walk toward an object
-  that exists only in an image.
+  that exists only in an image. If the object is far away or the evidence
+  image is too small to locate it precisely, START_ADJUST with MOVE_FORWARD
+  to get closer, then instantiate_points from the new view.
 - ground_target(query, frame_id=null, top_k=2) ->
   {{instances: [...], semantic_rejections: [...]}}: pointing, marked-image
   2D semantic audit, 3D geometry validation and automatic entity resolution.
@@ -172,6 +180,12 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
   as soon as the view or position is sufficient. Never emit movement actions
   outside takeover, and never START_ADJUST while already adjusting.
+  To land a reliable click on a distant or unclear target, START_ADJUST
+  with MOVE_FORWARD to approach it directly: the closer view makes the
+  target larger in the next frame, so your pixel coordinate (or a follow-up
+  instantiate_points) is much more accurate. After END_ADJUST the newest
+  view is navigation.current_frame_id: view it, read the target's pixel
+  position, and call instantiate_points(current_frame_id, pixels, label).
 - REPORT_FOUND instance_id: report the active canonical instance you are
   currently standing next to. target_id is REQUIRED and must equal
   navigation.active_target.id.

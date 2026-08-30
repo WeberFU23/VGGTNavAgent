@@ -167,6 +167,11 @@ class NavAgent(MappingAgent):
         self._scan_images = []
         self.memory = InstanceMemory()
         self._reported_count = 0
+        # 评测采集（get_target_pool）只读锚点状态：世界系 (gps, compass)
+        # 在首个有效 act 观测记录一次；SLAM 侧锚点（重力对齐系中最早
+        # 关键帧位姿）在每次重规划时刷新，跟随回环对历史位姿的改写。
+        self._pool_world_anchor = None
+        self._pool_slam_anchor = None
         self._no_hit_queries = 0
         self._target_mode = "any"
         self._target_count = None
@@ -365,6 +370,7 @@ class NavAgent(MappingAgent):
             if self.align_R is None:
                 self.align_R = nav.gravity_alignment(
                     poses64, cam_up=nav.mount_compensated_cam_up())
+            self._update_pool_slam_anchor(poses64[0])
             grid = nav.OccupancyGrid.from_frame_points(
                 frames, self.align_R)
             if grid is None:
@@ -598,6 +604,7 @@ class NavAgent(MappingAgent):
                 goal_text=str(observation.goal_text or ""))
         self._target_mode = str(observation.target_mode or "any").lower()
         self._target_count = observation.target_count
+        self._capture_pool_world_anchor(observation)
         if self._last_motion_failed and \
                 observation.previous_action == int(Action.MOVE_FORWARD):
             if self.follower is not None and self.follower.anchor_frame >= 0:
@@ -709,6 +716,121 @@ class NavAgent(MappingAgent):
         point = np.asarray(point, dtype=np.float64)
         align_R = getattr(self, "align_R", None)
         return align_R.T @ point if align_R is not None else point
+
+    # ------------------------------------------------------------------
+    # 评测采集接口（只读旁路；benchmark 评测器在每步 act() 之后调用，
+    # 统计已实例化但未上报目标 U_t 与发现池质量）。不写任何导航/
+    # 决策状态，不发起网络/磁盘 IO，不改变 act() 行为。
+    # ------------------------------------------------------------------
+    def _capture_pool_world_anchor(self, observation):
+        """记录 episode 首个有效 (gps, compass) 作为世界系锚点。
+
+        gps 为 habitat 世界系绝对位置（米，y-up）；compass 为绕世界
+        +Y 的右手 yaw（弧度），compass=0 时 agent 面向世界 -Z（与
+        evaluation/main/evaluator.py 的 _agent_compass 四元数转 yaw
+        约定一致）。只写 _pool_world_anchor，不影响其他状态。
+        """
+        if self._pool_world_anchor is not None:
+            return
+        gps = getattr(observation, "gps", None)
+        compass = getattr(observation, "compass", None)
+        if gps is None or compass is None:
+            return
+        try:
+            gps = np.asarray(gps, dtype=np.float64).reshape(-1)
+            compass = float(compass)
+        except (TypeError, ValueError):
+            return
+        if gps.size < 3 or not np.isfinite(gps[:3]).all() \
+                or not math.isfinite(compass):
+            return
+        self._pool_world_anchor = (gps[:3].copy(), compass)
+
+    def _update_pool_slam_anchor(self, first_pose):
+        """用最早关键帧位姿刷新 SLAM 侧锚点（重力对齐系，z-up）。
+
+        位姿来自调用方已有的 RPC 快照（本方法自身不做 IO）。每次
+        重规划刷新一次：回环改写历史位姿后，实例点与锚点仍处在
+        同一版 SLAM 坐标系里。
+        """
+        align_R = getattr(self, "align_R", None)
+        if align_R is None or first_pose is None:
+            return
+        try:
+            pose = np.asarray(first_pose, dtype=np.float64)
+            pos = align_R @ pose[:3, 3]
+            _x, _y, yaw = nav.pose_to_yaw_2d(pose, align_R)
+        except Exception:
+            return
+        if not np.isfinite(pos).all() or not math.isfinite(yaw):
+            return
+        self._pool_slam_anchor = (float(pos[0]), float(pos[1]),
+                                  float(pos[2]), float(yaw))
+
+    def _pool_metric_scale(self):
+        """地图单位 -> 米。无可靠估计返回 None（此时池坐标无意义）。"""
+        scale = self.calibrator.current_scale()
+        if scale is not None and math.isfinite(float(scale)) \
+                and float(scale) > 0:
+            return float(scale)
+        grid = getattr(self, "_frontier_grid", None)
+        unit_per_m = float(getattr(grid, "unit_per_m", 0.0) or 0.0)
+        if math.isfinite(unit_per_m) and unit_per_m > 0:
+            return 1.0 / unit_per_m
+        return None
+
+    def get_target_pool(self):
+        """评测采集接口：当前 episode 全部 canonical instance 的世界坐标。
+
+        契约（与 benchmark 评测器约定）：list[dict]，每项
+        {"position": [x, y, z], "reported": bool, "label": str}。
+        position 为 habitat 世界系坐标（米，y-up）；label 为
+        InstanceNode.text 截断 100 字符；包含已上报实例（reported
+        标志区分）。变换未建立（无锚点或无尺度）时返回 []，绝不
+        抛异常。每次调用现算（实例点随回环刷新），O(实例数)，无
+        任何网络/磁盘 IO。
+
+        坐标变换（近似相似变换，推导见 AGENT_ARCHITECTURE.md §12）：
+        对齐 SLAM 系为右手 z-up，habitat 世界系为右手 y-up；两者
+        水平面基序 (x_s, y_s) 与 (x_w, z_w) 手性相反，因此平面
+        映射是反射+旋转而非纯旋转：
+            ψ_w = atan2(−cos c0, −sin c0)   # 世界 forward 的平面角
+            α   = ψ_w + yaw_s0
+            dx, dy = p_xy − anchor_xy
+            wx = g0x + s·(cosα·dx + sinα·dy)
+            wy = g0y + s·(p_z − anchor_z)
+            wz = g0z + s·(sinα·dx − cosα·dy)
+        """
+        try:
+            world_anchor = getattr(self, "_pool_world_anchor", None)
+            slam_anchor = getattr(self, "_pool_slam_anchor", None)
+            if world_anchor is None or slam_anchor is None:
+                return []
+            scale = self._pool_metric_scale()
+            if scale is None:
+                return []
+            g0, compass0 = world_anchor
+            ax, ay, az, yaw_s0 = slam_anchor
+            psi_w = math.atan2(-math.cos(compass0), -math.sin(compass0))
+            alpha = psi_w + yaw_s0
+            cos_a, sin_a = math.cos(alpha), math.sin(alpha)
+            pool = []
+            for node in self.memory.nodes:
+                point = np.asarray(node.point, dtype=np.float64).reshape(-1)
+                if point.size < 3 or not np.isfinite(point[:3]).all():
+                    continue
+                dx, dy = point[0] - ax, point[1] - ay
+                wx = g0[0] + scale * (cos_a * dx + sin_a * dy)
+                wy = g0[1] + scale * (point[2] - az)
+                wz = g0[2] + scale * (sin_a * dx - cos_a * dy)
+                pool.append({
+                    "position": [float(wx), float(wy), float(wz)],
+                    "reported": bool(node.reported),
+                    "label": str(node.text or "")[:100],
+                })
+            return pool
+        except Exception:
+            return []
 
     def _refresh_memory_candidates(self, instance_ids=None):
         """回环后刷新 Observation 坐标，再重选 canonical 导航点。"""
@@ -2300,6 +2422,8 @@ class NavAgent(MappingAgent):
             self.align_R = nav.gravity_alignment(
                 np.asarray(poses, dtype=np.float64),
                 cam_up=nav.mount_compensated_cam_up())
+        self._update_pool_slam_anchor(
+            np.asarray(poses, dtype=np.float64)[order][0])
         scale = self.calibrator.current_scale()
         if self.follower is None:
             self.follower = nav.PathFollower(scale=scale, reach_m=self.reach_m)

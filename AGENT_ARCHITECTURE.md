@@ -312,3 +312,47 @@ VLM 必须输出一个 JSON 对象：
   但报告位置未满足 benchmark 近距离阈值；
 - 完整效果需要在真实模型、VGGT-SLAM 服务和 benchmark episode 上做闭环
   评测。
+
+## 12. 评测采集接口 `get_target_pool()`（只读旁路）
+
+benchmark 评测器在每步 `act()` 之后调用 `NavAgent.get_target_pool()`，
+统计"已实例化但未上报的目标"（U_t）与发现池质量。该接口是纯只读旁路：
+不写任何导航/决策状态，不复用也不影响 `NAV_ORACLE_GEOMETRY` 消融
+开关，不做网络/磁盘 IO，O(实例数)，每次调用现算（实例点随回环刷新，
+不缓存结果）。
+
+**契约**：`list[dict]`，每项 `{"position": [x, y, z], "reported": bool,
+"label": str}`。包含当前 episode 至今实例化过的所有 canonical
+instance（`self.memory.nodes`，含已上报的，`reported` 标志区分）；
+`position` 为 habitat 世界系坐标（米，y-up）；`label` 为
+`InstanceNode.text` 截断 100 字符。数据不可用（锚点或尺度未建立）时
+返回 `[]`，绝不抛异常。
+
+**坐标变换**（对齐 SLAM 系 → habitat 世界系的近似相似变换）：
+
+- 锚点：episode 首个 `act()` 中首个有效 `(gps, compass)` 记录一次
+  （`_capture_pool_world_anchor`）；SLAM 侧锚点为重力对齐系中最早
+  关键帧的位姿 `(x, y, z, yaw)`（`_update_pool_slam_anchor`，在
+  `_plan_exploration` / `_refresh_anchor` 用已有位姿快照每次重规划
+  刷新，跟随回环对历史位姿的改写）；
+- 尺度 s：`calibrator.current_scale()`（m/unit），缺失时回退
+  `_frontier_grid.unit_per_m` 的倒数，两者皆无则返回 `[]`；
+- 符号约定假设：compass 是绕世界 +Y 的右手 yaw，`compass=0` 时 agent
+  面向世界 −Z，forward = (−sin c, 0, −cos c)（与 benchmark
+  `evaluator._agent_compass` 的四元数转 yaw 一致）；对齐 SLAM 系为
+  右手 z-up。两手坐标系的水平面基序 (x_s, y_s) 与 (x_w, z_w) 手性
+  相反，因此平面映射是反射+旋转而非纯旋转：
+
+  ```
+  ψ_w = atan2(−cos c0, −sin c0)     # 世界 forward 在 (x_w, z_w) 平面的角
+  α   = ψ_w + yaw_s0
+  wx = g0x + s·(cosα·dx + sinα·dy)
+  wy = g0y + s·(pz − az)
+  wz = g0z + s·(sinα·dx − cosα·dy)
+  ```
+
+**近似误差来源**：SLAM 漂移随时间累积（晚实例化的点误差更大，锚点只
+在重规划时刷新）；尺度来自在线动作标定（撞墙/回环会污染）；首帧
+SLAM 位姿对应 step-0 观测、`pose_to_yaw_2d` 的相机 +Z 为朝向等假设
+若被服务端改动会破坏对齐；若发现系统性镜像/固定角度偏差，首要检查
+compass 符号约定。该接口只服务评测统计，不进入导航主路径。

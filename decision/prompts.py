@@ -105,28 +105,30 @@ Perception and retrieval:
   confidence}}]}}: ask the pointing model to locate the described object
   in ONE keyframe. Returns 0-1000 normalized pixel coordinates AND attaches
   a crosshair-marked evidence image (full frame + zoomed crop) for each
-  point — READ THOSE IMAGES and judge whether the crosshair lies on the
-  target before instantiating. Registers nothing. Skip this tool when you
+  point. Registers nothing. Skip this tool when you
   can already see the target in a viewed frame and can read its pixel
   position yourself.
+- review_crosshair(frame_id, pixel_1000, verdict, reason) ->
+  {{frame_id, pixel, verdict, instantiation_allowed}}: this is the REQUIRED
+  semantic gate for every pixel. First inspect its attached crosshair image,
+  then return exactly one verdict: ACCEPT only when the CROSSHAIR CENTER lies
+  on a visible object that matches the full task label; REJECT when it is on
+  background, wall, floor, a different object, or outside the object;
+  UNCERTAIN when the image cannot establish this. Never use ACCEPT based on
+  the caption, the pointing model's text, or a plausible nearby object.
 - instantiate_points(frame_id, pixels_1000, label) ->
   {{instances: [{{instance_id, observation_id, frame_id, confidence,
   association, reported}}], pending_confirmation: [...],
   geometry_rejections: [...]}}: register 3D instances at pixel coordinates.
   pixels_1000 is a list of [x, y] in the 0-1000 normalized space (from
   use_molmo_point results or your own reading of a viewed frame); label is
-  the full target description. Two-stage confirmation: pixels whose
-  crosshair evidence image you have NOT yet seen are returned as
+  the full target description. Pixels without crosshair evidence are returned as
   pending_confirmation with the marked image attached (crosshair overlay
-  showing exactly which pixel, plus a zoomed crop). Look at that image and
-  decide whether the CROSSHAIR CENTER lies on the visible surface of an
-  object matching the label. If yes, RESUBMIT THE SAME pixels_1000 on the
-  same frame to complete registration (semantic check then passes
-  automatically and only 3D depth validation remains). If the crosshair is
-  off the target, adjust pixels_1000 onto the actual surface and call
-  again; the new pixels get their own confirmation image. Pixels returned
-  by use_molmo_point are already confirmed once you have seen their images.
-  geometry_rejections are marks with invalid or missing 3D depth. Once you
+  showing exactly which pixel, plus a zoomed crop). After the image is shown,
+  call review_crosshair for the SAME pixel. Only an explicit ACCEPT allows a
+  later instantiate_points call to register 3D geometry. REJECT and UNCERTAIN
+  are semantic_rejections and must never be retried unchanged. geometry_rejections
+  are marks with invalid or missing 3D depth. Once you
   have SEEN a matching object in a frame, instantiate it right away: only a
   registered instance is navigable. Never try to walk toward an object
   that exists only in an image. If the object is far away or the evidence
@@ -294,8 +296,10 @@ EVENT_GUIDANCE = {
         "ACTIVE star. It has no trajectory or occupancy-region coloring; blank "
         "pixels are not proof of free space. Read "
         "world_state.adjustment, especially current_pose, active_target, "
-        "previous_action, collision, pitch_offset_steps, and remaining-step "
-        "information. A detected "
+        "previous_action, collision, pitch_offset_steps, and target_budget "
+        "information. target_budget is cumulative for this target across "
+        "all adjustment sessions: do not spend it on repeated turns or long "
+        "searches. A detected "
         "collision means the previous forward action produced no motion; do not "
         "immediately repeat it. active_target "
         "may be null when adjustment was entered for local active exploration; "

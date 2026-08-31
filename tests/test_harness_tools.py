@@ -219,12 +219,15 @@ def test_instantiate_points_unconfirmed_returns_pending_and_no_instances():
     assert agent.memory.nodes == []
 
 
-def test_instantiate_points_resubmit_same_pixels_confirms_and_ingests():
+def test_instantiate_points_accept_review_then_ingests():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _two_stage_client()
     first = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert first["instances"] == []
+    review = agent._tool_review_crosshair(
+        5, [637.1, 359.1], "ACCEPT", "crosshair center is on the basket")
+    assert review["instantiation_allowed"] is True
     second = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert "pending_confirmation" not in second
     assert "_tool_images" not in second      # 十字图已渲染过，不重复渲染
@@ -237,12 +240,34 @@ def test_instantiate_points_resubmit_same_pixels_confirms_and_ingests():
     assert agent.memory.nodes[0].text == "basket"
 
 
-def test_instantiate_points_rounding_within_tolerance_confirms():
-    """VLM 重发同坐标但四舍五入（±2）仍视为确认。"""
+def test_reject_or_uncertain_crosshair_never_instantiates():
+    for verdict in ("REJECT", "UNCERTAIN"):
+        agent = _make_agent()
+        agent._last_observation = SimpleNamespace(step_count=50)
+        agent.client = _two_stage_client()
+        agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+        review = agent._tool_review_crosshair(
+            5, [637.1, 359.1], verdict, "crosshair is not a clear basket")
+        assert review["instantiation_allowed"] is False
+        out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+        assert out["instances"] == []
+        assert out["semantic_rejections"][0]["verdict"] == verdict
+        assert agent.memory.nodes == []
+
+
+def test_crosshair_review_requires_shown_evidence():
+    agent = _make_agent()
+    out = agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
+    assert "error" in out
+
+
+def test_instantiate_points_rounding_within_tolerance_accepts_review():
+    """VLM 审核/重发同坐标但四舍五入（±2）仍匹配同一证据。"""
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _two_stage_client()
     agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
     out = agent._tool_instantiate_points(5, [[637, 359]], "basket")
     assert "pending_confirmation" not in out
     assert len(agent.memory.nodes) == 1
@@ -259,7 +284,8 @@ def test_instantiate_points_geometry_rejection_when_depth_invalid():
     client.resolve_candidates = lambda ids: {
         "c5": {"found": False, "error": "no valid depth"}}
     agent.client = client
-    agent._crosshair_confirmed.add((5, (637.1, 359.1)))   # 已看图确认
+    agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
     out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert out["instances"] == []
     assert "pending_confirmation" not in out
@@ -269,15 +295,17 @@ def test_instantiate_points_geometry_rejection_when_depth_invalid():
     assert agent.memory.nodes == []
 
 
-def test_molmo_confirmed_pixels_instantiate_without_pending():
-    """use_molmo_point 渲染并登记过的坐标可直接注册。"""
+def test_molmo_pixels_require_explicit_accept_before_instantiation():
+    """Molmo 十字图只提供审核证据，不能自动授予实例化权限。"""
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _two_stage_client()
-    agent._crosshair_confirmed.add((5, (637.1, 359.1)))
+    agent._record_crosshair_evidence(5, [637.1, 359.1])
+    pending = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    assert pending["instances"] == []
+    assert pending["pending_confirmation"]
+    agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
     out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
-    assert "pending_confirmation" not in out
-    assert "_tool_images" not in out
     assert len(agent.memory.nodes) == 1
 
 
@@ -295,35 +323,23 @@ def test_instantiate_points_requires_observation_and_handles_errors():
         "instances": [], "semantic_rejections": [], "geometry_rejections": []}
 
 
-def test_instantiate_points_uses_normalized_pixels_and_ingests():
+def test_instantiate_points_rejects_legacy_server_without_audit_path():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    seen = []
-
-    def instantiate_pixels(frame_id, pixels, normalized=True):
-        seen.append((frame_id, pixels, normalized))
-        return {"results": [_hit()]}
-
-    agent.client = SimpleNamespace(instantiate_pixels=instantiate_pixels)
+    agent.client = SimpleNamespace(instantiate_pixels=lambda *_a, **_k: {
+        "results": [_hit()]})
     rows = agent._tool_instantiate_points(5, [[500, 500]], "basket")
-    assert seen == [(5, [[500, 500]], True)]
-    assert rows["instances"][0]["instance_id"] == agent.memory.nodes[0].iid
-    assert rows["instances"][0]["observation_id"] == 1
-    assert rows["instances"][0]["association"] == "new_without_visual_relation"
-    assert rows["instances"][0]["frame_id"] == 5
-    assert agent.memory.nodes[0].text == "a basket"
+    assert "error" in rows
+    assert agent.memory.nodes == []
 
 
 def test_instantiate_points_label_becomes_initial_text():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    hit = _hit()
-    del hit["text"]
-    agent.client = SimpleNamespace(
-        instantiate_pixels=lambda fid, pixels, normalized=True:
-            {"results": [hit]})
-    agent._tool_instantiate_points(
-        5, [[500, 500]], "wooden chair by the table")
+    agent.client = _two_stage_client()
+    agent._tool_instantiate_points(5, [[500, 500]], "wooden chair by the table")
+    agent._tool_review_crosshair(5, [500, 500], "ACCEPT")
+    agent._tool_instantiate_points(5, [[500, 500]], "wooden chair by the table")
     assert agent.memory.nodes[0].text == "wooden chair by the table"
 
 
@@ -338,9 +354,7 @@ def test_instantiate_points_requires_pixels():
 def test_instantiate_points_propagates_server_error():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    agent.client = SimpleNamespace(
-        instantiate_pixels=lambda fid, pixels, normalized=True:
-            {"results": [], "error": "unknown frame_id 99"})
+    agent.client = SimpleNamespace()
     out = agent._tool_instantiate_points(99, [[500, 500]], "basket")
     assert "error" in out
 
@@ -386,7 +400,7 @@ def test_pointing_backend_error_code_reaches_decision_tool():
         "message": "connection refused"}}
 
 
-def test_use_molmo_point_returns_normalized_pixels_and_registers_crosshair():
+def test_use_molmo_point_returns_normalized_pixels_and_records_evidence():
     agent = _make_agent()
     agent.client = SimpleNamespace(
         point_pixels=lambda fid, text: {
@@ -399,8 +413,11 @@ def test_use_molmo_point_returns_normalized_pixels_and_registers_crosshair():
     assert out["points"] == [{"pixel": [500.0, 500.0], "confidence": 1.0}]
     # 十字证据图随结果返回，供 VLM 看图审核
     assert out["_tool_images"] == [("molmo_point_7_0", b"molmo-jpeg")]
-    # 渲染即登记：该坐标随后可直接 instantiate_points 注册（免 pending）
-    assert agent._crosshair_is_confirmed(7, [500.0, 500.0])
+    # 渲染只登记“已展示证据”，仍需要显式 ACCEPT 审核。
+    assert agent._find_crosshair_key(
+        7, [500.0, 500.0], agent._crosshair_evidence) is not None
+    assert agent._find_crosshair_key(
+        7, [500.0, 500.0], agent._crosshair_reviews) is None
 
 
 def test_use_molmo_point_skips_unrenderable_points():
@@ -416,7 +433,8 @@ def test_use_molmo_point_skips_unrenderable_points():
     out = agent._tool_use_molmo_point(7, "wooden chair")
     assert out["points"] == [{"pixel": [500.0, 500.0], "confidence": 1.0}]
     assert "_tool_images" not in out
-    assert not agent._crosshair_is_confirmed(7, [500.0, 500.0])
+    assert agent._find_crosshair_key(
+        7, [500.0, 500.0], agent._crosshair_evidence) is None
 
 
 def test_use_molmo_point_propagates_server_error():
@@ -682,31 +700,43 @@ def _nav_action_agent():
     return agent
 
 
-def test_nav_collision_replans_once_then_stuck():
-    """撞墙先重规划一次（可能绕开），连续撞 nav_collision_limit 次才 stuck。"""
+def test_nav_collision_escapes_then_replans_then_stuck():
+    """撞墙先转向脱困，再临时封路重规划；连续撞限次才 stuck。"""
     agent = _nav_action_agent()
     planned = []
     agent._plan_to_target = lambda obs: planned.append(1) or True
-    obs = SimpleNamespace(step_count=1)
+    obs = SimpleNamespace(step_count=1, previous_action=None)
     # 无碰撞：计数保持 0
     action, arrived, stuck = agent._nav_action(obs)
     assert not stuck and not arrived and action is not None
     assert agent._nav_collision_streak == 0
-    # 碰撞 1：立即重规划一次，返回新路径动作，不触发 stuck
+    # 碰撞 1：先执行交替转向，下一轮才在临时封路约束下重规划。
+    obs.previous_action = int(Action.MOVE_FORWARD)
     agent._last_motion_failed = True
     action, arrived, stuck = agent._nav_action(obs)
     assert not stuck and not arrived
-    assert action == int(Action.MOVE_FORWARD)
-    assert len(planned) == 1
-    # 碰撞 2（已重规划过）：跟随现有路径，不重复重规划
+    assert action == int(Action.TURN_LEFT)
+    assert len(agent._nav_blocked_points) == 1
+    assert len(planned) == 0
+    obs.previous_action = int(Action.TURN_LEFT)
+    agent._last_motion_failed = False
     action, arrived, stuck = agent._nav_action(obs)
-    assert not stuck
+    assert not stuck and not arrived and action == int(Action.MOVE_FORWARD)
+    assert len(planned) == 1
+    # 再次前进碰撞后交替向右转；仍不会立刻判定不可达。
+    obs.previous_action = int(Action.MOVE_FORWARD)
+    agent._last_motion_failed = True
+    action, arrived, stuck = agent._nav_action(obs)
+    assert not stuck and action == int(Action.TURN_RIGHT)
     assert len(planned) == 1
     # 碰撞 3：达到 nav_collision_limit → stuck
+    obs.previous_action = int(Action.MOVE_FORWARD)
+    agent._last_motion_failed = True
     action, arrived, stuck = agent._nav_action(obs)
     assert stuck and action is None and not arrived
     assert agent._nav_collision_streak == 3
     # 恢复运动后计数清零，可再次进入卡死检测
+    obs.previous_action = int(Action.MOVE_FORWARD)
     agent._last_motion_failed = False
     action, arrived, stuck = agent._nav_action(obs)
     assert agent._nav_collision_streak == 0 and not stuck
@@ -731,7 +761,8 @@ def test_nav_stuck_recovery_marks_unreachable_and_asks_decider():
     agent.decision_loop = _Loop()
     agent._plan_to_target = lambda obs: True
     obs = SimpleNamespace(step_count=1, max_steps=500,
-                          rgb=np.zeros((16, 16, 3), dtype=np.uint8))
+                          rgb=np.zeros((16, 16, 3), dtype=np.uint8),
+                          previous_action=int(Action.MOVE_FORWARD))
     agent._last_motion_failed = True
     agent._nav_action(obs)                 # streak 1
     agent._last_motion_failed = True
@@ -749,7 +780,8 @@ def test_nav_stuck_recovery_fallback_to_explore_when_decider_unavailable():
     agent = _nav_action_agent()
     agent._unreachable_instance_ids.clear()
     agent._plan_to_target = lambda obs: True
-    obs = SimpleNamespace(step_count=1)
+    obs = SimpleNamespace(step_count=1,
+                          previous_action=int(Action.MOVE_FORWARD))
     for _ in range(3):
         agent._last_motion_failed = True
         agent._nav_action(obs)

@@ -71,17 +71,20 @@ flowchart LR
      坐标，无 bbox/confidence；
    - `qwen`：JSON 输出绝对像素坐标 + 可选 bbox 交叉验证。
    返回给决策 VLM 的坐标统一为 0-1000 归一化（x 向右、y 向下）；
-5. **instantiate_points(frame_id, pixels_1000, label)**：把 0-1000 归一化像素
+5. **review_crosshair(frame_id, pixel_1000, verdict, reason)**：Decision VLM
+   对已展示的十字证据图给出 `ACCEPT / REJECT / UNCERTAIN`。只有 `ACCEPT`
+   允许实例化；后两者记录为 `semantic_rejections`，绝不入实例记忆；
+6. **instantiate_points(frame_id, pixels_1000, label)**：把 0-1000 归一化像素
    坐标变成可导航 3D 实例。`pixels_1000` 可来自 point_frame 工具，也可以是
-   VLM 看过帧图像后自己给出的坐标。流程严格分两阶段：先生成标记证据面板，
-   由 Decision VLM 审核十字中心是否落在目标表面；只有通过 2D 语义审核的像素
-   才进行 VGGT confidence 过滤、patch 深度采样和 3D 坐标恢复。深度无效的
-   候选进入 `geometry_rejections`；通过两阶段后才形成 Observation，再由
-   Entity Resolver 关联到 Canonical Instance；
-6. **ground_target(query, frame_id=null, top_k=2)**：pointing + 实例化的复合
+   VLM 看过帧图像后自己给出的坐标。先生成标记证据面板，再由
+   `review_crosshair` 的显式 `ACCEPT` 作为 2D 语义硬门；随后才进行 VGGT
+   confidence 过滤、patch 深度采样和 3D 坐标恢复。深度无效的候选进入
+   `geometry_rejections`；通过两阶段后才形成 Observation，再由 Entity Resolver
+   关联到 Canonical Instance；
+7. **ground_target(query, frame_id=null, top_k=2)**：pointing + 实例化的复合
    工具。传入 `frame_id` 时严格使用指定帧且不重新检索；仅在 `frame_id=null`
    时执行 caption 检索，供 VLM 不知道哪帧相关时使用；
-7. 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等；
+8. 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等；
    非重放 Observation 先在 1.2m 内召回最多 3 个 Canonical Instance，再把
    新照片及候选实例的标注照片交给专用 VLM 判断 `SAME / NEW / UNCERTAIN`。
    只有 `SAME` 会关联已有实例，`NEW/UNCERTAIN` 都新建实例以保护召回率；
@@ -189,7 +192,8 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 | `search_frames(query, top_k=5)` | `[{frame_id, score, caption}]`，只读 |
 | `view_frame(frame_id)` | 下一轮附加该关键帧原始 RGB，只读 |
 | `point_frame(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
-| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 2D 标记语义验证 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
+| `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录 `ACCEPT` / `REJECT` / `UNCERTAIN`；只有 `ACCEPT` 允许实例化，写 |
+| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
 | `ground_target(query, frame_id=null, top_k=2)` | 指定帧走 2D 语义审核→3D 几何验证；自动检索模式保持兼容并在入库前做语义审核，随后完成实体关联，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
 | `get_instance(instance_id)` | 完整实例记录（无图像），只读 |
@@ -248,7 +252,12 @@ VLM 必须输出一个 JSON 对象：
   RGB，默认最多 10 步（`NAV_ADJUST_MAX_STEPS`）。benchmark 原生支持的
   `LOOK_UP/LOOK_DOWN` 每次改变俯仰 30°；相对中性姿态默认限制为 ±1 档
   （`NAV_ADJUST_MAX_TILT_STEPS`），`END_ADJUST` 后 harness 自动逐步回正再
-  恢复导航，倾斜视角作为同一位置的现场观察证据保留；
+  恢复导航，倾斜视角作为同一位置的现场观察证据保留。除此之外，同一
+  target 的 session、累计步数和转向数分别受
+  `NAV_ADJUST_MAX_SESSIONS_PER_TARGET`（默认 2）、
+  `NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET`（默认 8）、
+  `NAV_ADJUST_MAX_TURNS_PER_TARGET`（默认 4）限制；连续同向转超过两次
+  会冷却该 target 并回到探索，禁止 `END_ADJUST`/`START_ADJUST` 循环；
 - `FINISH`：不可逆。many 模式数量不足时被 harness 拒绝并降级。
 
 `EXPLORE` 已从动作表移除（VLM 曾滥用一键探索）；探索应显式选
@@ -265,6 +274,14 @@ VLM 必须输出一个 JSON 对象：
 `candidate_id` 重投影刷新坐标，Canonical Instance 再选取质量最高的真实
 观测点作为导航点。碰撞、路径丢失和 frontier 失败计数仅用于执行恢复，
 不表达语义否定。
+
+导航前进无视觉位移时，不会在原栅格上重复规划：agent 先交替左/右转
+`NAV_NAV_ESCAPE_TURNS` 次（默认 1），把撞击方向在下一次建图中作为半径
+`NAV_NAV_BLOCK_RADIUS_M`（默认 0.35m）的临时障碍，且该障碍保留
+`NAV_NAV_BLOCK_TTL_STEPS` 步（默认 80），随后重新 A*。只有连续达到
+`NAV_NAV_COLLISION_LIMIT`（默认 3）次前进碰撞，才把当前实例标为
+unreachable 并触发 `nav_failed` 决策事件；benchmark 没有后退动作，因此
+恢复不产生不受支持的动作。
 
 到达实例后由决策 VLM 直接查看当前 RGB 和候选证据，决定报告、离开、
 换目标或 START_ADJUST；到达本身不强制微调。

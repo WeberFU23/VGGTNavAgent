@@ -1,9 +1,9 @@
 """多目标导航 agent：语义记忆 -> 实例定位 -> 栅格规划 -> 路径跟随。
 
 流程（多目标状态机）：
-1. EXPLORE：持续建图；决策 VLM 自主调用 use_molmo_point/instantiate_points
-   检索并定位目标（molmo 标点渲染十字图由 VLM 看图确认，确认后经 3D
-   几何验证写入实例记忆；不再有独立语义审核关卡）。
+1. EXPLORE：持续建图；决策 VLM 自主调用 use_molmo_point、
+   review_crosshair、instantiate_points 检索并定位目标。十字图必须经 VLM
+   显式给出 ACCEPT 才能进入 3D 几何验证并写入实例记忆。
 2. 拿到目标点后用点云构建 2D 占据栅格（agents/navigator.py），A* 规划，
    进入 NAV 模式沿路径输出离散动作。位姿锚定最新关键帧 + 航位推算，
    定期重建栅格并重规划（地图随探索增长，回环也会改写历史位姿）。
@@ -68,6 +68,12 @@ class NavAgent(MappingAgent):
         self.replan_interval = int(os.environ.get("NAV_REPLAN_INTERVAL", "20"))
         self.nav_collision_limit = max(1, int(os.environ.get(
             "NAV_NAV_COLLISION_LIMIT", "3")))
+        self.nav_escape_turns = max(1, int(os.environ.get(
+            "NAV_NAV_ESCAPE_TURNS", "1")))
+        self.nav_block_radius_m = max(0.1, float(os.environ.get(
+            "NAV_NAV_BLOCK_RADIUS_M", "0.35")))
+        self.nav_block_ttl_steps = max(1, int(os.environ.get(
+            "NAV_NAV_BLOCK_TTL_STEPS", "80")))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
         self.finish_patience = int(os.environ.get("NAV_FINISH_PATIENCE", "5"))
         self.finish_frontier_patience = int(os.environ.get(
@@ -79,6 +85,12 @@ class NavAgent(MappingAgent):
             "NAV_ADJUST_MAX_STEPS", "10")))
         self.adjust_max_tilt_steps = max(0, int(os.environ.get(
             "NAV_ADJUST_MAX_TILT_STEPS", "1")))
+        self.adjust_max_sessions_per_target = max(1, int(os.environ.get(
+            "NAV_ADJUST_MAX_SESSIONS_PER_TARGET", "2")))
+        self.adjust_max_total_steps_per_target = max(1, int(os.environ.get(
+            "NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET", "8")))
+        self.adjust_max_turns_per_target = max(1, int(os.environ.get(
+            "NAV_ADJUST_MAX_TURNS_PER_TARGET", "4")))
         self.adjust_map_radius_m = max(1.0, float(os.environ.get(
             "NAV_ADJUST_MAP_RADIUS_M", "4.0")))
         # 唯一候选生成语义链路：caption 检索 + pointing + 3D instance memory
@@ -106,6 +118,7 @@ class NavAgent(MappingAgent):
                            "update_instance": self._tool_update_instance,
                            "view_frame": self._tool_view_frame,
                            "use_molmo_point": self._tool_use_molmo_point,
+                           "review_crosshair": self._tool_review_crosshair,
                            "instantiate_points": self._tool_instantiate_points,
                            "get_agent_status": self._tool_get_agent_status,
                            "set_notes": self._tool_set_notes,
@@ -148,6 +161,9 @@ class NavAgent(MappingAgent):
         # nav 模式此前没有——撞墙会永远重规划同一路径直到步数耗尽。
         self._nav_collision_streak = 0
         self._nav_stuck_replanned = False
+        self._nav_recovery_queue = []
+        self._nav_recovery_stage = 0
+        self._nav_blocked_points = []
         # 导航确认不可达的实例（episode 内排除出 VLM 候选表；REPORT_FOUND
         # 仍可用——agent 可能就停在目标旁边，直接观察可确认）。
         self._unreachable_instance_ids = set()
@@ -176,12 +192,14 @@ class NavAgent(MappingAgent):
         # Prevent START_ADJUST -> END_ADJUST -> START_ADJUST recursion within
         # one benchmark observation when the VLM repeats the same request.
         self._adjust_reentry_blocked_step = None
+        self._adjustment_key = None
+        self._adjustment_budgets = {}
         self._last_decision_output = None
-        # 指向确认资格：(frame_id, (pixel_norm_x, pixel_norm_y)) —— 十字证据图
-        # 已渲染并随工具结果返回给 VLM 的点。use_molmo_point 渲染即登记；
-        # instantiate_points 手搓坐标第一次调用渲染图返回并登记，VLM 看图后
-        # 原样重发同坐标即完成确认，跳过语义审核直接做几何验证。
-        self._crosshair_confirmed = set()
+        # 十字证据与显式语义审核分开保存。证据已展示绝不等于审核通过：
+        # 只有 Decision VLM 调用 review_crosshair(..., verdict="ACCEPT")
+        # 的同一像素才可进入 3D 实例化。
+        self._crosshair_evidence = {}
+        self._crosshair_reviews = {}
         # 决策层状态：近期事件流 + 最近一次探索规划的 frontier 缓存
         self._events = []
         self._last_frontier_clusters = []
@@ -831,6 +849,11 @@ class NavAgent(MappingAgent):
         self.grid = None
         self._explore_follower = None
         self._plan_failures = 0
+        self._nav_recovery_queue = []
+        self._nav_recovery_stage = 0
+        self._nav_collision_streak = 0
+        self._nav_stuck_replanned = False
+        self._nav_blocked_points = []
         self._scanning = False
         self._scan_steps = 0
         self._scan_images = []
@@ -1246,27 +1269,55 @@ class NavAgent(MappingAgent):
             "message": str(response.get("error"))[:300],
         }}
 
-    def _crosshair_is_confirmed(self, frame_id, pixel_norm):
-        """该 (frame, 归一化像素) 是否已渲染十字图并给 VLM 看过（确认资格）。
+    @staticmethod
+    def _crosshair_key(frame_id, pixel_norm):
+        """归一化十字坐标的稳定 key；允许 VLM 一位小数重发。"""
+        return (int(frame_id), round(float(pixel_norm[0]), 1),
+                round(float(pixel_norm[1]), 1))
 
-        允许 ±2 容差：VLM 重发时可能对数字做微小四舍五入。
-        """
-        fid = int(frame_id)
+    def _find_crosshair_key(self, frame_id, pixel_norm, source):
+        """查找同一证据点，容忍 VLM 对 0--1000 坐标的 ±2 四舍五入。"""
         try:
-            nx, ny = float(pixel_norm[0]), float(pixel_norm[1])
+            fid = int(frame_id)
+            x, y = float(pixel_norm[0]), float(pixel_norm[1])
         except (TypeError, ValueError, IndexError):
-            return False
-        for f, (x, y) in self._crosshair_confirmed:
-            if f == fid and abs(x - nx) <= 2.0 and abs(y - ny) <= 2.0:
-                return True
-        return False
+            return None
+        for key in source:
+            if key[0] == fid and abs(key[1] - x) <= 2.0 and \
+                    abs(key[2] - y) <= 2.0:
+                return key
+        return None
+
+    def _record_crosshair_evidence(self, frame_id, pixel_norm):
+        """记录已展示给 VLM 的十字图；不授予实例化权限。"""
+        key = self._crosshair_key(frame_id, pixel_norm)
+        self._crosshair_evidence[key] = {
+            "frame_id": key[0], "pixel": [key[1], key[2]],
+        }
+        return key
+
+    def _tool_review_crosshair(self, frame_id, pixel_1000, verdict,
+                               reason=""):
+        """记录 VLM 对已展示十字图的显式三值语义审核。"""
+        verdict = str(verdict or "").strip().upper()
+        if verdict not in {"ACCEPT", "REJECT", "UNCERTAIN"}:
+            return {"error": "verdict must be ACCEPT, REJECT, or UNCERTAIN"}
+        key = self._find_crosshair_key(
+            frame_id, pixel_1000, self._crosshair_evidence)
+        if key is None:
+            return {"error": "no crosshair evidence was shown for this pixel; "
+                    "call use_molmo_point or instantiate_points first"}
+        review = {"verdict": verdict, "reason": str(reason or "")[:300]}
+        self._crosshair_reviews[key] = review
+        return {"frame_id": key[0], "pixel": [key[1], key[2]], **review,
+                "instantiation_allowed": verdict == "ACCEPT"}
 
     def _tool_use_molmo_point(self, frame_id, query):
         """调用 pointing 模型在指定关键帧定位描述目标。
 
         返回 0-1000 归一化坐标，同时为每个标点渲染十字证据图（全帧 +
-        bbox 放大，不注册候选）随结果返回；VLM 看图确认后这些坐标即可
-        直接交给 instantiate_points 注册（免二次语义审核）。
+        bbox 放大，不注册候选）。VLM 必须先调用 review_crosshair 给出
+        ACCEPT / REJECT / UNCERTAIN，只有 ACCEPT 的坐标才可实例化。
         """
         try:
             resp = self.client.point_pixels(int(frame_id), str(query))
@@ -1293,7 +1344,7 @@ class NavAgent(MappingAgent):
             if meta.get("found") and payload:
                 label = f"molmo_point_{fid}_{i}"
                 images.append((label, payload))
-                self._crosshair_confirmed.add((fid, tuple(norm)))
+                self._record_crosshair_evidence(fid, norm)
             points.append({"pixel": norm,
                            "confidence": round(float(pt.get(
                                "confidence", 0.0)), 3)})
@@ -1315,9 +1366,7 @@ class NavAgent(MappingAgent):
         if not isinstance(pixels_1000, (list, tuple)) or not pixels_1000:
             return {"error": "pixels_1000 must be a non-empty list of "
                              "[x, y] in 0-1000 normalized coordinates"}
-        # Two-stage path: prepare candidates first (registers them on the
-        # server for evidence rendering), then resolve depth/3D only for
-        # crosshair-confirmed pixels.
+        # 先准备候选以生成十字证据；随后只解析被显式 ACCEPT 的像素。
         prepare = getattr(self.client, "prepare_pixels", None)
         if prepare is not None:
             try:
@@ -1339,12 +1388,31 @@ class NavAgent(MappingAgent):
                      "point_score": row.get("point_score", 1.0),
                      "text": desc}
                     for row in candidates]
-            unconfirmed = [h for h in hits if not self._crosshair_is_confirmed(
-                h.get("frame_id"), h.get("pixel_norm"))]
-            if unconfirmed:
+            pending, accepted, semantic_rejections = [], [], []
+            for hit in hits:
+                fid, pixel = hit.get("frame_id"), hit.get("pixel_norm")
+                evidence_key = self._find_crosshair_key(
+                    fid, pixel, self._crosshair_evidence)
+                review_key = self._find_crosshair_key(
+                    fid, pixel, self._crosshair_reviews)
+                review = (self._crosshair_reviews.get(review_key)
+                          if review_key is not None else None)
+                if evidence_key is None or review is None:
+                    pending.append(hit)
+                elif review["verdict"] == "ACCEPT":
+                    accepted.append(hit)
+                else:
+                    semantic_rejections.append({
+                        "candidate_id": hit.get("candidate_id"),
+                        "frame_id": fid,
+                        "pixel": pixel or hit.get("pixel"),
+                        "verdict": review["verdict"],
+                        "reason": review.get("reason", ""),
+                    })
+            if pending:
                 # 第一段：渲染十字图返回给 VLM 看图确认，不注册实例。
                 images = []
-                for h in unconfirmed:
+                for h in pending:
                     cid = h.get("candidate_id")
                     try:
                         meta, payload = self.client.get_candidate_evidence(cid)
@@ -1354,26 +1422,29 @@ class NavAgent(MappingAgent):
                         continue
                     images.append((f"confirm_{cid}", payload))
                     try:
-                        self._crosshair_confirmed.add(
-                            (int(h["frame_id"]),
-                             tuple(float(v) for v in h["pixel_norm"])))
+                        self._record_crosshair_evidence(
+                            h["frame_id"], h["pixel_norm"])
                     except (TypeError, ValueError, IndexError):
                         pass
                 return {"instances": [],
-                        "semantic_rejections": [],
+                        "semantic_rejections": semantic_rejections,
                         "geometry_rejections": [],
                         "pending_confirmation": [
                             {"candidate_id": h.get("candidate_id"),
                              "frame_id": h.get("frame_id"),
                              "pixel": h.get("pixel_norm") or h.get("pixel")}
-                            for h in unconfirmed],
+                            for h in pending],
                         "_tool_images": images}
-            # 第二段：全部已确认，只做 3D 几何验证后入库。
-            ids = [h.get("candidate_id") for h in hits if h.get("candidate_id")]
+            if not accepted:
+                return {"instances": [],
+                        "semantic_rejections": semantic_rejections,
+                        "geometry_rejections": []}
+            ids = [h.get("candidate_id") for h in accepted
+                   if h.get("candidate_id")]
             resolved = self.client.resolve_candidates(ids)
             geometry_rejections = []
             valid_hits = []
-            for hit in hits:
+            for hit in accepted:
                 cid = str(hit.get("candidate_id"))
                 row = resolved.get(cid) or {}
                 if not row.get("found"):
@@ -1388,27 +1459,10 @@ class NavAgent(MappingAgent):
             changed = self._ingest_semantic_hits(
                 self._last_observation, valid_hits, select=False) or []
             return {"instances": self._ground_rows(changed),
-                    "semantic_rejections": [],
+                    "semantic_rejections": semantic_rejections,
                     "geometry_rejections": geometry_rejections}
-        try:
-            resp = self.client.instantiate_pixels(
-                int(frame_id), pixels_1000, normalized=True)
-        except Exception as exc:
-            return {"error": str(exc)[:200]}
-        if resp.get("error"):
-            return self._pointing_error(resp)
-        results = resp.get("results") or []
-        desc = str(label or "").strip()
-        if desc:
-            for row in results:
-                row.setdefault("text", desc)
-        hits = [r for r in results if r.get("found")]
-        if not hits:
-            return {"instances": [], "semantic_rejections": []}
-        changed = self._ingest_semantic_hits(
-            self._last_observation, hits, select=False) or []
-        return {"instances": self._ground_rows(changed),
-                "semantic_rejections": []}
+        return {"error": "mapping server lacks prepare_pixels; refusing "
+                "unsafe instantiation without explicit semantic audit"}
 
     def _tool_get_agent_status(self):
         """覆盖/预算快照：服务端建图状态 + 最新 caption 帧号 + 实例计数。"""
@@ -1859,6 +1913,21 @@ class NavAgent(MappingAgent):
     def _start_adjustment(self, observation, source_event,
                           context_images=None):
         """Enter VLM-controlled single-step visual adjustment."""
+        key = ("instance", int(self.target_instance_id)) \
+            if self.target_instance_id is not None else \
+            ("candidate", str(self.target_candidate_id or source_event))
+        budget = self._adjustment_budgets.setdefault(key, {
+            "sessions": 0, "steps": 0, "turns": 0,
+            "turn_streak": 0, "last_turn": None,
+        })
+        if budget["sessions"] >= self.adjust_max_sessions_per_target or \
+                budget["steps"] >= self.adjust_max_total_steps_per_target:
+            self._log_event(
+                f"adjustment budget exhausted for {key}: {budget}")
+            return self._abandon_adjustment_target(
+                observation, "target_adjustment_budget_exhausted")
+        budget["sessions"] += 1
+        self._adjustment_key = key
         self._adjusting = True
         self._adjust_steps = 0
         self._adjust_source_event = str(source_event)
@@ -1871,8 +1940,28 @@ class NavAgent(MappingAgent):
             (label, payload) for label, payload in (context_images or [])
             if label != "current_observation"]
         self._log_event(
-            f"adjustment started from {self._adjust_source_event}")
+            f"adjustment started from {self._adjust_source_event}; "
+            f"target_budget={budget}")
         return self._adjustment_action(observation)
+
+    def _abandon_adjustment_target(self, observation, reason):
+        """调整无法产生新证据时冷却当前候选，避免 END/START 循环。"""
+        if self.target_instance_id is not None:
+            self._unreachable_instance_ids.add(self.target_instance_id)
+        self._log_event(
+            f"adjustment abandon target={self.target_instance_id} "
+            f"candidate={self.target_candidate_id}: {reason}")
+        self._adjusting = False
+        self._adjustment_key = None
+        self._adjust_steps = 0
+        self._adjust_source_event = None
+        self._adjust_context_images = []
+        self._adjust_pitch_steps = 0
+        self._adjust_leveling = False
+        self._adjust_end_reason = None
+        self._clear_current_target()
+        self.mode = "explore"
+        return self._explore_action(observation)
 
     def _adjustment_state(self, observation):
         state, map_png = self._build_decider_input(
@@ -1888,6 +1977,8 @@ class NavAgent(MappingAgent):
             self._last_motion_failed and
             previous_id == int(Action.MOVE_FORWARD))
         navigation = state.get("navigation", {})
+        target_budget = dict(self._adjustment_budgets.get(
+            self._adjustment_key, {}))
         state["adjustment"] = {
             "active": True,
             "source_event": self._adjust_source_event,
@@ -1895,6 +1986,12 @@ class NavAgent(MappingAgent):
             "max_steps": self.adjust_max_steps,
             "steps_remaining": max(
                 0, self.adjust_max_steps - self._adjust_steps),
+            "target_budget": {
+                **target_budget,
+                "max_sessions": self.adjust_max_sessions_per_target,
+                "max_total_steps": self.adjust_max_total_steps_per_target,
+                "max_turns": self.adjust_max_turns_per_target,
+            },
             "pitch_offset_steps": self._adjust_pitch_steps,
             "pitch_offset_degrees": 30 * self._adjust_pitch_steps,
             "max_pitch_offset_steps": self.adjust_max_tilt_steps,
@@ -1946,6 +2043,13 @@ class NavAgent(MappingAgent):
 
     def _adjustment_action(self, observation):
         """Ask the VLM for exactly one atomic motion, then re-observe."""
+        budget = self._adjustment_budgets.get(self._adjustment_key, {})
+        if budget.get("steps", 0) >= self.adjust_max_total_steps_per_target:
+            return self._abandon_adjustment_target(
+                observation, "target_total_adjustment_steps_exhausted")
+        if budget.get("turns", 0) >= self.adjust_max_turns_per_target:
+            return self._abandon_adjustment_target(
+                observation, "target_turn_budget_exhausted")
         if self._adjust_leveling:
             if self._adjust_pitch_steps:
                 return self._level_adjustment_camera(observation)
@@ -1992,6 +2096,19 @@ class NavAgent(MappingAgent):
             self._log_event(
                 f"adjustment produced no executable action: {result.action}")
             return self._end_adjustment_and_resume(observation, "invalid")
+        if result.action in ("TURN_LEFT", "TURN_RIGHT"):
+            same_turn = budget.get("last_turn") == result.action
+            if same_turn and budget.get("turn_streak", 0) >= 2:
+                return self._abandon_adjustment_target(
+                    observation, "repeated_same_turn")
+            budget["turns"] = budget.get("turns", 0) + 1
+            budget["turn_streak"] = budget.get("turn_streak", 0) + 1 \
+                if same_turn else 1
+            budget["last_turn"] = result.action
+        else:
+            budget["turn_streak"] = 0
+            budget["last_turn"] = None
+        budget["steps"] = budget.get("steps", 0) + 1
         self._adjust_steps += 1
         if result.action == "LOOK_UP":
             self._adjust_pitch_steps += 1
@@ -2015,6 +2132,9 @@ class NavAgent(MappingAgent):
         else:
             action_name, action = "LOOK_UP", int(Action.LOOK_UP)
             self._adjust_pitch_steps += 1
+        budget = self._adjustment_budgets.get(self._adjustment_key)
+        if budget is not None:
+            budget["steps"] = budget.get("steps", 0) + 1
         self._adjust_steps += 1
         trace_result = result or DecisionResult(
             action_name, reason="automatic camera leveling",
@@ -2027,6 +2147,9 @@ class NavAgent(MappingAgent):
 
     def _end_adjustment_and_resume(self, observation, reason):
         """Exit adjustment and immediately resume its originating decision."""
+        if reason in {"safety_limit", "unavailable", "invalid"}:
+            return self._abandon_adjustment_target(
+                observation, f"adjustment_{reason}")
         source_event = self._adjust_source_event or "world_state_updated"
         context_images = list(self._adjust_context_images)
         self._adjusting = False
@@ -2036,6 +2159,7 @@ class NavAgent(MappingAgent):
         self._adjust_pitch_steps = 0
         self._adjust_leveling = False
         self._adjust_end_reason = None
+        self._adjustment_key = None
         self._adjust_reentry_blocked_step = observation.step_count
         self._log_event(f"adjustment ended ({reason}); resume {source_event}")
 
@@ -2089,6 +2213,44 @@ class NavAgent(MappingAgent):
             images.append(("selected_candidate", self._selected_evidence))
         return self._decider_next(
             observation, "arrival", images=images, state_fn=arrival_state)
+
+    def _block_failed_nav_direction(self, observation):
+        """把最近撞上的前向小段临时作为障碍，避免 A* 原样重走。"""
+        if self.follower is None:
+            return
+        scale = self.calibrator.current_scale() or 1.0
+        distance = 0.25 / scale
+        point = (float(self.follower.x + math.cos(self.follower.yaw) * distance),
+                 float(self.follower.y + math.sin(self.follower.yaw) * distance))
+        expiry = int(observation.step_count) + self.nav_block_ttl_steps
+        self._nav_blocked_points.append((point, expiry))
+        self._nav_blocked_points = self._nav_blocked_points[-8:]
+        self._log_event(
+            f"nav temporary block at ({point[0]:.2f},{point[1]:.2f}) "
+            f"until step={expiry}")
+
+    def _apply_nav_temporary_blocks(self, observation):
+        """将临时撞墙位置投影到当前新栅格；地图重建后仍保留恢复约束。"""
+        if self.grid is None:
+            return
+        step = int(observation.step_count)
+        self._nav_blocked_points = [
+            item for item in self._nav_blocked_points if item[1] >= step]
+        if not self._nav_blocked_points:
+            return
+        radius_cells = max(1, int(math.ceil(
+            self.nav_block_radius_m / max(float(self.grid.res), 1e-6))))
+        height, width = self.grid.free.shape
+        for point, _expiry in self._nav_blocked_points:
+            row, col = self.grid.world_to_cell(point)
+            r0, r1 = max(0, row - radius_cells), min(height, row + radius_cells + 1)
+            c0, c1 = max(0, col - radius_cells), min(width, col + radius_cells + 1)
+            yy, xx = np.ogrid[r0:r1, c0:c1]
+            mask = (yy - row) ** 2 + (xx - col) ** 2 <= radius_cells ** 2
+            free_view = self.grid.free[r0:r1, c0:c1]
+            obstacle_view = self.grid.obstacle[r0:r1, c0:c1]
+            free_view[mask] = False
+            obstacle_view[mask] = True
 
     def _nav_failed_vlm_decision(self, observation):
         """导航目标不可达（连续碰撞）：只咨询决策 VLM（event=nav_failed）。
@@ -2612,6 +2774,8 @@ class NavAgent(MappingAgent):
                   "拒绝用轨迹伪造自由空间")
             return False
 
+        self._apply_nav_temporary_blocks(observation)
+
         goal_xy = (self.align_R @ self.target_point)[:2]
         # 起点只能吸附到几何确认的 free；traversed 层不参与规划。
         sc = self.grid.nearest_traversable(
@@ -2662,29 +2826,39 @@ class NavAgent(MappingAgent):
         except Exception:
             pass
 
-        # 碰撞恢复：撞墙即丢弃不可信路径并立即重规划一次（可能绕开）；
-        # 连续碰撞达到 nav_collision_limit 次仍未摆脱 → stuck。MOVE_FORWARD
-        # 被挡时位置原地不动，到达判定与定期重规划都救不了——必须让决策层
-        # 介入换目标，否则会永远重规划同一路径直到步数耗尽（对齐 explore
-        # 模式的碰撞处理，explore 有而 nav 此前没有）。
-        if self._last_motion_failed:
+        # 碰撞恢复不能在同一张地图上直接重规划：它通常会得到原路径并再次
+        # 撞墙。失败后先转向脱困，再把前方小段临时封路重规划；多次失败才
+        # 放弃目标。只有“上一动作是前进且实际有视觉位移”才清空失败计数，
+        # 转向本身不应掩盖刚发生的碰撞。
+        previous = getattr(observation, "previous_action", None)
+        if previous == int(Action.MOVE_FORWARD) and self._last_motion_failed:
             self._nav_collision_streak += 1
             self._log_event(
                 f"nav collision streak={self._nav_collision_streak}")
             if self._nav_collision_streak >= self.nav_collision_limit:
                 self._nav_stuck_replanned = False
                 return None, False, True
-            if not self._nav_stuck_replanned:
-                self._nav_stuck_replanned = True
-                if self._plan_to_target(observation):
-                    action, _arrived = self.follower.next_action()
-                    if action is not None:
-                        return int(action), False, False
-                return None, False, False
-            # 已重规划过仍撞：保持路径，follower 继续尝试（streak 累计）
-        else:
+            self._block_failed_nav_direction(observation)
+            self._nav_recovery_stage = 1
+            turn = (int(Action.TURN_LEFT) if self._nav_collision_streak % 2
+                    else int(Action.TURN_RIGHT))
+            self._nav_recovery_queue = [turn] * self.nav_escape_turns
+        elif previous == int(Action.MOVE_FORWARD):
             self._nav_collision_streak = 0
             self._nav_stuck_replanned = False
+
+        if self._nav_recovery_queue:
+            return int(self._nav_recovery_queue.pop(0)), False, False
+        if self._nav_recovery_stage == 1:
+            self._nav_recovery_stage = 2
+            self._nav_stuck_replanned = True
+            if not self._plan_to_target(observation):
+                return None, False, False
+            action, arrived = self.follower.next_action()
+            if arrived:
+                return None, True, False
+            return (int(action), False, False) if action is not None else \
+                (None, False, False)
 
         # 到达判定：到原始目标点的水平距离（评测阈值 1.0m，默认 0.8m 留裕量）
         goal_xy = (self.align_R @ self.target_point)[:2]

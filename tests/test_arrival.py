@@ -120,6 +120,18 @@ def test_adjustment_state_has_pose_target_collision_and_local_map():
     agent.follower.anchor_frame = 3
     agent.follower.x, agent.follower.y, agent.follower.yaw = 10.0, 10.0, 0.5
     agent.adjust_map_radius_m = 2.0
+    # 决策图必须来自带颜色的 mapping 快照；该 client 仅用于到达逻辑，
+    # 因而直接提供最小快照，避免把单元测试耦合到 RPC mock。
+    agent._frontier_grid = agent.grid
+    agent._frontier_pointcloud = (
+        np.array([[9.0, 9.0, 0.0], [10.0, 10.0, 0.0],
+                  [11.0, 10.0, 0.0], [10.0, 11.0, 0.0]]),
+        np.array([[80, 80, 80], [120, 120, 120],
+                  [160, 160, 160], [200, 200, 200]], dtype=np.uint8))
+    agent._frontier_pose = (10.0, 10.0, 0.5)
+    agent._frontier_scale = 1.0
+    agent._last_frontier_step = 100
+    agent._last_decision_snapshot_step = 100
     agent._adjust_source_event = "arrival"
     agent._last_motion_failed = True
 
@@ -138,7 +150,7 @@ def test_adjustment_state_has_pose_target_collision_and_local_map():
     assert adjustment["max_pitch_offset_steps"] == 1
     assert adjustment["local_topdown_map"]["attached"] is True
     image = Image.open(io.BytesIO(map_png))
-    assert image.size == (20, 20)
+    assert image.size == (1024, 1024)
     colors = {tuple(pixel) for pixel in np.asarray(image).reshape(-1, 3)}
     assert (40, 80, 220) in colors       # YOU
     assert (245, 145, 25) in colors      # active TARGET
@@ -172,6 +184,47 @@ def test_adjustment_can_tilt_camera_and_auto_levels_before_resume():
     assert agent._adjustment_action(_obs(step=202)) == int(Action.TURN_LEFT)
     assert not agent._adjusting
     assert ("adjustment_direct_evidence", b"tilted-evidence") in resumed_images
+
+
+def test_adjustment_stops_when_target_cumulative_budget_is_exhausted():
+    """同一 target 的跨 session 预算耗尽时，不再请求 VLM。"""
+    agent = _make_agent()
+    agent._adjustment_key = ("candidate", "c1")
+    agent._adjustment_budgets[agent._adjustment_key] = {
+        "sessions": 1, "steps": agent.adjust_max_total_steps_per_target,
+        "turns": 0, "turn_streak": 0, "last_turn": None,
+    }
+    abandoned = []
+    agent._abandon_adjustment_target = lambda obs, reason: (
+        abandoned.append(reason) or int(Action.TURN_LEFT))
+    agent.decision_loop = SimpleNamespace(
+        decide=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("budget exhaustion must not query VLM")))
+
+    assert agent._adjustment_action(_obs()) == int(Action.TURN_LEFT)
+    assert abandoned == ["target_total_adjustment_steps_exhausted"]
+
+
+def test_adjustment_rejects_repeated_same_turn_before_another_loop():
+    """第三次连续同向转动直接冷却 target，避免原地旋转。"""
+    agent = _make_agent()
+    key = ("candidate", "c1")
+    agent._adjustment_key = key
+    agent._adjustment_budgets[key] = {
+        "sessions": 1, "steps": 2, "turns": 2,
+        "turn_streak": 2, "last_turn": "TURN_LEFT",
+    }
+    agent._build_decider_input = lambda obs, **kwargs: ({}, None)
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"rgb")
+    agent.decision_loop = SimpleNamespace(
+        decide=lambda *args, **kwargs: DecisionResult("TURN_LEFT"),
+        logger=None)
+    abandoned = []
+    agent._abandon_adjustment_target = lambda obs, reason: (
+        abandoned.append(reason) or int(Action.TURN_RIGHT))
+
+    assert agent._adjustment_action(_obs()) == int(Action.TURN_RIGHT)
+    assert abandoned == ["repeated_same_turn"]
 
 
 def test_active_exploration_refreshes_frontiers_after_end_adjust():

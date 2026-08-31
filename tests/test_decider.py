@@ -58,6 +58,7 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
                  "instantiate_points(frame_id, pixels_1000, label)",
                  "use_molmo_point(frame_id, query)",
+                 "review_crosshair(frame_id, pixel_1000, verdict, reason)",
                  "search_instances(",
                  "get_instance(instance_id)",
                  "view_instance(instance_id)",
@@ -91,7 +92,10 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert "undo_merge" not in prompt
     assert "ground_target" not in prompt
     assert "point_frame(" not in prompt
-    assert "semantic_rejections" not in prompt
+    assert "semantic_rejections" in prompt
+    assert "ACCEPT only" in prompt
+    assert "REJECT when" in prompt
+    assert "UNCERTAIN when" in prompt
     assert "automatically" in prompt
     assert "observation_count" in prompt
     assert "query_memory" not in prompt

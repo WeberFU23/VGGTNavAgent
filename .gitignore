@@ -25,6 +25,8 @@ ENV/
 *.jsonl
 decision_trace*.jsonl
 .decision_trace*.jsonl
+scripts/remote/
+remote_results/
 
 # ===== 调试输出（统一根目录） =====
 /debug_output/

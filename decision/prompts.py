@@ -31,8 +31,11 @@ FINISH is irreversible: the episode ends immediately.
    - step, max_steps, steps_remaining: your action budget. Plan around it.
    - instances: candidate targets registered so far (see Memory below).
    - frontiers: reachable exploration candidates, each {{id, path_cost_m}};
-     path_cost_m is the precomputed path length in meters — smaller means
-     closer.
+     path_cost_m is the precomputed path length in meters. The topdown map
+     shows where each frontier lies relative to you: treat several
+     frontiers clustered in the same direction as one exploration goal,
+     and pick the frontier that advances into a NEW area rather than
+     merely the closest one.
    - navigation: current_pose (x, y, yaw), current_frame_id (the frame id
      of the latest RGB just fed to the map server — the current view; usable
      with view_frame and instantiate_points) and active_target.
@@ -45,10 +48,16 @@ FINISH is irreversible: the episode ends immediately.
 2. A bird's-eye map image reconstructed from the 3D point cloud. Legend:
    blue AGENT arrow = current pose, purple diamonds fN = frontiers, green
    circles tN = instances, orange ACTIVE star = active target; marker ids
-   match the state JSON. The image shows reconstructed 3D colors only — no
-   free/obstacle coloring, no trajectory; blank pixels mean "no rendered 3D
-   point", not known free space. Judge reachability from the precomputed
-   path costs, never from image color.
+   match the state JSON. The image shows reconstructed 3D colors only —
+   no free/obstacle coloring and no trajectory; blank pixels mean "no
+   rendered 3D point", i.e. space the robot has not observed yet — a large
+   blank region is unexplored and worth moving toward. Combine the image
+   with the JSON numbers when choosing: use path_cost_m for distance and
+   reachability, and use the image for spatial layout — which direction
+   each frontier lies in, which frontiers belong to the same region, and
+   where unexplored space remains. Do not simply pick the closest
+   frontier: check the image first, and choose the frontier that opens up
+   new space or a new room.
 3. Event-specific images: the current RGB on arrival, panorama views after
    SCAN, or images you requested through tools.
 
@@ -92,42 +101,41 @@ Perception and retrieval:
   frames may contain the target. Read-only.
 - view_frame(frame_id): attach the keyframe's raw RGB image to your next
   input. Use it to verify what a frame actually shows. Read-only.
-- point_frame(frame_id, query) -> {{points: [{{pixel: [x, y]}}]}}: ask the
-  pointing model to locate the described object in ONE keyframe. Returns
-  pixel coordinates only and registers nothing. Coordinates are 0-1000
-  normalized: x = 1000 * (column / width), y = 1000 * (row / height).
-  Skip this tool when you can already see the target in a viewed frame
-  and can read its pixel position yourself.
+- use_molmo_point(frame_id, query) -> {{points: [{{pixel: [x, y],
+  confidence}}]}}: ask the pointing model to locate the described object
+  in ONE keyframe. Returns 0-1000 normalized pixel coordinates AND attaches
+  a crosshair-marked evidence image (full frame + zoomed crop) for each
+  point — READ THOSE IMAGES and judge whether the crosshair lies on the
+  target before instantiating. Registers nothing. Skip this tool when you
+  can already see the target in a viewed frame and can read its pixel
+  position yourself.
 - instantiate_points(frame_id, pixels_1000, label) ->
   {{instances: [{{instance_id, observation_id, frame_id, confidence,
-  association, reported}}], semantic_rejections: [...],
-  geometry_rejections: [...]}}: first ask a second VLM to audit the marked
-  RGB pixel, then resolve depth/3D only for accepted pixels. pixels_1000 is
-  a list of [x, y]
-  in the 0-1000 normalized space, taken from point_frame results or your
-  own reading of the frame; label is the full target description.
-  semantic_rejections are wrong-object marks: each carries the marked
-  evidence image (crosshair overlay showing exactly which pixel was
-  validated) and a reason telling where the target sits relative to the
-  crosshair. Retry by shifting pixels_1000 toward the target in that
-  image and calling instantiate_points again on the same frame.
+  association, reported}}], pending_confirmation: [...],
+  geometry_rejections: [...]}}: register 3D instances at pixel coordinates.
+  pixels_1000 is a list of [x, y] in the 0-1000 normalized space (from
+  use_molmo_point results or your own reading of a viewed frame); label is
+  the full target description. Two-stage confirmation: pixels whose
+  crosshair evidence image you have NOT yet seen are returned as
+  pending_confirmation with the marked image attached (crosshair overlay
+  showing exactly which pixel, plus a zoomed crop). Look at that image and
+  decide whether the CROSSHAIR CENTER lies on the visible surface of an
+  object matching the label. If yes, RESUBMIT THE SAME pixels_1000 on the
+  same frame to complete registration (semantic check then passes
+  automatically and only 3D depth validation remains). If the crosshair is
+  off the target, adjust pixels_1000 onto the actual surface and call
+  again; the new pixels get their own confirmation image. Pixels returned
+  by use_molmo_point are already confirmed once you have seen their images.
   geometry_rejections are marks with invalid or missing 3D depth. Once you
   have SEEN a matching object in a frame, instantiate it right away: only a
   registered instance is navigable. Never try to walk toward an object
   that exists only in an image. If the object is far away or the evidence
   image is too small to locate it precisely, START_ADJUST with MOVE_FORWARD
   to get closer, then instantiate_points from the new view.
-- ground_target(query, frame_id=null, top_k=2) ->
-  {{instances: [...], semantic_rejections: [...]}}: pointing, marked-image
-  2D semantic audit, 3D geometry validation and automatic entity resolution.
-  When frame_id is supplied, it MUST use exactly that frame and performs no
-  caption retrieval. Use this after view_frame confirms a target. Only when
-  frame_id is null does it retrieve candidate frames automatically; use that
-  mode when you do not know which frame matters.
-  If pointing infrastructure is unavailable, point_frame/ground_target returns
-  error code POINTING_BACKEND_UNAVAILABLE. This is not evidence that the target
-  is absent: inspect a retrieved frame and use your own pixel coordinates with
-  instantiate_points, or continue exploration.
+  If pointing infrastructure is unavailable, use_molmo_point/instantiate_points
+  returns error code POINTING_BACKEND_UNAVAILABLE. This is not evidence that
+  the target is absent: inspect a retrieved frame and use your own pixel
+  coordinates with instantiate_points, or continue exploration.
 
 Instance memory:
 - search_instances(query, reported=null, top_k=10) -> compact rows: keyword
@@ -147,8 +155,8 @@ Housekeeping:
 - get_action_history(before_step, limit) -> [{{step, action, target_id,
   outcome}}]: your older action history; recent_actions covers the last 3.
 
-After a write tool (update_instance, set_notes, instantiate_points,
-ground_target) the refreshed world state is
+After a write tool (update_instance, set_notes, instantiate_points) the
+refreshed world state is
 included in your next prompt — rely on it, not on the pre-write state.
 Stop calling tools as soon as the supplied evidence is sufficient.
 
@@ -156,13 +164,20 @@ Stop calling tools as soon as the supplied evidence is sufficient.
 
 - GOTO_INSTANCE id: navigate to an unreported instance's 3D point; an
   arrival decision triggers near it. Does not assert the instance matches
-  the task. This is how you reach a target: use instantiate_points or
-  ground_target first, then GOTO_INSTANCE. Approaching a seen-but-not-
+  the task. This is how you reach a target: use instantiate_points
+  first, then GOTO_INSTANCE. Approaching a seen-but-not-
   instantiated object through
   frontiers or adjustment does not work.
 - GOTO_FRONTIER id: follow the precomputed path to an exploration frontier.
   New frames are collected along the way and listed in new_keyframes at
   the next decision.
+- CONTINUE_NAVIGATION (en_route only): keep following the precomputed path
+  to the current navigation goal — the orange ACTIVE star on the topdown
+  map. That frontier may no longer appear as an fN diamond in the fresh
+  candidate table: it is still your current destination, keep moving
+  toward it. Prefer CONTINUE_NAVIGATION while navigating unless the
+  current view or map shows a clearly better option; choosing any other
+  action abandons the current path.
 - SCAN: spin 360 degrees in place (12 left turns, four sampled views).
   It only shows what is visible from your current position — it cannot
   reveal other sides of an object, so it cannot verify a candidate. Use
@@ -202,7 +217,7 @@ observations have been collected, so retrieval tools will return nothing.
 SCAN to look around, or pick a frontier to move to first.
 
 Finally reply with exactly one JSON object and nothing else:
-  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
+  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|CONTINUE_NAVIGATION|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
     "target_id": "<instance id for GOTO_INSTANCE/REPORT_FOUND, frontier id for GOTO_FRONTIER, otherwise null>",
     "reason": "short reason (log only)"}}"""
 
@@ -214,11 +229,16 @@ EVENT_GUIDANCE = {
         "keep your notes current. Read and, when useful, update instance "
         "texts. Choose globally among GOTO_INSTANCE, GOTO_FRONTIER and SCAN "
         "(REPORT_FOUND and FINISH are also available when their "
-        "conditions are met). When no frontier or instance looks "
-        "promising, prefer START_ADJUST: short local turns/steps "
-        "actively reveal nearby space and often expose new frontiers "
-        "or targets. Use START_ADJUST also when a better viewing angle "
-        "would help before making a global choice."),
+        "conditions are met). When choosing a frontier, read the topdown "
+        "map: locate the blue AGENT arrow and the purple frontier diamonds, "
+        "then combine their spatial layout with path_cost_m. Prefer the "
+        "frontier that advances into a new region or unexplored direction; "
+        "if the nearest frontiers cluster around you or retrace areas you "
+        "already visited, pick one that leads elsewhere instead. When no "
+        "frontier or instance looks promising, prefer START_ADJUST: short "
+        "local turns/steps actively reveal nearby space and often expose "
+        "new frontiers or targets. Use START_ADJUST also when a better "
+        "viewing angle would help before making a global choice."),
     "arrival": (
         "\nYou have arrived at the selected candidate; the current RGB is "
         "attached and historical candidate evidence may follow. Judge "
@@ -232,6 +252,14 @@ EVENT_GUIDANCE = {
         "from this spot, not a way to inspect the candidate. When the "
         "current candidate is clearly not the target, leave it unresolved "
         "and choose another instance or frontier."),
+    "nav_failed": (
+        "\nNavigation to the active target failed: repeated collisions "
+        "blocked the path, so that instance was marked unreachable and "
+        "removed from the instances table (blocked_target in navigation "
+        "records it). The current RGB is attached. Choose a different "
+        "instance, a frontier, or SCAN/START_ADJUST to reconsider the "
+        "scene. REPORT_FOUND remains valid only if you confirm the active "
+        "instance by direct observation at your current position."),
     "scan_complete": (
         "\nA general panoramic scan is complete. The images show the "
         "surrounding environment rather than a target verification "
@@ -240,6 +268,19 @@ EVENT_GUIDANCE = {
         "GOTO_INSTANCE, GOTO_FRONTIER, or START_ADJUST when a short "
         "local active-exploration movement would reveal useful nearby "
         "space or correct the current camera pose."),
+    "en_route": (
+        "\nYou are mid-navigation toward the goal marked by the orange "
+        "ACTIVE star on the topdown map (navigation.active_target); the map "
+        "and frontier table are fresh, but the star's frontier may have "
+        "vanished from the fN diamonds — it is still your current "
+        "destination. New keyframes/captions reflect scenes you passed "
+        "along the way: check them for the target. Prefer "
+        "CONTINUE_NAVIGATION to keep the current path. Choose a different "
+        "action only when the current view or refreshed map shows a clearly "
+        "better option — e.g. the target visible ahead (then instantiate or "
+        "START_ADJUST for a closer look), a promising instance, or a "
+        "frontier leading into a new region. Choosing any other action "
+        "abandons the current path and restarts planning."),
     "finish_check": (
         "\nFINISH is irreversible. Inspect instance memory and task progress "
         "before deciding."),

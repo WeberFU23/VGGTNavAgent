@@ -9,6 +9,7 @@
 但保留来源和两类信息增益供排序、日志与鸟瞰图解释。
 """
 
+import math
 from collections import deque
 
 import numpy as np
@@ -45,8 +46,17 @@ def zhang_suen_thinning(binary, max_iter=200):
     return img.astype(bool)
 
 
-def _label8(mask):
-    """8 连通标记，返回 (labels int32, n)。"""
+def _label8(mask, radius=1):
+    """连通域标注，返回 (labels int32, n)。
+
+    ``radius=1`` 是 8 邻接（3x3 窗口）；``radius=2`` 是 24 邻接
+    （5x5 窗口去中心）。frontier 聚类用 24 邻接：同一门洞/走廊口的
+    几何与语义 frontier 环常被 1-2 格的观测间隙断成多个簇，放宽
+    邻接半径让断口在像素层直接合并。注意 5x5 窗口可能跨过 1-2 格
+    厚的障碍两侧，把墙两边的边界也连成一簇——frontier 像素本身都
+    在 free 格上，且下游有 A* 可达过滤，行为可控；代价是簇的
+    size/gain 偏大。
+    """
     h, w = mask.shape
     labels = np.zeros((h, w), dtype=np.int32)
     n = 0
@@ -58,8 +68,10 @@ def _label8(mask):
         q = deque([(sy, sx)])
         while q:
             y, x = q.popleft()
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if dy == 0 and dx == 0:
+                        continue
                     ny, nx = y + dy, x + dx
                     if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] \
                             and not labels[ny, nx]:
@@ -226,7 +238,8 @@ def frontier_clusters(grid, min_size=5, info_radius=5,
     frontier = layers["unified"]
     if not frontier.any():
         return ([], layers) if return_layers else []
-    labels, n = _label8(frontier)
+    # 24 邻接：断口（1-2 格观测间隙）在同一簇内合并，见 _label8 注释。
+    labels, n = _label8(frontier, radius=2)
     clusters = []
     for cid in range(1, n + 1):
         ys, xs = np.nonzero(labels == cid)
@@ -271,3 +284,38 @@ def frontier_clusters(grid, min_size=5, info_radius=5,
         })
     clusters.sort(key=lambda c: -c["size"])
     return (clusters, layers) if return_layers else clusters
+
+
+def merge_same_spot(clusters, scale, radius_m=1.5):
+    """轮内归并：代表点距离 < radius_m 的候选合并为一个。
+
+    8 连通只保证像素级聚合：同一个门洞/走廊口的几何与语义 frontier
+    环可能断成多个簇，代表点只差 1-3 格，但物理上是同一个探索目标。
+    合并后下游（A*、打分、VLM 候选表、鸟瞰图标注）只处理一次，
+    VLM 不再看到同一位置的一串冗余候选。
+
+    ``scale`` 是把 world 坐标（SLAM 单位）换算为米的系数，与调用方
+    ``_plan_exploration`` 使用的尺度一致。按 size 降序处理，大簇先落位
+    成为锚点；被并入簇的 size/gain 累加到锚上，reason 取并集。
+    原地修改 ``clusters`` 内的 dict 之外，返回新的合并列表，不改变
+    输入列表本身。
+    """
+    if radius_m <= 0 or len(clusters) < 2:
+        return list(clusters)
+    merged = []
+    for c in sorted(clusters, key=lambda c: -c.get("size", 0)):
+        world = np.asarray(c["world"], dtype=np.float64)[:2]
+        for m in merged:
+            if math.dist(
+                    world, np.asarray(m["world"], dtype=np.float64)[:2]) \
+                    * (scale or 1.0) < radius_m:
+                m["size"] += c.get("size", 0)
+                m["geometry_gain"] += c.get("geometry_gain", 0)
+                m["semantic_gain"] += c.get("semantic_gain", 0)
+                m["information_gain"] += c.get("information_gain", 0)
+                if m["reason"] != c.get("reason", "geometry"):
+                    m["reason"] = "both"
+                break
+        else:
+            merged.append(dict(c))
+    return merged

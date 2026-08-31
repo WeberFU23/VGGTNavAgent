@@ -11,9 +11,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from benchmark_api import Action
+from agents import navigator as nav
 from agents.decision_state import build_world_state
 from agents.nav_agent import NavAgent
-from decision import DecisionLoop
+from decision import DecisionLoop, DecisionResult
 from mapping.caption_store import CaptionStore
 from mapping.client import MappingClient
 
@@ -171,51 +173,126 @@ def test_view_frame_returns_jpeg_payload():
     assert agent._tool_view_frame(7) is None
 
 
-# ------------------------------- 工具：ground_target / instantiate_points
-def test_ground_target_without_frame_retrieves_and_ingests_hits():
+# ------------------------------- 工具：use_molmo_point / instantiate_points
+def _candidate():
+    """两段式 instantiate_points 第一段的候选行（prepare_pixels 输出）。"""
+    return {"frame_id": 5, "pixel": [330, 186], "pixel_norm": [637.1, 359.1],
+            "candidate_id": "c5", "bbox": [300, 160, 380, 220],
+            "point_score": 0.9}
+
+
+def _two_stage_client():
+    """带 prepare_pixels/get_candidate_evidence/resolve_candidates 的 mock。
+
+    prepare_pixels 按请求的像素生成候选（与真实服务端一致），使不同坐标
+    的重发得到不同 pixel_norm，从而能测试 ±2 容差确认与未确认分支。
+    """
+
+    def prepare_pixels(fid, pixels, normalized=True):
+        cand = _candidate()
+        cand["pixel_norm"] = [float(pixels[0][0]), float(pixels[0][1])]
+        cand["pixel"] = [round(p * 518.0 / 1000.0, 1)
+                         for p in cand["pixel_norm"]]
+        return {"candidates": [cand]}
+
+    return SimpleNamespace(
+        prepare_pixels=prepare_pixels,
+        get_candidate_evidence=lambda cid:
+            ({"found": True}, b"confirm-jpeg") if cid == "c5"
+            else ({"found": False}, b""),
+        resolve_candidates=lambda ids:
+            {"c5": {"found": True, "point": [1.0, 2.0, 0.0]}})
+
+
+def test_instantiate_points_unconfirmed_returns_pending_and_no_instances():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    agent.client = SimpleNamespace(
-        ground_object=lambda text, top_k: [_hit(), {"found": False}])
-    rows = agent._tool_ground_target("basket")
+    agent.client = _two_stage_client()
+    out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    # 第一段：只渲染十字证据图返回，不注册任何实例
+    assert out["instances"] == []
+    assert out["semantic_rejections"] == []
+    assert out["geometry_rejections"] == []
+    assert out["pending_confirmation"] == [
+        {"candidate_id": "c5", "frame_id": 5, "pixel": [637.1, 359.1]}]
+    assert out["_tool_images"] == [("confirm_c5", b"confirm-jpeg")]
+    assert agent.memory.nodes == []
+
+
+def test_instantiate_points_resubmit_same_pixels_confirms_and_ingests():
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent.client = _two_stage_client()
+    first = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    assert first["instances"] == []
+    second = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    assert "pending_confirmation" not in second
+    assert "_tool_images" not in second      # 十字图已渲染过，不重复渲染
     assert len(agent.memory.nodes) == 1
-    node = agent.memory.nodes[0]
-    assert rows["instances"] == [{"instance_id": node.iid, "observation_id": 1,
-                     "frame_id": 5, "confidence": 0.9,
-                     "association": "new_without_visual_relation",
-                     "reported": False}]
+    row = second["instances"][0]
+    assert row["instance_id"] == agent.memory.nodes[0].iid
+    assert row["observation_id"] == 1
+    assert row["frame_id"] == 5
+    assert row["association"] == "new_without_visual_relation"
+    assert agent.memory.nodes[0].text == "basket"
 
 
-def test_ground_target_with_frame_skips_retrieval_and_uses_exact_frame():
+def test_instantiate_points_rounding_within_tolerance_confirms():
+    """VLM 重发同坐标但四舍五入（±2）仍视为确认。"""
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    seen = []
-
-    def point_frame(frame_id, query):
-        seen.append((frame_id, query))
-        return {"results": [_hit()]}
-
-    agent.client = SimpleNamespace(
-        point_frame=point_frame,
-        ground_object=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("ground_object must not run for a fixed frame")))
-    rows = agent._tool_ground_target("basket by the sink", frame_id=5)
-    assert seen == [(5, "basket by the sink")]
-    assert rows["instances"][0]["frame_id"] == 5
+    agent.client = _two_stage_client()
+    agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    out = agent._tool_instantiate_points(5, [[637, 359]], "basket")
+    assert "pending_confirmation" not in out
+    assert len(agent.memory.nodes) == 1
+    # 明显不同的坐标不算确认，重新进入 pending
+    out2 = agent._tool_instantiate_points(5, [[300.0, 300.0]], "basket")
+    assert out2["instances"] == []
+    assert out2["pending_confirmation"][0]["candidate_id"] == "c5"
 
 
-def test_ground_target_requires_observation_and_handles_errors():
+def test_instantiate_points_geometry_rejection_when_depth_invalid():
     agent = _make_agent()
-    assert "error" in agent._tool_ground_target("basket")   # 尚无观测
+    agent._last_observation = SimpleNamespace(step_count=50)
+    client = _two_stage_client()
+    client.resolve_candidates = lambda ids: {
+        "c5": {"found": False, "error": "no valid depth"}}
+    agent.client = client
+    agent._crosshair_confirmed.add((5, (637.1, 359.1)))   # 已看图确认
+    out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    assert out["instances"] == []
+    assert "pending_confirmation" not in out
+    assert out["geometry_rejections"] == [{
+        "candidate_id": "c5", "frame_id": 5,
+        "pixel": [637.1, 359.1], "reason": "no valid depth"}]
+    assert agent.memory.nodes == []
+
+
+def test_molmo_confirmed_pixels_instantiate_without_pending():
+    """use_molmo_point 渲染并登记过的坐标可直接注册。"""
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent.client = _two_stage_client()
+    agent._crosshair_confirmed.add((5, (637.1, 359.1)))
+    out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    assert "pending_confirmation" not in out
+    assert "_tool_images" not in out
+    assert len(agent.memory.nodes) == 1
+
+
+def test_instantiate_points_requires_observation_and_handles_errors():
+    agent = _make_agent()
+    assert "error" in agent._tool_instantiate_points(5, [[500, 500]], "basket")
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = SimpleNamespace(
-        ground_object=lambda text, top_k: (_ for _ in ()).throw(
+        prepare_pixels=lambda *_a, **_k: (_ for _ in ()).throw(
             RuntimeError("rpc down")))
-    assert "error" in agent._tool_ground_target("basket")
+    assert "error" in agent._tool_instantiate_points(5, [[500, 500]], "basket")
     agent.client = SimpleNamespace(
-        ground_object=lambda text, top_k: [{"found": False}])
-    assert agent._tool_ground_target("basket") == {
-        "instances": [], "semantic_rejections": []}
+        prepare_pixels=lambda *_a, **_k: {"candidates": []})
+    assert agent._tool_instantiate_points(5, [[500, 500]], "basket") == {
+        "instances": [], "semantic_rejections": [], "geometry_rejections": []}
 
 
 def test_instantiate_points_uses_normalized_pixels_and_ingests():
@@ -268,94 +345,34 @@ def test_instantiate_points_propagates_server_error():
     assert "error" in out
 
 
-def test_instantiation_semantic_validation_rejects_wrong_surface():
-    agent = _make_agent()
-    agent._last_observation = SimpleNamespace(
-        step_count=50, episode_id="semantic-test")
-    hit = _hit()
-    hit.pop("semantic_validation")
-    hit["pixel"] = [640, 360]
-
-    class VLM:
-        enabled = True
-
-        def set_trace_context(self, **_kwargs):
-            pass
-
-        def chat_json(self, prompt, images, trace_kind=None):
-            assert "crosshair" in prompt.lower()
-            assert "pixel coordinate is (640, 360)" in prompt
-            assert images == [("marked_instantiation", b"marked-jpeg")]
-            assert trace_kind == "instance_semantic_validation"
-            return {"valid": False, "confidence": 0.98,
-                    "reason": "crosshair center is on the wall"}
-
-    agent.vlm = VLM()
-    agent.client = SimpleNamespace(
-        instantiate_pixels=lambda *_args, **_kwargs: {"results": [hit]},
-        get_candidate_evidence=lambda _cid:
-            ({"found": True}, b"marked-jpeg"))
-    out = agent._tool_instantiate_points(5, [[500, 500]], "basket")
-    assert out["instances"] == []
-    assert out["semantic_rejections"][0]["valid"] is False
-    assert "wall" in out["semantic_rejections"][0]["reason"]
-    # 拒绝证据图经 _tool_images 通道带回决策层（修正闭环视觉锚点）
-    assert out["_tool_images"] == [("reject_c5_evidence", b"marked-jpeg")]
-    assert agent.memory.nodes == []
-
-
-def test_semantic_rejection_images_reach_decision_prompt():
+def test_confirm_images_reach_decision_prompt():
     """agent_loop 将 _tool_images 弹出 JSON 并附加到下一轮提示的图像通道。"""
     import decision.agent_loop as loop_mod
 
-    seen_images = {}
-
     class Chat:
-        def __init__(self):
-            self.prompts = []
-
         def decide(self, event, state, state_fn, **kwargs):
             return None  # 不实际调用
 
     chat = Chat()
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
-    agent.target_text = "basket"
-    agent._target_mode = "all"
-    hit = _hit()
-    hit.pop("semantic_validation")
-
-    class VLM:
-        enabled = True
-
-        def set_trace_context(self, **_kwargs):
-            pass
-
-        def chat_json(self, prompt, images, trace_kind=None):
-            return {"valid": False, "confidence": 0.98,
-                    "reason": "mark on the floor"}
-
-    agent.vlm = VLM()
-    agent.client = SimpleNamespace(
-        instantiate_pixels=lambda *_args, **_kwargs: {"results": [hit]},
-        get_candidate_evidence=lambda _cid:
-            ({"found": True}, b"reject-jpeg"))
+    agent.client = _two_stage_client()
 
     loop = loop_mod.DecisionLoop(
         chat_fn=chat, tools={
             "instantiate_points": agent._tool_instantiate_points})
     payload, images, ok = loop._run_tool(
         {"name": "instantiate_points", "frame_id": 5,
-         "pixels_1000": [[500, 500]], "label": "basket"})
+         "pixels_1000": [[637.1, 359.1]], "label": "basket"})
     assert ok
     # 证据图不进 JSON
     assert "_tool_images" not in payload
-    assert images == [("reject_c5_evidence", b"reject-jpeg")]
+    assert images == [("confirm_c5", b"confirm-jpeg")]
     # 附加到图像通道：重复调用同 label 不累积
     images2 = loop._with_tool_image(
-        list(images), "reject_c5_evidence", b"reject-jpeg-2")
+        list(images), "confirm_c5", b"confirm-jpeg-2")
     assert len(images2) == 1
-    assert images2[0] == ("reject_c5_evidence", b"reject-jpeg-2")
+    assert images2[0] == ("confirm_c5", b"confirm-jpeg-2")
 
 
 def test_pointing_backend_error_code_reaches_decision_tool():
@@ -363,29 +380,51 @@ def test_pointing_backend_error_code_reaches_decision_tool():
     agent.client = SimpleNamespace(point_pixels=lambda *_args, **_kwargs: {
         "points": [], "error_code": "POINTING_BACKEND_UNAVAILABLE",
         "error": "connection refused"})
-    out = agent._tool_point_frame(7, "basket")
+    out = agent._tool_use_molmo_point(7, "basket")
     assert out == {"error": {
         "code": "POINTING_BACKEND_UNAVAILABLE",
         "message": "connection refused"}}
 
 
-def test_point_frame_returns_normalized_pixels():
+def test_use_molmo_point_returns_normalized_pixels_and_registers_crosshair():
     agent = _make_agent()
     agent.client = SimpleNamespace(
         point_pixels=lambda fid, text: {
             "width": 1280, "height": 720,
             "points": [{"pixel": [640.0, 360.0], "confidence": 1.0,
-                        "bbox": None}]})
-    out = agent._tool_point_frame(7, "wooden chair")
-    assert out == {"points": [{"pixel": [500.0, 500.0]}]}
+                        "bbox": None}]},
+        evidence_for_point=lambda fid, pixel, bbox:
+            ({"found": True}, b"molmo-jpeg"))
+    out = agent._tool_use_molmo_point(7, "wooden chair")
+    assert out["points"] == [{"pixel": [500.0, 500.0], "confidence": 1.0}]
+    # 十字证据图随结果返回，供 VLM 看图审核
+    assert out["_tool_images"] == [("molmo_point_7_0", b"molmo-jpeg")]
+    # 渲染即登记：该坐标随后可直接 instantiate_points 注册（免 pending）
+    assert agent._crosshair_is_confirmed(7, [500.0, 500.0])
 
 
-def test_point_frame_propagates_server_error():
+def test_use_molmo_point_skips_unrenderable_points():
+    """证据图渲染失败的标点返回坐标但不登记确认资格。"""
+    agent = _make_agent()
+    agent.client = SimpleNamespace(
+        point_pixels=lambda fid, text: {
+            "width": 1280, "height": 720,
+            "points": [{"pixel": [640.0, 360.0], "confidence": 1.0,
+                        "bbox": None}]},
+        evidence_for_point=lambda fid, pixel, bbox:
+            ({"found": False}, b""))
+    out = agent._tool_use_molmo_point(7, "wooden chair")
+    assert out["points"] == [{"pixel": [500.0, 500.0], "confidence": 1.0}]
+    assert "_tool_images" not in out
+    assert not agent._crosshair_is_confirmed(7, [500.0, 500.0])
+
+
+def test_use_molmo_point_propagates_server_error():
     agent = _make_agent()
     agent.client = SimpleNamespace(
         point_pixels=lambda fid, text: {"points": [],
                                         "error": "unknown frame_id 99"})
-    out = agent._tool_point_frame(99, "wooden chair")
+    out = agent._tool_use_molmo_point(99, "wooden chair")
     assert "error" in out
 
 
@@ -624,3 +663,139 @@ def test_client_get_captions_rpc_shape():
     assert seen[0]["cmd"] == "get_captions"
     assert seen[0]["frame_ids"] == [3, 5]
     assert out["captions"] == [{"frame_id": 3, "caption": "x"}]
+
+
+# ---------------------------------------------------------- nav 卡死恢复（方案 A）
+def _nav_action_agent():
+    """mode=nav + follower 挂 2m 直线路径；client 最小依赖，规划可替换。"""
+    agent = _make_agent()
+    fl = nav.PathFollower(scale=1.0, reach_m=0.8)
+    fl.x, fl.y, fl.yaw = 0.0, 0.0, 0.0
+    fl.set_path([(0.0, 0.0), (2.0, 0.0)])
+    agent.follower = fl
+    agent.mode = "nav"
+    agent.target_point = np.array([2.0, 0.0, 0.0])
+    agent.target_instance_id = 3
+    agent._last_plan_step = 0
+    agent._last_motion_failed = False
+    agent._refresh_anchor = lambda poses, frame_ids: None
+    return agent
+
+
+def test_nav_collision_replans_once_then_stuck():
+    """撞墙先重规划一次（可能绕开），连续撞 nav_collision_limit 次才 stuck。"""
+    agent = _nav_action_agent()
+    planned = []
+    agent._plan_to_target = lambda obs: planned.append(1) or True
+    obs = SimpleNamespace(step_count=1)
+    # 无碰撞：计数保持 0
+    action, arrived, stuck = agent._nav_action(obs)
+    assert not stuck and not arrived and action is not None
+    assert agent._nav_collision_streak == 0
+    # 碰撞 1：立即重规划一次，返回新路径动作，不触发 stuck
+    agent._last_motion_failed = True
+    action, arrived, stuck = agent._nav_action(obs)
+    assert not stuck and not arrived
+    assert action == int(Action.MOVE_FORWARD)
+    assert len(planned) == 1
+    # 碰撞 2（已重规划过）：跟随现有路径，不重复重规划
+    action, arrived, stuck = agent._nav_action(obs)
+    assert not stuck
+    assert len(planned) == 1
+    # 碰撞 3：达到 nav_collision_limit → stuck
+    action, arrived, stuck = agent._nav_action(obs)
+    assert stuck and action is None and not arrived
+    assert agent._nav_collision_streak == 3
+    # 恢复运动后计数清零，可再次进入卡死检测
+    agent._last_motion_failed = False
+    action, arrived, stuck = agent._nav_action(obs)
+    assert agent._nav_collision_streak == 0 and not stuck
+
+
+def test_nav_stuck_recovery_marks_unreachable_and_asks_decider():
+    """stuck → 实例标记不可达 + nav_failed 决策事件 + 映射动作执行。"""
+    agent = _nav_action_agent()
+    agent.client = SimpleNamespace(
+        get_all_poses=lambda: (np.stack([np.eye(4)] * 3), [0, 1, 2]),
+        get_state=lambda: {"caption_pending": 0})
+    events = []
+
+    class _Loop:
+        def decide(self, event, state, map_png=None, images=None,
+                   state_fn=None):
+            events.append(event)
+            state, _map = state_fn()
+            assert state["navigation"]["blocked_target"]["instance_id"] == 3
+            return DecisionResult("FINISH", None)
+
+    agent.decision_loop = _Loop()
+    agent._plan_to_target = lambda obs: True
+    obs = SimpleNamespace(step_count=1, max_steps=500,
+                          rgb=np.zeros((16, 16, 3), dtype=np.uint8))
+    agent._last_motion_failed = True
+    agent._nav_action(obs)                 # streak 1
+    agent._last_motion_failed = True
+    agent._nav_action(obs)                 # streak 2
+    agent._last_motion_failed = True
+    action, arrived, stuck = agent._nav_action(obs)   # streak 3 → stuck
+    assert stuck
+    result = agent._nav_failed_recovery(obs)
+    assert 3 in agent._unreachable_instance_ids
+    assert events == ["nav_failed"]
+    assert result == int(Action.FINISH)
+
+
+def test_nav_stuck_recovery_fallback_to_explore_when_decider_unavailable():
+    agent = _nav_action_agent()
+    agent._unreachable_instance_ids.clear()
+    agent._plan_to_target = lambda obs: True
+    obs = SimpleNamespace(step_count=1)
+    for _ in range(3):
+        agent._last_motion_failed = True
+        agent._nav_action(obs)
+    result = agent._nav_failed_recovery(obs)   # decision_loop None
+    assert 3 in agent._unreachable_instance_ids
+    assert agent.mode == "explore"
+    assert isinstance(result, int)
+
+
+def test_unreachable_instance_excluded_from_world_state():
+    agent = _make_agent()
+    agent._unreachable_instance_ids = {2}
+    agent.memory = SimpleNamespace(
+        nodes=[
+            SimpleNamespace(iid=1, reported=False, text="basket",
+                            point=np.array([1.0, 1.0, 0.0]), step=1,
+                            observation_ids=[], report_claim_id=None,
+                            candidate_id=None),
+            SimpleNamespace(iid=2, reported=False, text="basket too",
+                            point=np.array([2.0, 2.0, 0.0]), step=2,
+                            observation_ids=[], report_claim_id=None,
+                            candidate_id=None)])
+    obs = SimpleNamespace(step_count=50, max_steps=500,
+                          goal_text="Find all baskets")
+    state = build_world_state(agent, obs)
+    assert [r["id"] for r in state["instances"]] == [1]
+    assert state["instances_total"] == 2
+    assert state["instances_unreachable_ids"] == ["2"]
+
+
+def test_activate_memory_target_skips_unreachable():
+    agent = _make_agent()
+    agent._unreachable_instance_ids = {1}
+    agent.memory = SimpleNamespace(
+        nodes=[
+            SimpleNamespace(iid=1, reported=False, text="basket",
+                            point=np.array([1.0, 1.0, 0.0]), step=1,
+                            observation_ids=[], report_claim_id=None,
+                            candidate_id=None),
+            SimpleNamespace(iid=2, reported=False, text="basket too",
+                            point=np.array([2.0, 2.0, 0.0]), step=2,
+                            observation_ids=[], report_claim_id=None,
+                            candidate_id=None)])
+    agent._ordered_memory_nodes = lambda: agent.memory.nodes
+    agent._plan_to_target = lambda obs: True
+    obs = SimpleNamespace(step_count=1)
+    assert agent._activate_memory_target(obs)
+    assert agent.target_instance_id == 2
+    assert agent.mode == "nav"

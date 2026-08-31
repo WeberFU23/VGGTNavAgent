@@ -53,7 +53,12 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
     max_instances = int(os.environ.get(
         "NAV_STATE_MAX_INSTANCES", str(MAX_STATE_INSTANCES)))
     nodes = list(agent.memory.nodes)
-    unreported = [nd for nd in nodes if not nd.reported]
+    # 导航确认不可达的实例不进候选表（VLM 不会主动再选；REPORT_FOUND
+    # 校验仍可用——agent 可能就停在目标旁，直接观察可确认）。
+    unreachable_ids = getattr(agent, "_unreachable_instance_ids",
+                              None) or set()
+    unreported = [nd for nd in nodes
+                  if not nd.reported and nd.iid not in unreachable_ids]
     reported_ids = [nd.iid for nd in nodes if nd.reported]
     reported_instances = [{
         "id": nd.iid,
@@ -109,6 +114,8 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         "instances": instances,
         "instances_total": len(nodes),
         "instances_omitted_ids": omitted_ids,
+        "instances_unreachable_ids": sorted(
+            str(i) for i in unreachable_ids),
         "reported_instance_ids": reported_ids,
         "reported_instances": reported_instances,
         "report_claims": [claim.as_dict() for claim in

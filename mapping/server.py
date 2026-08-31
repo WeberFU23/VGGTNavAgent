@@ -1028,6 +1028,7 @@ class MappingServer:
                 "candidate_id": meta["candidate_id"],
                 "frame_id": fid,
                 "pixel": [x, y],
+                "pixel_norm": meta["pixel_norm"],
                 "point_score": 1.0,
                 "bbox": meta.get("bbox"),
             })
@@ -1119,8 +1120,11 @@ class MappingServer:
         sampled = sample_point_depth(
             pts_world, conf, pixel, patch=self.point_patch,
             cam_origin=cam_origin, bbox=point_info.get("bbox"))
+        pixel_norm = [float(pixel[0]) / w * 1000.0,
+                      float(pixel[1]) / h * 1000.0]
         if not sampled["found"]:
             return {"found": False, "pixel": [float(pixel[0]), float(pixel[1])],
+                    "pixel_norm": pixel_norm,
                     "point_score": float(point_info["confidence"]),
                     "num_points": int(sampled["num_points"])}
         out = {
@@ -1130,6 +1134,7 @@ class MappingServer:
             "depth_std": sampled["depth_std"],
             "spread": sampled["spread"],
             "pixel": [float(pixel[0]), float(pixel[1])],
+            "pixel_norm": pixel_norm,
             "point_score": float(point_info["confidence"]),
         }
         if register:
@@ -1156,11 +1161,16 @@ class MappingServer:
         yy, xx = np.mgrid[0:h, 0:w]
         disk = (xx - pixel[0]) ** 2 + (yy - pixel[1]) ** 2 \
             <= (max(self.point_patch, 8) / 2.0) ** 2
+        # pixel_norm 与决策 VLM 的 pixels_1000 同约定（0-1000 归一化），
+        # 供语义审核拒绝记录原样返回，避免 VLM 把原始帧坐标当归一化坐标。
+        pixel_norm = [float(pixel[0]) / w * 1000.0,
+                      float(pixel[1]) / h * 1000.0]
         self._ground_candidates[candidate_id] = {
             "submap_id": sid,
             "frame_index": int(idx),
             "frame_id": int(frame_id),
             "pixel": (float(pixel[0]), float(pixel[1])),
+            "pixel_norm": pixel_norm,
             "mask": disk,
             "bbox": np.asarray([x0, y0, x1, y1], dtype=np.float32),
             "point_score": float(score),
@@ -1169,7 +1179,8 @@ class MappingServer:
             self._ground_candidates.pop(next(iter(self._ground_candidates)))
         return {"candidate_id": candidate_id,
                 "point_score": float(score),
-                "bbox": [x0, y0, x1, y1]}
+                "bbox": [x0, y0, x1, y1],
+                "pixel_norm": pixel_norm}
 
     def resolve_candidate(self, candidate_id):
         """在当前图优化结果下重新采样 pointing 像素的 3D 点。"""
@@ -1219,14 +1230,7 @@ class MappingServer:
         # object: a high-contrast crosshair is clearer to the verifier than a
         # translucent patch alone.
         px, py = (int(round(value)) for value in cand["pixel"])
-        radius = max(10, self.point_patch)
-        for thickness, color in ((5, (0, 0, 0)), (2, (255, 255, 0))):
-            cv2.line(overlay, (max(0, px - radius), py),
-                     (min(overlay.shape[1] - 1, px + radius), py),
-                     color, thickness, cv2.LINE_AA)
-            cv2.line(overlay, (px, max(0, py - radius)),
-                     (px, min(overlay.shape[0] - 1, py + radius)),
-                     color, thickness, cv2.LINE_AA)
+        self._draw_crosshair(overlay, px, py)
         x0, y0, x1, y1 = np.asarray(cand["bbox"], dtype=int)
         h, w = overlay.shape[:2]
         margin = max(8, int(0.1 * max(x1 - x0, y1 - y0)))
@@ -1234,6 +1238,64 @@ class MappingServer:
         x1, y1 = min(w, x1 + margin), min(h, y1 + margin)
         crop = overlay[y0:y1, x0:x1]
         if crop.size == 0:
+            crop = overlay
+        panel = self._evidence_panel(overlay, crop)
+        ok, encoded = cv2.imencode(
+            ".jpg", cv2.cvtColor(panel, cv2.COLOR_RGB2BGR),
+            [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return {"found": False, "error": "jpeg encode failed"}, b""
+        return {"found": True, "mime_type": "image/jpeg"}, encoded.tobytes()
+
+    def _draw_crosshair(self, overlay, px, py, radius=None):
+        """高对比十字：黑 outline + 黄芯，标出验证/确认的精确像素。"""
+        if radius is None:
+            radius = max(10, self.point_patch)
+        for thickness, color in ((5, (0, 0, 0)), (2, (255, 255, 0))):
+            cv2.line(overlay, (max(0, px - radius), py),
+                     (min(overlay.shape[1] - 1, px + radius), py),
+                     color, thickness, cv2.LINE_AA)
+            cv2.line(overlay, (px, max(0, py - radius)),
+                     (px, min(overlay.shape[0] - 1, py + radius)),
+                     color, thickness, cv2.LINE_AA)
+
+    def evidence_for_point(self, frame_id, pixel, bbox=None):
+        """按像素渲染十字证据面板（不注册候选）。
+
+        供 use_molmo_point 把 pointing 模型标点渲染成 VLM 可确认的证据图：
+        左半全帧 overlay + 十字，右半 bbox 放大裁剪 + 十字。与候选证据
+        面板同形态，但完全无状态，不进入 _ground_candidates。
+        """
+        located = self._locate_frame(int(frame_id))
+        if located is None:
+            return {"found": False, "error": "unknown frame"}, b""
+        from torchvision.transforms.functional import to_pil_image
+        with self.data_lock:
+            submap = self.solver.map.get_submap(located[0])
+            rgb = np.asarray(to_pil_image(
+                submap.get_frame_at_index(located[1])))
+        overlay = rgb.copy()
+        try:
+            px, py = int(round(float(pixel[0]))), int(round(float(pixel[1])))
+        except (TypeError, ValueError, IndexError):
+            return {"found": False, "error": "invalid pixel"}, b""
+        self._draw_crosshair(overlay, px, py)
+        if bbox is not None:
+            try:
+                x0, y0, x1, y1 = (int(round(v)) for v in bbox)
+            except (TypeError, ValueError):
+                x0, y0, x1, y1 = None, None, None, None
+            if x0 is not None:
+                h, w = overlay.shape[:2]
+                margin = max(8, int(0.1 * max(x1 - x0, y1 - y0)))
+                x0, y0 = max(0, x0 - margin), max(0, y0 - margin)
+                x1, y1 = min(w, x1 + margin), min(h, y1 + margin)
+                crop = overlay[y0:y1, x0:x1]
+                if crop.size == 0:
+                    crop = overlay
+            else:
+                crop = overlay
+        else:
             crop = overlay
         panel = self._evidence_panel(overlay, crop)
         ok, encoded = cv2.imencode(
@@ -1374,6 +1436,11 @@ class MappingServer:
                 header.get("candidate_ids", []))}, b""
         if cmd == "candidate_evidence":
             resp, evidence = self.candidate_evidence(header["candidate_id"])
+            return {"ok": True, **resp}, evidence
+        if cmd == "evidence_for_point":
+            resp, evidence = self.evidence_for_point(
+                int(header["frame_id"]), header.get("pixel", []),
+                header.get("bbox"))
             return {"ok": True, **resp}, evidence
         if cmd == "ground_frame":
             rgb = self._decode_rgb(header.get("shape"), payload)

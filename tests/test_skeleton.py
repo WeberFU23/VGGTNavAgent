@@ -129,6 +129,83 @@ def test_frontier_representative_is_free_and_reports_gain():
     assert clusters[0]["clearance_cells"] > 0
 
 
+def test_frontier_24_adjacency_merges_gaps():
+    """frontier 连通域用 24 邻接：1 格观测间隙的断口应合并成同一簇。"""
+    import numpy as np
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[10, 3:17] = True
+    # 1 格间隙：8 邻接断开、24 邻接（5x5 窗口）合并
+    mask[10, 9] = False
+    labels8, n8 = sk._label8(mask, radius=1)
+    labels24, n24 = sk._label8(mask, radius=2)
+    assert n8 == 2, "8 邻接应断开"
+    assert n24 == 1, "24 邻接应合并 1 格间隙"
+    assert labels24[10, 3] == labels24[10, 12] == 1
+    # 2 格间隙超出 24 邻接跨越能力（最大跳过 1 个缺失格）
+    mask[10, 9:11] = False
+    _, n24b = sk._label8(mask, radius=2)
+    assert n24b == 2
+    # 斜向错位一格的两条带也应在 24 邻接下连通
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[10, 3:8] = True
+    mask[11, 8:13] = True
+    assert sk._label8(mask, radius=1)[1] == 1
+    mask[10, 8] = False
+    mask[11, 8] = False
+    assert sk._label8(mask, radius=1)[1] == 2
+    assert sk._label8(mask, radius=2)[1] == 1
+
+
+def test_merge_same_spot_combines_nearby_and_keeps_far():
+    """同一位置的断簇应合并为一个候选；远处目标保留。"""
+    import numpy as np
+    base = {
+        "cell": (0, 0), "centroid_cell": (0, 0),
+        "world": np.array([0.0, 0.0, 0.0]),
+        "size": 10, "reason": "geometry", "geometry_gain": 8,
+        "semantic_gain": 0, "information_gain": 8, "clearance_cells": 9,
+    }
+    near = dict(base)
+    near["world"] = np.array([1.0, 0.0, 0.0])
+    near["size"] = 6
+    near["reason"] = "semantic"
+    near["geometry_gain"] = 0
+    near["semantic_gain"] = 5
+    far = dict(base)
+    far["world"] = np.array([5.0, 0.0, 0.0])
+    far["size"] = 20
+    out = sk.merge_same_spot([far, near, base], scale=1.0, radius_m=1.5)
+    assert len(out) == 2, "近簇应合并、远簇保留"
+    by_size = sorted(out, key=lambda c: -c["size"])
+    assert by_size[0]["size"] == 20, "大簇作为独立锚点保留"
+    merged = by_size[1]
+    assert merged["size"] == 16, "base(10) + near(6)"
+    assert merged["reason"] == "both"
+    assert merged["geometry_gain"] == 8 and merged["semantic_gain"] == 5
+
+
+def test_merge_same_spot_scale_and_disable():
+    """scale 参与距离换算；radius<=0 时禁用合并。"""
+    import numpy as np
+    base = {
+        "cell": (0, 0), "centroid_cell": (0, 0),
+        "world": np.array([0.0, 0.0, 0.0]), "size": 5, "reason": "geometry",
+        "geometry_gain": 1, "semantic_gain": 0, "information_gain": 1,
+        "clearance_cells": 5,
+    }
+    other = dict(base)
+    other["world"] = np.array([2.0, 0.0, 0.0])
+    # 2.0 米 > 1.5 阈值：不合并
+    assert len(sk.merge_same_spot([base, other], scale=1.0, radius_m=1.5)) == 2
+    # scale=0.5 → 2.0 单位 = 1.0 米 < 1.5：合并
+    out = sk.merge_same_spot([base, other], scale=0.5, radius_m=1.5)
+    assert len(out) == 1
+    # radius=0：禁用
+    assert len(sk.merge_same_spot([base, other], scale=1.0, radius_m=0)) == 2
+    # 输入列表不被修改
+    assert len([base, other]) == 2
+
+
 def test_semantic_gap_creates_one_unified_frontier():
     """几何已覆盖但 caption 视角不足时，仍应产生语义型统一 frontier。"""
     free = np.zeros((20, 24), dtype=bool)
@@ -159,4 +236,7 @@ if __name__ == "__main__":
     test_observed_hole_is_not_frontier()
     test_frontier_representative_is_free_and_reports_gain()
     test_semantic_gap_creates_one_unified_frontier()
+    test_frontier_24_adjacency_merges_gaps()
+    test_merge_same_spot_combines_nearby_and_keeps_far()
+    test_merge_same_spot_scale_and_disable()
     print("ALL SKELETON TESTS PASSED")

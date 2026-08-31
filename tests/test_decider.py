@@ -57,8 +57,7 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     flat = " ".join(prompt.split())
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
                  "instantiate_points(frame_id, pixels_1000, label)",
-                 "point_frame(frame_id, query)",
-                 "ground_target(query, frame_id=null, top_k=2)",
+                 "use_molmo_point(frame_id, query)",
                  "search_instances(",
                  "get_instance(instance_id)",
                  "view_instance(instance_id)",
@@ -90,6 +89,9 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert "look_at" not in prompt
     assert "merge_instances" not in prompt
     assert "undo_merge" not in prompt
+    assert "ground_target" not in prompt
+    assert "point_frame(" not in prompt
+    assert "semantic_rejections" not in prompt
     assert "automatically" in prompt
     assert "observation_count" in prompt
     assert "query_memory" not in prompt
@@ -319,6 +321,48 @@ def test_scan_complete_reselects_globally_instead_of_reporting():
     assert result.action == "REPORT_FOUND"
 
 
+def test_continue_navigation_is_en_route_only():
+    state = _state()
+    state["navigation"]["active_target"] = {
+        "type": "frontier", "id": "active_frontier"}
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "CONTINUE_NAVIGATION"}])).decide("en_route", state)
+    assert result.action == "CONTINUE_NAVIGATION"
+    assert result.target_id is None
+    # 其他事件拒绝 CONTINUE_NAVIGATION → 校验失败重试
+    for event in ("world_state_updated", "arrival", "scan_complete"):
+        chat = _ScriptedChat([
+            {"action": "CONTINUE_NAVIGATION"},
+            {"action": "GOTO_FRONTIER", "target_id": "f0"},
+        ])
+        result = DecisionLoop(chat).decide(event, _state())
+        assert result.action == "GOTO_FRONTIER"
+
+
+def test_en_route_can_abandon_path_for_new_target():
+    for action, target_id in (("GOTO_INSTANCE", "1"),
+                              ("GOTO_FRONTIER", "f0")):
+        result = DecisionLoop(_ScriptedChat([{
+            "action": action, "target_id": target_id
+        }])).decide("en_route", _state())
+        assert result.action == action and result.target_id == target_id
+
+
+def test_prompt_documents_continue_navigation_and_en_route_guidance():
+    prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
+        "en_route", _state())
+    assert "CONTINUE_NAVIGATION" in prompt
+    assert "orange" in prompt and "ACTIVE star" in prompt
+    assert "abandons the current path" in prompt
+    assert "mid-navigation" in prompt
+    # world_state_updated 的普通决策也知晓该动作（契约部分），
+    # 但 en_route 引导只出现在 en_route 事件。
+    plain = DecisionLoop(_ScriptedChat([]))._build_prompt(
+        "world_state_updated", _state())
+    assert "CONTINUE_NAVIGATION" in plain
+    assert "mid-navigation" not in plain
+
+
 def test_report_found_requires_active_canonical_instance_id():
     state = _state(instances=[
         {"id": 1, "text": "basket", "reported": False},
@@ -359,16 +403,18 @@ def test_write_tool_refreshes_world_state_before_validation():
         {"id": 2, "text": "resolved red cup", "reported": False},
     ])
 
-    def ground_target(query, frame_id=None, top_k=2):
-        return [{"instance_id": 2, "observation_id": 9,
-                 "association": "visual_relation"}]
+    def instantiate_points(frame_id, pixels_1000, label=""):
+        return {"instances": [{"instance_id": 2, "observation_id": 9,
+                               "association": "visual_relation"}],
+                "geometry_rejections": []}
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "ground_target", "query": "red cup"}},
+        {"tool_call": {"name": "instantiate_points", "frame_id": 5,
+                       "pixels_1000": [[500, 500]], "label": "red cup"}},
         {"action": "GOTO_INSTANCE", "target_id": "2"},
     ])
     result = DecisionLoop(
-        chat, tools={"ground_target": ground_target}).decide(
+        chat, tools={"instantiate_points": instantiate_points}).decide(
             "world_state_updated", stale, state_fn=lambda: fresh)
     assert result.action == "GOTO_INSTANCE" and result.target_id == "2"
     assert result.tool_calls == 1
@@ -411,15 +457,16 @@ def test_topdown_map_is_prioritized_after_current_rgb():
 def test_failed_write_tool_does_not_refresh_state():
     calls = []
 
-    def ground_target(query, frame_id=None, top_k=2):
+    def instantiate_points(frame_id, pixels_1000, label=""):
         return {"error": "no valid pointing result"}
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "ground_target", "query": "basket"}},
+        {"tool_call": {"name": "instantiate_points", "frame_id": 5,
+                       "pixels_1000": [[500, 500]], "label": "basket"}},
         {"action": "GOTO_INSTANCE", "target_id": "1"},
     ])
     result = DecisionLoop(
-        chat, tools={"ground_target": ground_target}).decide(
+        chat, tools={"instantiate_points": instantiate_points}).decide(
             "world_state_updated", _state(),
             state_fn=lambda: calls.append(1) or _state())
     assert result.action == "GOTO_INSTANCE" and result.target_id == "1"
@@ -634,6 +681,86 @@ def _make_agent():
     poses = np.stack([np.eye(4)] * 3)
     agent.client = SimpleNamespace(get_all_poses=lambda: (poses, [0, 1, 2]))
     return agent
+
+
+def test_en_route_decision_throttles_by_interval():
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    calls = []
+    agent._decider_next = lambda obs, event: (
+        calls.append(event) or SimpleNamespace(
+            action="CONTINUE_NAVIGATION", target_id=None), None)
+    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
+    agent._last_en_route_step = 10
+    assert agent._en_route_decision(SimpleNamespace(step_count=13)) is None
+    assert calls == []  # 间隔内不触发
+    action = agent._en_route_decision(SimpleNamespace(step_count=15))
+    assert calls == ["en_route"]
+    assert action == int(Action.MOVE_FORWARD)
+
+
+def test_en_route_continue_keeps_follower():
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    agent._active_frontier_key = (1, 2)
+    agent._last_en_route_step = 0
+    agent._decider_next = lambda obs, event: (
+        SimpleNamespace(action="CONTINUE_NAVIGATION", target_id=None), None)
+    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
+    action = agent._en_route_decision(SimpleNamespace(step_count=5))
+    assert action == int(Action.MOVE_FORWARD)
+    assert agent._explore_follower is not None  # continue 不清 follower
+    assert agent._active_frontier_key == (1, 2)
+
+
+def test_en_route_goto_frontier_keeps_new_follower():
+    # GOTO_FRONTIER 由 _decider_next 内部重建 follower；en_route 不能再清。
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    agent._active_frontier_key = (1, 2)
+    agent._last_en_route_step = 0
+    agent._decider_next = lambda obs, event: (
+        SimpleNamespace(action="GOTO_FRONTIER", target_id="f0"),
+        int(Action.MOVE_FORWARD))
+    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
+    obs = SimpleNamespace(step_count=5)
+    action = agent._en_route_decision(obs)
+    assert action == int(Action.MOVE_FORWARD)
+    assert agent._explore_follower is not None  # 新 follower 保留
+    assert agent._active_frontier_key == (1, 2)
+    assert agent._last_explore_plan == 5
+
+
+def test_en_route_scan_abandons_path_and_starts_spin():
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    agent._active_frontier_key = (1, 2)
+    agent._last_en_route_step = 0
+    agent._decider_next = lambda obs, event: (
+        SimpleNamespace(action="SCAN", target_id=None), None)
+    action = agent._en_route_decision(SimpleNamespace(step_count=5))
+    assert action == int(Action.TURN_LEFT)
+    assert agent._explore_follower is None
+    assert agent._active_frontier_key is None
+    assert agent._scanning is True
+
+
+def test_en_route_decision_failure_keeps_following():
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    agent._last_en_route_step = 0
+
+    def boom(obs, event):
+        raise RuntimeError("model unavailable")
+
+    agent._decider_next = boom
+    assert agent._en_route_decision(
+        SimpleNamespace(step_count=5)) is None
 
 
 def test_world_state_contains_text_evidence_and_no_anchor_table():
@@ -1013,8 +1140,48 @@ def test_navagent_view_instance_prefers_candidate_overlay():
     assert agent._tool_view_instance(node.iid) == b"overlay"
 
 
+# ---------------------------------------------------------- nav 卡死决策（方案 A）
+def test_nav_failed_event_allows_frontier_and_has_guidance():
+    prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
+        "nav_failed", _state())
+    assert "repeated collisions" in prompt
+    assert "blocked_target" in prompt
+    assert "removed from the instances table" in prompt
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "GOTO_FRONTIER", "target_id": "f0"}])).decide(
+        "nav_failed", _state())
+    assert result.action == "GOTO_FRONTIER"
+    # 指引只出现在 nav_failed 事件
+    plain = DecisionLoop(_ScriptedChat([]))._build_prompt(
+        "world_state_updated", _state())
+    assert "repeated collisions" not in plain
+
+
+def test_goto_unreachable_instance_rejected_but_report_allowed():
+    state = _state(instances=[
+        {"id": 1, "text": "basket", "reported": False},
+        {"id": 2, "text": "other basket", "reported": False},
+    ])
+    state["instances_unreachable_ids"] = ["2"]
+    # GOTO 不可达实例被校验拒绝 → 重试后选可达实例
+    loop = DecisionLoop(_ScriptedChat([
+        {"action": "GOTO_INSTANCE", "target_id": "2"},
+        {"action": "GOTO_INSTANCE", "target_id": "1"},
+    ]))
+    result = loop.decide("nav_failed", state)
+    assert result.action == "GOTO_INSTANCE" and result.target_id == "1"
+    # REPORT_FOUND 不可达实例仍放行：agent 可能就停在目标旁边直接确认
+    state["navigation"]["active_target"] = {"type": "instance", "id": "2"}
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "REPORT_FOUND", "target_id": "2"}])).decide(
+        "nav_failed", state)
+    assert result.action == "REPORT_FOUND"
+
+
 if __name__ == "__main__":
     test_goto_accepts_any_unreported_instance()
+    test_nav_failed_event_allows_frontier_and_has_guidance()
+    test_goto_unreachable_instance_rejected_but_report_allowed()
     test_prompt_documents_action_effects_tool_returns_and_no_confidence()
     test_search_frames_tool_call_uses_standard_result_envelope()
     test_view_instance_attaches_labeled_instance_evidence_image()

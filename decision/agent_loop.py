@@ -15,17 +15,16 @@ import time
 
 from decision.prompts import build_decision_prompt, build_final_decision_prompt
 
-ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND", "SCAN",
-           "EXPLORE", "FINISH", "START_ADJUST", "END_ADJUST",
-           "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
-           "LOOK_DOWN")
+ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "CONTINUE_NAVIGATION",
+           "REPORT_FOUND", "SCAN", "EXPLORE", "FINISH", "START_ADJUST",
+           "END_ADJUST", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT",
+           "LOOK_UP", "LOOK_DOWN")
 
 DEFAULT_MAX_TOOL_ROUNDS = 15
 FINAL_ACTION_ATTEMPTS = 2
 
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
-WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points",
-               "ground_target")
+WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points")
 
 EVENT_ACTIONS = {
     # 除 finish_check / adjustment 外放行高层动作（EXPLORE 除外——VLM 滥用
@@ -37,6 +36,15 @@ EVENT_ACTIONS = {
                 "SCAN", "FINISH", "START_ADJUST"},
     "scan_complete": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
                       "SCAN", "FINISH", "START_ADJUST"},
+    # 导航卡死（连续碰撞无法到达目标）：与 arrival 同集——当前 RGB 已附加，
+    # VLM 换目标/探索/局部调整；REPORT_FOUND 仅在能直接确认时使用。
+    "nav_failed": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
+                   "SCAN", "FINISH", "START_ADJUST"},
+    # 途中决策：CONTINUE_NAVIGATION 只在此事件放行；选其他动作即放弃
+    # 当前导航规划，按正常流程执行（导航目标在图上是橙色 ACTIVE 星，
+    # 可能已从 fN 候选表消失——见 prompts.py en_route 说明）。
+    "en_route": {"CONTINUE_NAVIGATION", "GOTO_INSTANCE", "GOTO_FRONTIER",
+                 "REPORT_FOUND", "SCAN", "FINISH", "START_ADJUST"},
     "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "FINISH"},
     "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
                    "LOOK_DOWN", "END_ADJUST"},
@@ -229,6 +237,8 @@ class DecisionLoop:
         """Choose a valid progress action if final-only VLM replies stay invalid."""
         allowed = EVENT_ACTIONS.get(str(event), set(ACTIONS) - {"EXPLORE"})
         if "GOTO_INSTANCE" in allowed:
+            unreachable = {str(i) for i in
+                           world_state.get("instances_unreachable_ids", [])}
             instances = [item for item in world_state.get("instances", [])
                          if not item.get("reported", False)]
             if instances:
@@ -237,7 +247,8 @@ class DecisionLoop:
                     "Forced final action after tool limit: " + str(error),
                     validation="forced_after_tool_limit",
                     tool_calls=tool_calls)
-            omitted = world_state.get("instances_omitted_ids", [])
+            omitted = [i for i in world_state.get("instances_omitted_ids", [])
+                       if str(i) not in unreachable]
             if omitted:
                 return DecisionResult(
                     "GOTO_INSTANCE", str(omitted[0]),
@@ -433,11 +444,14 @@ class DecisionLoop:
         if target_id is not None:
             target_id = str(target_id)
         if action == "GOTO_INSTANCE":
-            # 摘要表之外但未被报告的实例（omitted）同样是合法导航目标。
+            # 摘要表之外但未被报告的实例（omitted）同样是合法导航目标；
+            # 导航确认不可达的实例不再作为导航目标（但 REPORT_FOUND 可用）。
             valid = {str(i["id"]) for i in world_state.get("instances", [])
                      if not i.get("reported", False)}
             valid |= {str(i) for i in
                       world_state.get("instances_omitted_ids", [])}
+            valid -= {str(i) for i in
+                      world_state.get("instances_unreachable_ids", [])}
             if target_id not in valid:
                 return None, f"target_id {target_id!r} not an unreported instance"
         elif action == "GOTO_FRONTIER":

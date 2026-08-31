@@ -298,6 +298,16 @@ class MappingClient:
             {"cmd": "candidate_evidence", "candidate_id": candidate_id})
         return resp, payload
 
+    def evidence_for_point(self, frame_id, pixel, bbox=None):
+        """按像素渲染十字证据面板（不注册候选），供 VLM 看图确认。
+        pixel/bbox 为原图坐标系；返回 (meta, jpeg bytes)。"""
+        resp, payload = self._request({
+            "cmd": "evidence_for_point", "frame_id": int(frame_id),
+            "pixel": [float(pixel[0]), float(pixel[1])],
+            "bbox": None if bbox is None else
+            [float(v) for v in bbox]})
+        return resp, payload
+
     def ground_frame(self, rgb, text):
         """对当前实时帧做 VQA + pointing；仅保留给诊断/兼容调用。"""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)

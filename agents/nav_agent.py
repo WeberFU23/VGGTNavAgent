@@ -117,6 +117,8 @@ class NavAgent(MappingAgent):
                            "get_instance": self._tool_get_instance,
                            "update_instance": self._tool_update_instance,
                            "view_frame": self._tool_view_frame,
+                           "propose_candidates": self._tool_propose_candidates,
+                           "commit_candidates": self._tool_commit_candidates,
                            "use_molmo_point": self._tool_use_molmo_point,
                            "review_crosshair": self._tool_review_crosshair,
                            "instantiate_points": self._tool_instantiate_points,
@@ -164,6 +166,7 @@ class NavAgent(MappingAgent):
         self._nav_recovery_queue = []
         self._nav_recovery_stage = 0
         self._nav_blocked_points = []
+        self._metric_replan_required = False
         # 导航确认不可达的实例（episode 内排除出 VLM 候选表；REPORT_FOUND
         # 仍可用——agent 可能就停在目标旁边，直接观察可确认）。
         self._unreachable_instance_ids = set()
@@ -194,12 +197,20 @@ class NavAgent(MappingAgent):
         self._adjust_reentry_blocked_step = None
         self._adjustment_key = None
         self._adjustment_budgets = {}
+        self._adjust_goal = None
+        self._adjust_start_frame_id = None
+        self._adjust_progress = {"successful_moves": 0, "fresh_views": 0,
+                                 "new_keyframes": 0}
         self._last_decision_output = None
         # 十字证据与显式语义审核分开保存。证据已展示绝不等于审核通过：
         # 只有 Decision VLM 调用 review_crosshair(..., verdict="ACCEPT")
         # 的同一像素才可进入 3D 实例化。
         self._crosshair_evidence = {}
         self._crosshair_reviews = {}
+        # Candidate transaction state.  A proposal is not a navigation target:
+        # only explicitly accepted proposals are inserted into InstanceMemory.
+        self._proposals = {}
+        self._proposal_limit = 128
         # 决策层状态：近期事件流 + 最近一次探索规划的 frontier 缓存
         self._events = []
         self._last_frontier_clusters = []
@@ -219,6 +230,9 @@ class NavAgent(MappingAgent):
         self._frontier_pose = None
         self._frontier_slam_pose = None
         self._frontier_scale = None
+        self._metric_snapshot = {"revision": 0, "scale": None,
+                                 "source": None, "pending": None,
+                                 "pending_count": 0}
         self._frontier_server_revision = None
         self._frontier_stats = {}
         self._last_decision_snapshot_step = -10 ** 9
@@ -248,6 +262,12 @@ class NavAgent(MappingAgent):
         self._recent_frontiers = []
         self._frontier_failures = {}
         self._active_frontier_key = None
+        self._frontier_branches = []
+        self._branch_outcomes = {}
+        self._active_branch_key = None
+        self._explore_recovery_queue = []
+        self._explore_recovery_stage = 0
+        self._explore_recovery_count = 0
         self._frontier_exhausted_reported = False
         self._last_map_submaps = 0
         self._last_map_growth_step = 0
@@ -382,6 +402,16 @@ class NavAgent(MappingAgent):
 
     def _explore_action(self, observation):
         """前沿引导探索；碰撞恢复最优先，构建失败回退随机游走。"""
+        if (not self._last_motion_failed and
+                getattr(observation, "previous_action", None) ==
+                int(Action.MOVE_FORWARD) and self._active_branch_key):
+            outcome = self._branch_outcomes.setdefault(
+                self._active_branch_key, {"collisions": 0, "moves": 0,
+                                          "keyframes": 0, "last_step": 0})
+            outcome["moves"] += 1
+            outcome["last_step"] = int(observation.step_count)
+            if self._last_feed_info.get("is_keyframe"):
+                outcome["keyframes"] += 1
         if self._last_motion_failed:
             if self._active_frontier_key is not None:
                 key = self._active_frontier_key
@@ -390,9 +420,30 @@ class NavAgent(MappingAgent):
                 self._log_event(
                     f"frontier navigation failed {key} "
                     f"count={self._frontier_failures[key]}")
-                self._active_frontier_key = None
+            if self._active_branch_key is not None:
+                outcome = self._branch_outcomes.setdefault(
+                    self._active_branch_key, {"collisions": 0, "moves": 0,
+                                              "keyframes": 0, "last_step": 0})
+                outcome["collisions"] += 1
+                outcome["last_step"] = int(observation.step_count)
+            self._block_failed_nav_direction(
+                observation, follower=self._explore_follower)
+            self._explore_recovery_count += 1
+            turn = (int(Action.TURN_LEFT) if self._explore_recovery_count % 2
+                    else int(Action.TURN_RIGHT))
+            self._explore_recovery_queue = [turn] * self.nav_escape_turns
+            self._explore_recovery_stage = 1
+            self._active_frontier_key = None
+            self._active_branch_key = None
             self._explore_follower = None      # 碰撞后旧路径不可信
-            return super()._explore_action(observation)
+        if self._explore_recovery_queue:
+            return self._explore_recovery_queue.pop(0)
+        if self._explore_recovery_stage == 1:
+            self._explore_recovery_stage = 0
+            self._plan_exploration(observation, select=True)
+            action = self._explore_follow(observation)
+            if action is not None:
+                return action
         if not self.explore_enabled:
             return super()._explore_action(observation)
         # 途中决策：follower 活跃时每 en_route_decision_interval 步咨询一次
@@ -444,6 +495,7 @@ class NavAgent(MappingAgent):
         if arrived or action is None:
             self._explore_follower = None
             self._active_frontier_key = None
+            self._active_branch_key = None
             # 到达短 frontier 后保留正常重规划间隔，避免每一步重新选择
             # 同一个已经到达的边界。
             self._last_explore_plan = observation.step_count
@@ -583,8 +635,10 @@ class NavAgent(MappingAgent):
         cur = latest_pose[:3, 3] @ self.align_R.T
         # 尺度：栅格尺规（相机离地 1.5m）比在线动作标定更直接，也必须
         # 与当前鸟瞰图使用同一份尺度。
-        scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
-        self._frontier_scale = scale or self.calibrator.current_scale() or 1.0
+        raw_scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
+        self._frontier_scale = self._update_metric_snapshot(
+            raw_scale or self.calibrator.current_scale() or 1.0,
+            source="grid" if raw_scale else "calibrator")
         scale = self._frontier_scale
         slam_x, slam_y, slam_yaw = nav.pose_to_yaw_2d(
             latest_pose, self.align_R)
@@ -682,6 +736,8 @@ class NavAgent(MappingAgent):
             else:
                 cooldown_count += 1
         valid.sort(key=lambda c: -c["utility"])
+        self._frontier_branches = self._summarize_frontier_branches(
+            valid, cur[:2], grid, scale, observation.step_count)
 
         self._last_frontier_count = len(valid)
         self._last_reachable_frontier_count = len(reachable)
@@ -726,6 +782,146 @@ class NavAgent(MappingAgent):
         y_m = float(world_xy[1]) * (scale or 1.0)
         return (int(round(x_m / bucket_m)), int(round(y_m / bucket_m)))
 
+    def _update_metric_snapshot(self, candidate, source):
+        """Accept only stable metric-scale changes for all nav consumers."""
+        try:
+            candidate = float(candidate)
+        except (TypeError, ValueError):
+            return self._metric_scale_value() or 1.0
+        if not math.isfinite(candidate) or candidate <= 0:
+            return self._metric_scale_value() or 1.0
+        snapshot = self._metric_snapshot
+        current = snapshot.get("scale")
+        if current is None:
+            snapshot.update(scale=candidate, source=str(source), revision=1,
+                            pending=None, pending_count=0)
+            return candidate
+        relative = abs(candidate - current) / max(abs(current), 1e-6)
+        if relative <= 0.12:
+            snapshot.update(scale=candidate, source=str(source),
+                            pending=None, pending_count=0)
+            return candidate
+        pending = snapshot.get("pending")
+        if pending is not None and abs(candidate - pending) / max(
+                abs(pending), 1e-6) <= 0.12:
+            snapshot["pending_count"] = int(snapshot.get("pending_count", 0)) + 1
+        else:
+            snapshot["pending"] = candidate
+            snapshot["pending_count"] = 1
+        if snapshot["pending_count"] >= 3:
+            snapshot.update(scale=candidate, source=str(source),
+                            revision=int(snapshot.get("revision", 0)) + 1,
+                            pending=None, pending_count=0)
+            self._invalidate_metric_navigation()
+            self._log_event(
+                f"metric scale snapshot switched to {candidate:.3f} ({source})")
+        else:
+            self._log_event(
+                f"metric scale candidate deferred {candidate:.3f}; "
+                f"current={current:.3f}")
+        return float(snapshot["scale"])
+
+    def _invalidate_metric_navigation(self):
+        """Discard geometry whose metres-per-unit contract just changed."""
+        # Paths, temporary obstacle radii and follower reach checks all embed
+        # a scale. Keep the semantic target, but rebuild every geometric
+        # artifact from one fresh mapping snapshot before issuing another move.
+        self.follower = None
+        self.grid = None
+        self._nav_recovery_queue = []
+        self._nav_recovery_stage = 0
+        self._nav_blocked_points = []
+        self._explore_follower = None
+        self._explore_recovery_queue = []
+        self._explore_recovery_stage = 0
+        self._active_frontier_key = None
+        self._active_branch_key = None
+        self._metric_replan_required = True
+
+    def _metric_scale_value(self):
+        scale = self._metric_snapshot.get("scale")
+        if scale is not None:
+            return float(scale)
+        try:
+            scale = self.calibrator.current_scale()
+            return float(scale) if scale is not None else None
+        except Exception:
+            return None
+
+    def _summarize_frontier_branches(self, frontiers, start_xy, grid, scale,
+                                     step):
+        """Group current frontiers by their local A* prefix, not room labels.
+
+        VGGT global reconstruction is not trusted enough for persistent room
+        segmentation.  A branch is an ephemeral route option on this snapshot;
+        its short-lived ledger prevents choosing the same blocked corridor over
+        and over without inventing semantic place names or fixed map markers.
+        """
+        groups = {}
+        prefix_units = 1.0 / max(float(scale or 1.0), 1e-6)
+        for frontier in frontiers:
+            path = frontier.get("path") or []
+            if len(path) < 2:
+                continue
+            walked, pivot = 0.0, np.asarray(path[-1], dtype=np.float64)
+            previous = np.asarray(path[0], dtype=np.float64)
+            for point in path[1:]:
+                point = np.asarray(point, dtype=np.float64)
+                walked += float(np.linalg.norm(point - previous))
+                previous = point
+                if walked >= prefix_units:
+                    pivot = point
+                    break
+            try:
+                row, col = grid.world_to_cell(tuple(pivot[:2]))
+                key = f"b{int(row // 3)}_{int(col // 3)}"
+            except Exception:
+                angle = math.atan2(pivot[1] - start_xy[1],
+                                   pivot[0] - start_xy[0])
+                key = f"b_angle_{int(round(angle / (math.pi / 4)))}"
+            outcome = self._branch_outcomes.get(key, {})
+            frontier["branch_id"] = key
+            frontier["recently_attempted"] = bool(
+                int(step) - int(outcome.get("last_step", -10 ** 9)) <=
+                self.frontier_cooldown_steps)
+            frontier["novelty"] = (
+                "untried" if not outcome else
+                ("blocked" if outcome.get("collisions", 0) else
+                 "revisited"))
+            bucket = groups.setdefault(key, {"id": key, "frontiers": [],
+                                              "geometry_gain": 0,
+                                              "semantic_gain": 0,
+                                              "min_cost_m": None})
+            bucket["frontiers"].append(frontier)
+            bucket["geometry_gain"] += int(frontier.get("geometry_gain", 0))
+            bucket["semantic_gain"] += int(frontier.get("semantic_gain", 0))
+            cost = frontier.get("path_cost_m")
+            if cost is not None:
+                bucket["min_cost_m"] = (float(cost) if
+                    bucket["min_cost_m"] is None else
+                    min(float(cost), bucket["min_cost_m"]))
+        rows = []
+        for key, bucket in groups.items():
+            outcome = self._branch_outcomes.get(key, {})
+            rows.append({"id": key,
+                         "frontier_ids": [f"f{i}" for i, item in
+                                          enumerate(frontiers)
+                                          if item.get("branch_id") == key],
+                         "path_cost_m": (round(bucket["min_cost_m"], 2)
+                                         if bucket["min_cost_m"] is not None else None),
+                         "geometry_gain": bucket["geometry_gain"],
+                         "semantic_gain": bucket["semantic_gain"],
+                         "collision_count": int(outcome.get("collisions", 0)),
+                         "successful_moves": int(outcome.get("moves", 0)),
+                         "new_keyframes": int(outcome.get("keyframes", 0)),
+                         "recently_attempted": bool(outcome),
+                         "novelty": ("untried" if not outcome else
+                                     ("blocked" if outcome.get("collisions", 0)
+                                      else "revisited"))})
+        return sorted(rows, key=lambda row: (
+            row["novelty"] != "untried", row["path_cost_m"] is None,
+            row["path_cost_m"] or float("inf")))
+
     def _activate_frontier(self, observation, cluster, source):
         """用生成该路径时的尺度启动 frontier follower。"""
         path = cluster.get("path")
@@ -738,6 +934,12 @@ class NavAgent(MappingAgent):
         follower.set_path(path)
         self._explore_follower = follower
         self._active_frontier_key = cluster.get("key")
+        self._active_branch_key = cluster.get("branch_id")
+        if self._active_branch_key is not None:
+            outcome = self._branch_outcomes.setdefault(
+                self._active_branch_key, {"collisions": 0, "moves": 0,
+                                          "keyframes": 0, "last_step": 0})
+            outcome["last_step"] = int(observation.step_count)
         self._recent_frontiers.append((
             np.asarray(cluster["world"], dtype=np.float64)[:2],
             observation.step_count))
@@ -752,6 +954,17 @@ class NavAgent(MappingAgent):
         self._feed_frame(observation)
         self._last_observation = observation
         self._settle_action_outcomes()
+        if self._adjusting and not self._last_motion_failed and \
+                getattr(observation, "previous_action", None) == \
+                int(Action.MOVE_FORWARD):
+            self._adjust_progress["successful_moves"] += 1
+        frame_id = self._last_feed_info.get("frame_id")
+        if self._adjusting and frame_id is not None and \
+                self._adjust_start_frame_id is not None and \
+                int(frame_id) > int(self._adjust_start_frame_id):
+            self._adjust_progress["fresh_views"] += 1
+            if self._last_feed_info.get("is_keyframe"):
+                self._adjust_progress["new_keyframes"] += 1
         if hasattr(self.vlm, "set_trace_context"):
             self.vlm.set_trace_context(
                 episode=str(observation.episode_id),
@@ -785,7 +998,14 @@ class NavAgent(MappingAgent):
             if self._scanning:
                 action = self._handle_scan(observation)
             else:
-                action, arrived, stuck = self._nav_action(observation)
+                if self._metric_replan_required:
+                    self._metric_replan_required = False
+                    if self._plan_to_target(observation):
+                        action, arrived, stuck = self._nav_action(observation)
+                    else:
+                        action, arrived, stuck = None, False, False
+                else:
+                    action, arrived, stuck = self._nav_action(observation)
                 if stuck:
                     # 连续碰撞无法到达：登记不可达并让决策 VLM 介入换目标
                     action = self._nav_failed_recovery(observation)
@@ -848,6 +1068,10 @@ class NavAgent(MappingAgent):
         self.follower = None
         self.grid = None
         self._explore_follower = None
+        self._active_frontier_key = None
+        self._active_branch_key = None
+        self._explore_recovery_queue = []
+        self._explore_recovery_stage = 0
         self._plan_failures = 0
         self._nav_recovery_queue = []
         self._nav_recovery_stage = 0
@@ -936,7 +1160,7 @@ class NavAgent(MappingAgent):
 
     def _pool_metric_scale(self):
         """地图单位 -> 米。无可靠估计返回 None（此时池坐标无意义）。"""
-        scale = self.calibrator.current_scale()
+        scale = self._metric_scale_value()
         if scale is not None and math.isfinite(float(scale)) \
                 and float(scale) > 0:
             return float(scale)
@@ -1353,6 +1577,136 @@ class NavAgent(MappingAgent):
             out["_tool_images"] = images
         return out
 
+    def _tool_propose_candidates(self, frame_id, query):
+        """Point one frame and create a bounded, reviewable proposal batch.
+
+        This is the preferred perception transaction.  It deliberately does
+        not resolve 3D or mutate InstanceMemory: the decision VLM first sees
+        all crosshair panels, then commits a batch of tri-state verdicts.
+        """
+        try:
+            pointed = self.client.point_pixels(int(frame_id), str(query))
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+        if pointed.get("error"):
+            return self._pointing_error(pointed)
+        pixels = []
+        width, height = float(pointed.get("width") or 0), \
+            float(pointed.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return {"proposals": []}
+        for row in (pointed.get("points") or [])[:16]:
+            px = row.get("pixel") or []
+            if len(px) != 2:
+                continue
+            pixels.append([round(float(px[0]) / width * 1000, 1),
+                           round(float(px[1]) / height * 1000, 1)])
+        if not pixels:
+            return {"proposals": []}
+        try:
+            prepared = self.client.prepare_pixels(
+                int(frame_id), pixels, normalized=True)
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+        if prepared.get("error"):
+            return self._pointing_error(prepared)
+        images, rows = [], []
+        for candidate in prepared.get("candidates") or []:
+            cid = str(candidate.get("candidate_id") or "")
+            fid = candidate.get("frame_id")
+            pixel = candidate.get("pixel_norm")
+            if not cid or fid is None or not pixel:
+                continue
+            self._proposals[cid] = {
+                "candidate_id": cid, "frame_id": int(fid),
+                "pixel_norm": list(pixel), "bbox": candidate.get("bbox"),
+                "query": str(query)[:300], "step": int(
+                    getattr(self._last_observation, "step_count", 0)),
+                "status": "pending",
+            }
+            self._record_crosshair_evidence(fid, pixel)
+            try:
+                meta, payload = self.client.get_candidate_evidence(cid)
+            except Exception:
+                meta, payload = {"found": False}, b""
+            if meta.get("found") and payload:
+                images.append((f"proposal_{cid}", payload))
+            rows.append({"candidate_id": cid, "frame_id": int(fid),
+                         "pixel": list(pixel)})
+        if len(self._proposals) > self._proposal_limit:
+            oldest = sorted(self._proposals.values(),
+                            key=lambda row: row["step"])[:-self._proposal_limit]
+            for row in oldest:
+                self._proposals.pop(row["candidate_id"], None)
+        out = {"proposals": rows, "next":
+               "inspect panels, then commit any reviewed subset with one "
+               "verdict per submitted candidate; other proposals stay pending"}
+        if images:
+            out["_tool_images"] = images
+        return out
+
+    def _tool_commit_candidates(self, reviews, label=""):
+        """Commit a reviewed proposal batch; only ACCEPT becomes active."""
+        if self._last_observation is None:
+            return {"error": "no observation yet"}
+        if not isinstance(reviews, (list, tuple)) or not reviews:
+            return {"error": "reviews must be non-empty candidate verdict rows"}
+        accepted, rejected, unresolved = [], [], []
+        seen = set()
+        for row in reviews[:16]:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("candidate_id") or "")
+            verdict = str(row.get("verdict") or "UNCERTAIN").upper()
+            proposal = self._proposals.get(cid)
+            if not cid or cid in seen or proposal is None or \
+                    proposal.get("status") != "pending":
+                continue
+            seen.add(cid)
+            if verdict not in {"ACCEPT", "REJECT", "UNCERTAIN"}:
+                verdict = "UNCERTAIN"
+            proposal["status"] = verdict.lower()
+            proposal["reason"] = str(row.get("reason") or "")[:300]
+            if verdict == "ACCEPT":
+                accepted.append(proposal)
+            elif verdict == "REJECT":
+                rejected.append(cid)
+            else:
+                unresolved.append(cid)
+        if not accepted:
+            return {"instances": [], "accepted": [], "rejected": rejected,
+                    "uncertain": unresolved}
+        resolved = self.client.resolve_candidates(
+            [row["candidate_id"] for row in accepted])
+        resolved_rows = (resolved.get("candidates", {})
+                         if isinstance(resolved, dict) else {})
+        # MappingClient returns {candidates: {...}}; accept the older flat
+        # shape in tests/rolling deployments as well.
+        if not resolved_rows and isinstance(resolved, dict):
+            resolved_rows = resolved
+        valid_hits, geometry_rejections = [], []
+        for proposal in accepted:
+            cid = proposal["candidate_id"]
+            row = (resolved_rows.get(cid) or {})
+            if not row.get("found"):
+                geometry_rejections.append({"candidate_id": cid,
+                    "reason": str(row.get("error") or "no valid 3D depth")[:240]})
+                proposal["status"] = "geometry_rejected"
+                continue
+            proposal["status"] = "active"
+            valid_hits.append({**row, "found": True,
+                               "frame_id": proposal["frame_id"],
+                               "candidate_id": cid,
+                               "pixel": proposal["pixel_norm"],
+                               "bbox": proposal.get("bbox"),
+                               "text": str(label or proposal["query"])})
+        changed = self._ingest_semantic_hits(
+            self._last_observation, valid_hits, select=False) or []
+        return {"instances": self._ground_rows(changed),
+                "accepted": [row["candidate_id"] for row in accepted],
+                "rejected": rejected, "uncertain": unresolved,
+                "geometry_rejections": geometry_rejections}
+
     def _tool_instantiate_points(self, frame_id, pixels_1000, label=""):
         """按像素坐标实例化 3D 目标（0-1000 归一化坐标）。
 
@@ -1513,7 +1867,7 @@ class NavAgent(MappingAgent):
         try:
             x, y, yaw = nav.pose_to_yaw_2d(pose, self.align_R)
             tracker = nav.PathFollower(
-                scale=scale or self.calibrator.current_scale() or 1.0,
+                scale=scale or self._metric_scale_value() or 1.0,
                 reach_m=self.reach_m)
             tracker.x, tracker.y, tracker.yaw = x, y, yaw
             tracker.anchor_frame = int(frame_id)
@@ -1577,7 +1931,7 @@ class NavAgent(MappingAgent):
             fid = int(np.asarray(frame_ids)[order][-1])
             pose = np.asarray(poses, dtype=np.float64)[order][-1]
             x, y, yaw = nav.pose_to_yaw_2d(pose, self.align_R)
-            scale = self.calibrator.current_scale() or 1.0
+            scale = self._metric_scale_value() or 1.0
             tracker = nav.PathFollower(scale=scale, reach_m=self.reach_m)
             tracker.x, tracker.y, tracker.yaw = x, y, yaw
             tracker.anchor_frame = fid
@@ -1616,7 +1970,7 @@ class NavAgent(MappingAgent):
         if target_xy is None:
             return None, None
 
-        scale = scale or self.calibrator.current_scale() or 1.0
+        scale = scale or self._metric_scale_value() or 1.0
         distance_m = None
         if pose is not None:
             distance_m = math.hypot(
@@ -1647,7 +2001,7 @@ class NavAgent(MappingAgent):
         pose = self._frontier_pose or self._frontier_slam_pose or \
             self._estimated_current_pose()
         snapshot_scale = self._frontier_scale or \
-            self.calibrator.current_scale() or 1.0
+            self._metric_scale_value() or 1.0
         # 只刷新将进入有界 world-state 的候选，避免长 episode 对上百个
         # 历史实例逐个 RPC；刷新后重建状态，距离和 A* 代价保持一致。
         state = build_world_state(
@@ -1931,6 +2285,12 @@ class NavAgent(MappingAgent):
         self._adjusting = True
         self._adjust_steps = 0
         self._adjust_source_event = str(source_event)
+        self._adjust_goal = (
+            "verify_instance" if self.target_instance_id is not None else
+            ("clear_path" if self._last_motion_failed else "inspect_sector"))
+        self._adjust_start_frame_id = self._last_feed_info.get("frame_id")
+        self._adjust_progress = {"successful_moves": 0, "fresh_views": 0,
+                                 "new_keyframes": 0}
         self._adjust_pitch_steps = 0
         self._adjust_leveling = False
         self._adjust_end_reason = None
@@ -1941,7 +2301,7 @@ class NavAgent(MappingAgent):
             if label != "current_observation"]
         self._log_event(
             f"adjustment started from {self._adjust_source_event}; "
-            f"target_budget={budget}")
+            f"goal={self._adjust_goal}; target_budget={budget}")
         return self._adjustment_action(observation)
 
     def _abandon_adjustment_target(self, observation, reason):
@@ -1959,6 +2319,8 @@ class NavAgent(MappingAgent):
         self._adjust_pitch_steps = 0
         self._adjust_leveling = False
         self._adjust_end_reason = None
+        self._adjust_goal = None
+        self._adjust_start_frame_id = None
         self._clear_current_target()
         self.mode = "explore"
         return self._explore_action(observation)
@@ -1982,6 +2344,13 @@ class NavAgent(MappingAgent):
         state["adjustment"] = {
             "active": True,
             "source_event": self._adjust_source_event,
+            "goal": self._adjust_goal,
+            "success_conditions": {
+                "verify_instance": "obtain at least one fresh post-adjustment view, then END_ADJUST",
+                "clear_path": "make one successful move or reveal an alternate route",
+                "inspect_sector": "obtain a new mapping keyframe of unseen local space",
+            }.get(self._adjust_goal, "obtain new actionable evidence"),
+            "progress": dict(self._adjust_progress),
             "steps_used": self._adjust_steps,
             "max_steps": self.adjust_max_steps,
             "steps_remaining": max(
@@ -2077,6 +2446,21 @@ class NavAgent(MappingAgent):
                 return self._level_adjustment_camera(observation)
             return self._end_adjustment_and_resume(observation, "unavailable")
         if result.action == "END_ADJUST":
+            if not self._adjustment_goal_met():
+                # END is a completion claim, not an escape hatch.  Advance one
+                # bounded observation so the VLM can re-evaluate with evidence.
+                action = (int(Action.TURN_LEFT) if self._adjust_steps % 2 == 0
+                          else int(Action.TURN_RIGHT))
+                budget["steps"] = budget.get("steps", 0) + 1
+                budget["turns"] = budget.get("turns", 0) + 1
+                budget["turn_streak"] = 0
+                budget["last_turn"] = None
+                self._adjust_steps += 1
+                self._trace_adjustment_execution(observation, result, action)
+                self._log_event(
+                    "ignored END_ADJUST before goal progress; "
+                    f"goal={self._adjust_goal} progress={self._adjust_progress}")
+                return action
             if self._adjust_pitch_steps:
                 # This is direct visual evidence captured at the current robot
                 # position. Keep it for the resumed arrival/global decision,
@@ -2120,6 +2504,17 @@ class NavAgent(MappingAgent):
             f"{result.action}")
         return action
 
+    def _adjustment_goal_met(self):
+        """Minimal harness-side evidence required before END_ADJUST."""
+        progress = self._adjust_progress
+        if self._adjust_goal == "clear_path":
+            return progress.get("successful_moves", 0) >= 1
+        if self._adjust_goal == "inspect_sector":
+            return progress.get("new_keyframes", 0) >= 1
+        if self._adjust_goal == "verify_instance":
+            return progress.get("fresh_views", 0) >= 1
+        return progress.get("fresh_views", 0) >= 1
+
     def _level_adjustment_camera(self, observation, result=None):
         """Return one legal pitch action toward the neutral mapping pose."""
         if not self._adjust_pitch_steps:
@@ -2159,6 +2554,8 @@ class NavAgent(MappingAgent):
         self._adjust_pitch_steps = 0
         self._adjust_leveling = False
         self._adjust_end_reason = None
+        self._adjust_goal = None
+        self._adjust_start_frame_id = None
         self._adjustment_key = None
         self._adjust_reentry_blocked_step = observation.step_count
         self._log_event(f"adjustment ended ({reason}); resume {source_event}")
@@ -2214,14 +2611,15 @@ class NavAgent(MappingAgent):
         return self._decider_next(
             observation, "arrival", images=images, state_fn=arrival_state)
 
-    def _block_failed_nav_direction(self, observation):
+    def _block_failed_nav_direction(self, observation, follower=None):
         """把最近撞上的前向小段临时作为障碍，避免 A* 原样重走。"""
-        if self.follower is None:
+        follower = follower or self.follower
+        if follower is None:
             return
-        scale = self.calibrator.current_scale() or 1.0
+        scale = self._metric_scale_value() or 1.0
         distance = 0.25 / scale
-        point = (float(self.follower.x + math.cos(self.follower.yaw) * distance),
-                 float(self.follower.y + math.sin(self.follower.yaw) * distance))
+        point = (float(follower.x + math.cos(follower.yaw) * distance),
+                 float(follower.y + math.sin(follower.yaw) * distance))
         expiry = int(observation.step_count) + self.nav_block_ttl_steps
         self._nav_blocked_points.append((point, expiry))
         self._nav_blocked_points = self._nav_blocked_points[-8:]
@@ -2371,7 +2769,7 @@ class NavAgent(MappingAgent):
         step = observation.step_count
         if step - self._last_anchor_step < 5:
             return
-        if self.calibrator.current_scale() is None:
+        if self._metric_scale_value() is None:
             return
         self._last_anchor_step = step
         try:
@@ -2413,27 +2811,13 @@ class NavAgent(MappingAgent):
         # 环视期间的新关键帧可能还在 caption 队列里；先等语义记忆追上，
         # 否则紧接的检索会漏掉刚看到的场景（有界等待，超时继续）。
         self._wait_for_captions()
-        try:
-            response = self.client.ground_object(
-                phrase, top_k=self.ground_top_k)
-            if isinstance(response, dict):
-                error = self._pointing_error(response)
-                if error:
-                    raise RuntimeError(error["error"]["message"])
-                results = response.get("results") or []
-            else:
-                results = response
-            hits = [item for item in results if item.get("found")]
-        except Exception as exc:
-            self._log_event(f"post-scan memory refresh failed: {exc}")
-            hits = []
-        # post-scan 刷新是确定性后处理（无 VLM 看图环节）：能恢复有效 3D
-        # 点的 pointing 命中直接入库，语义判断由决策 VLM 在后续决策/到达
-        # 时通过十字证据图完成。
-        if hits:
-            self._ingest_semantic_hits(observation, hits, select=False)
-        else:
-            self._no_hit_queries += 1
+        # A panoramic scan improves caption retrieval, but it must never
+        # inject pointing hits directly into InstanceMemory.  That historical
+        # shortcut bypassed the explicit ACCEPT/REJECT/UNCERTAIN gate and was
+        # a major source of navigable wall/background false positives.  The
+        # panorama is supplied below; the VLM may open a frame and start a
+        # reviewable proposal transaction if it sees a target.
+        self._log_event("post-scan: captions refreshed; no auto-instantiation")
         return self._choose_high_level_target(
             observation, "scan_complete", images=images)
 
@@ -2580,10 +2964,13 @@ class NavAgent(MappingAgent):
                 "bbox": h.get("bbox"),
                 "depth_std": h.get("depth_std"),
             }
-            replay = self.memory.find_replay(
+            replay_observation = self.memory.find_replay_observation(
                 candidate_id=h.get("candidate_id"),
                 frame_id=h.get("frame_id"), pixel=h.get("pixel"),
                 bbox=h.get("bbox"))
+            replay = (self.memory.instance_for_observation(
+                replay_observation.oid)
+                if replay_observation is not None else None)
             if replay is not None:
                 node = self.memory.register_replay(
                     replay, candidate_id=h.get("candidate_id"),
@@ -2593,18 +2980,40 @@ class NavAgent(MappingAgent):
                     verdict="SAME", reason="same evidence or same-frame mark")
                 observation_id = (node.observation_ids[-1]
                                   if node.observation_ids else None)
+            elif replay_observation is not None:
+                # The same raw evidence was previously left UNCERTAIN.  It is
+                # not a new visual observation and must not be re-resolved into
+                # a second canonical instance merely because commit was retried.
+                node = None
+                observation_id = replay_observation.oid
+                result = ResolutionResult(
+                    None, replay_observation, is_new=False,
+                    method="unresolved_observation_replay", verdict="UNCERTAIN",
+                    reason="same unresolved evidence; await a new view")
             else:
                 observed = self.memory.new_observation(
                     aligned, text=initial_text, evidence=evidence,
                     frame_id=h.get("frame_id"), step=step,
                     candidate_id=h.get("candidate_id"),
                     pixel=h.get("pixel"), bbox=h.get("bbox"))
-                scale = self.calibrator.current_scale() or 1.0
+                scale = self._metric_scale_value() or 1.0
                 result = self.entity_resolver.resolve(
                     self.memory, observed, scale,
                     compare_fn=self._resolve_observation_visual)
                 node = result.node
                 observation_id = observed.oid
+            if node is None:
+                cid = str(h.get("candidate_id") or f"obs{observation_id}")
+                self._proposals[cid] = {
+                    "candidate_id": cid, "frame_id": h.get("frame_id"),
+                    "pixel_norm": h.get("pixel"), "bbox": h.get("bbox"),
+                    "query": initial_text[:300], "step": int(step),
+                    "status": "uncertain", "reason": result.reason,
+                    "observation_id": observation_id,
+                }
+                self._log_event(
+                    f"observation {observation_id} retained as uncertain proposal")
+                continue
             changed.append({
                 "instance_id": node.iid,
                 "observation_id": observation_id,
@@ -2703,7 +3112,7 @@ class NavAgent(MappingAgent):
                 cam_up=nav.mount_compensated_cam_up())
         self._update_pool_slam_anchor(
             np.asarray(poses, dtype=np.float64)[order][0])
-        scale = self.calibrator.current_scale()
+        scale = self._metric_scale_value()
         if self.follower is None:
             self.follower = nav.PathFollower(scale=scale, reach_m=self.reach_m)
         self.follower.scale = scale
@@ -2732,47 +3141,44 @@ class NavAgent(MappingAgent):
             except Exception as e:
                 print(f"[NavAgent] 候选重投影失败，使用记忆坐标: {e}")
                 self.target_candidate_id = None
-        scale = self.calibrator.current_scale()
+        scale = self._metric_scale_value()
         if scale is None:
             return False
         self._last_plan_step = observation.step_count
         try:
-            poses, frame_ids = self.client.get_all_poses()
-            if poses is None or len(poses) < 5:
+            # A target path must use the same locked server snapshot for its
+            # pose anchor, camera centres and occupancy grid.  Fetching poses
+            # and points through separate RPCs can mix pre/post-loop-closure
+            # coordinate frames and produce a path through a wall.
+            frames = self.client.get_frame_points(stride=6)
+            pose_by_frame = {
+                int(frame.get("frame_id", -1)): np.asarray(
+                    frame["pose"], dtype=np.float64)
+                for frame in (frames or []) if frame.get("pose") is not None
+            }
+            frame_ids = np.asarray(sorted(pose_by_frame), dtype=np.int64)
+            if len(frame_ids) < 5:
                 return False
+            poses = np.stack([pose_by_frame[int(fid)] for fid in frame_ids])
+            if self.align_R is None:
+                self.align_R = nav.gravity_alignment(
+                    poses, cam_up=nav.mount_compensated_cam_up())
+            grid = nav.OccupancyGrid.from_frame_points(frames, self.align_R)
+            if grid is None:
+                return False
+            raw_scale = (1.0 / grid.unit_per_m
+                         if grid.unit_per_m > 0 else None)
+            scale = self._update_metric_snapshot(
+                raw_scale or scale,
+                source="grid" if raw_scale else "calibrator")
+            self.grid = grid
             self._refresh_anchor(poses, frame_ids)
         except Exception as e:
-            print(f"[NavAgent] 拉取位姿失败: {e}")
+            print(f"[NavAgent] 原子地图快照/规划锚点失败: {e}")
             return False
 
         cam_centers = np.asarray(poses, dtype=np.float64)[:, :3, 3] \
             @ self.align_R.T
-        # 自由空间栅格：合并去重后的关键帧点云，用一个全局地板峰分层。
-        # 轨迹只是执行历史，不能回退成占据地图。
-        self.grid = None
-        try:
-            frames = self.client.get_frame_points(stride=6)
-            if frames:
-                self.grid = nav.OccupancyGrid.from_frame_points(
-                    frames, self.align_R)
-        except Exception as e:
-            print(f"[NavAgent] 全局点云栅格构建异常: {e}")
-            self.grid = None
-        if self.grid is None:
-            try:
-                pts, _cols = self.client.get_map_points(max_points=800000)
-                if pts is not None and len(pts) > 1000:
-                    pts_aligned = np.asarray(pts, dtype=np.float64) \
-                        @ self.align_R.T
-                    self.grid = nav.OccupancyGrid.build(
-                        pts_aligned, cam_centers)
-            except Exception as e:
-                print(f"[NavAgent] 点云栅格构建异常: {e}")
-                self.grid = None
-        if self.grid is None:
-            print("[NavAgent] 几何栅格构建失败（点数或地面证据不足）；"
-                  "拒绝用轨迹伪造自由空间")
-            return False
 
         self._apply_nav_temporary_blocks(observation)
 
@@ -2806,6 +3212,7 @@ class NavAgent(MappingAgent):
             return False
         path = self.grid.shortcut(path)
         self.follower.set_path(path)
+        self._metric_replan_required = False
         self._plan_failures = 0
         dist_m = sum(np.linalg.norm(np.asarray(path[i + 1]) - np.asarray(path[i]))
                      for i in range(len(path) - 1)) * scale
@@ -2816,7 +3223,7 @@ class NavAgent(MappingAgent):
     def _nav_action(self, observation):
         """返回 (action, arrived, stuck)。stuck=True 表示连续碰撞无法到达
         目标，由 act() 登记不可达并触发 nav_failed 决策（VLM 换目标）。"""
-        scale = self.calibrator.current_scale()
+        scale = self._metric_scale_value()
         if scale is None or self.follower is None:
             return None, False, False
         try:

@@ -240,6 +240,43 @@ def test_instantiate_points_accept_review_then_ingests():
     assert agent.memory.nodes[0].text == "basket"
 
 
+def test_candidate_transaction_only_commits_explicit_accepts():
+    """批量 proposal 不可导航；仅 ACCEPT 才进入 canonical memory。"""
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    client = _two_stage_client()
+    client.point_pixels = lambda fid, query: {
+        "width": 518, "height": 518,
+        "points": [{"pixel": [330, 186], "confidence": 0.9}]}
+    agent.client = client
+    proposed = agent._tool_propose_candidates(5, "basket")
+    assert proposed["proposals"] == [
+        {"candidate_id": "c5", "frame_id": 5,
+         "pixel": [637.1, 359.1]}]
+    assert agent.memory.nodes == []
+    committed = agent._tool_commit_candidates([
+        {"candidate_id": "c5", "verdict": "ACCEPT",
+         "reason": "crosshair is on basket"}], "basket")
+    assert len(committed["instances"]) == 1
+    assert len(agent.memory.nodes) == 1
+
+
+def test_candidate_transaction_keeps_uncertain_out_of_memory():
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    client = _two_stage_client()
+    client.point_pixels = lambda fid, query: {
+        "width": 518, "height": 518,
+        "points": [{"pixel": [330, 186], "confidence": 0.9}]}
+    agent.client = client
+    agent._tool_propose_candidates(5, "basket")
+    committed = agent._tool_commit_candidates([
+        {"candidate_id": "c5", "verdict": "UNCERTAIN"}], "basket")
+    assert committed["uncertain"] == ["c5"]
+    assert agent._proposals["c5"]["status"] == "uncertain"
+    assert agent.memory.nodes == []
+
+
 def test_reject_or_uncertain_crosshair_never_instantiates():
     for verdict in ("REJECT", "UNCERTAIN"):
         agent = _make_agent()
@@ -789,6 +826,15 @@ def test_nav_stuck_recovery_fallback_to_explore_when_decider_unavailable():
     assert 3 in agent._unreachable_instance_ids
     assert agent.mode == "explore"
     assert isinstance(result, int)
+
+
+def test_metric_snapshot_defers_one_off_scale_jump():
+    agent = _make_agent()
+    assert agent._update_metric_snapshot(2.0, "grid") == 2.0
+    assert agent._update_metric_snapshot(3.0, "grid") == 2.0
+    assert agent._update_metric_snapshot(3.02, "grid") == 2.0
+    assert agent._update_metric_snapshot(2.98, "grid") == 2.98
+    assert agent._metric_snapshot["revision"] == 2
 
 
 def test_unreachable_instance_excluded_from_world_state():

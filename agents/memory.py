@@ -149,6 +149,18 @@ class InstanceMemory:
         return (self.instance_for_observation(observation.oid)
                 if observation is not None else None)
 
+    def find_replay_observation(self, candidate_id=None, frame_id=None,
+                                pixel=None, bbox=None):
+        """Return prior raw evidence, including an unresolved observation.
+
+        ``find_replay`` intentionally returns only a canonical instance for
+        historical callers. Candidate transactions also need to suppress
+        re-resolving evidence which is still UNCERTAIN.
+        """
+        return self._find_replay_observation(
+            candidate_id=candidate_id, frame_id=frame_id,
+            pixel=pixel, bbox=bbox)
+
     def _find_replay_observation(self, candidate_id=None, frame_id=None,
                                  pixel=None, bbox=None):
         """Return the exact prior observation behind an idempotent replay."""

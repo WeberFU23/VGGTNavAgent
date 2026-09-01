@@ -24,7 +24,8 @@ DEFAULT_MAX_TOOL_ROUNDS = 15
 FINAL_ACTION_ATTEMPTS = 2
 
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
-WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points")
+WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points",
+               "commit_candidates")
 
 EVENT_ACTIONS = {
     # 除 finish_check / adjustment 外放行高层动作（EXPLORE 除外——VLM 滥用

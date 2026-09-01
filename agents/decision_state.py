@@ -97,7 +97,19 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
             "id": f"f{i}",
             "path_cost_m": (round(float(c["path_cost_m"]), 2)
                             if c.get("path_cost_m") is not None else None),
+            "branch_id": c.get("branch_id"),
+            "geometry_gain": int(c.get("geometry_gain", 0)),
+            "semantic_gain": int(c.get("semantic_gain", 0)),
+            "failure_count": int(c.get("failure_count", 0)),
+            "recently_attempted": bool(c.get("recently_attempted", False)),
+            "novelty": str(c.get("novelty", "unknown")),
         })
+
+    proposals = list(getattr(agent, "_proposals", {}).values())
+    proposal_counts = {
+        status: sum(1 for row in proposals if row.get("status") == status)
+        for status in ("pending", "uncertain", "rejected", "active",
+                       "geometry_rejected")}
 
     return {
         "task": {
@@ -121,6 +133,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         "report_claims": [claim.as_dict() for claim in
                           getattr(agent.memory, "report_claims", [])[-20:]],
         "frontiers": frontier_rows,
+        "frontier_branches": [dict(row) for row in
+                              getattr(agent, "_frontier_branches", [])[:8]],
+        "proposal_summary": proposal_counts,
         # VLM 自己维护的跨决策工作记忆（经 set_notes 工具改写）。
         "notes": getattr(agent, "_notes", ""),
         # 最近 3 步高层动作流水（不含进行中的条目）；更早的经

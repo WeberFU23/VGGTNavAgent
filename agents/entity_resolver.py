@@ -70,10 +70,19 @@ class EntityResolver:
             result = ResolutionResult(
                 node, observation, is_new=False, method="visual_relation",
                 verdict=verdict, reason=reason)
-        else:
+        elif verdict == "NEW" or response is None or not candidates:
             node = memory.create_instance(observation, text=description)
             result = ResolutionResult(
                 node, observation, is_new=True,
+                method=("visual_relation" if response is not None
+                        else "new_without_visual_relation"),
+                verdict=verdict, reason=reason)
+        else:
+            # Cross-view uncertainty is evidence, not a fresh navigable
+            # physical object.  The caller keeps the immutable observation as
+            # a proposal until another view can resolve its identity.
+            result = ResolutionResult(
+                None, observation, is_new=False,
                 method=("visual_relation" if response is not None
                         else "new_without_visual_relation"),
                 verdict=verdict, reason=reason)
@@ -115,7 +124,8 @@ class EntityResolver:
                 for iid, distance in sorted(distances.items(),
                                             key=lambda item: item[1])],
             "decision": result.verdict,
-            "canonical_instance_id": result.node.iid,
+            "canonical_instance_id": (result.node.iid
+                                      if result.node is not None else None),
             "is_new": result.is_new,
             "method": result.method,
             "reason": result.reason,

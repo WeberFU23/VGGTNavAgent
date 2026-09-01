@@ -40,6 +40,7 @@ class MappingAgent:
         self.rng = np.random.default_rng(0)
         self._last_visual = None
         self._last_motion_failed = False
+        self._visual_stall_count = 0
         self.stuck_steps = 0
         self._server_busy = False
         self._last_feed_info = {}
@@ -70,6 +71,7 @@ class MappingAgent:
         self.episode_id = None
         self._last_visual = None
         self._last_motion_failed = False
+        self._visual_stall_count = 0
         self.stuck_steps = 0
         self._server_busy = False
         self._last_feed_info = {}
@@ -87,7 +89,7 @@ class MappingAgent:
     # 供子类复用的拆块
     # ------------------------------------------------------------------
     def _feed_frame(self, observation):
-        """pacing + 喂帧，并仅用 RGB 变化估计上一前进动作是否失败。"""
+        """Pace/feed frames and conservatively detect a blocked forward move."""
         if self.episode_id is None:
             self.episode_id = observation.episode_id
             try:
@@ -122,12 +124,23 @@ class MappingAgent:
                 visual.shape == self._last_visual.shape:
             delta = float(np.mean(np.abs(visual - self._last_visual)))
             threshold = float(os.environ.get("MAPPING_STUCK_RGB_DELTA", "1.0"))
-            self._last_motion_failed = delta < threshold
+            # RGB alone is weak evidence in textureless corridors. Require two
+            # consecutive static forward observations before discarding a path.
+            if delta < threshold:
+                self._visual_stall_count += 1
+            else:
+                self._visual_stall_count = 0
+            confirm_steps = max(1, int(os.environ.get(
+                "MAPPING_STUCK_CONFIRM_STEPS", "2")))
+            self._last_motion_failed = \
+                self._visual_stall_count >= confirm_steps
             if self._last_motion_failed and self.calibrator.actions and \
                     self.calibrator.actions[-1] == int(Action.MOVE_FORWARD):
                 # 上一步命令未产生视觉运动，不把它当作尺度样本或航位
                 # 推算中的真实前进。-1 是内部 no-op，不会发给 benchmark。
                 self.calibrator.actions[-1] = -1
+        else:
+            self._visual_stall_count = 0
         self._last_visual = visual
         # 实验：喂给 SLAM 前中心裁剪，把 hfov 从 90° 收窄到 VGGT
         # 训练分布内的范围（0.5 -> 约 53°）。只影响 SLAM 输入，

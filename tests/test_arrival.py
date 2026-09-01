@@ -91,6 +91,8 @@ def test_adjustment_executes_one_vlm_motion_per_observation_then_resumes():
          ("selected_candidate", b"evidence")])
     assert first == int(Action.MOVE_FORWARD)
     assert agent._adjusting and agent._adjust_steps == 1
+    # In production act() records the fresh observation after MOVE_FORWARD.
+    agent._adjust_progress["fresh_views"] = 1
     second = agent._adjustment_action(_obs(step=101))
     assert second == int(Action.TARGET_FOUND)
     assert not agent._adjusting
@@ -177,6 +179,10 @@ def test_adjustment_can_tilt_camera_and_auto_levels_before_resume():
     assert agent._start_adjustment(
         _obs(step=200), "world_state_updated") == int(Action.LOOK_DOWN)
     assert agent._adjust_pitch_steps == -1
+    # The next observation is fresh; direct private-method tests emulate the
+    # accounting normally performed by NavAgent.act().
+    agent._adjust_progress["fresh_views"] = 1
+    agent._adjust_progress["new_keyframes"] = 1
     # END_ADJUST first emits the inverse benchmark action; the original event
     # resumes only after a fresh neutral-camera observation arrives.
     assert agent._adjustment_action(_obs(step=201)) == int(Action.LOOK_UP)
@@ -319,7 +325,7 @@ def test_scan_is_general_panorama_without_target_grounding():
     for step in range(11):
         assert agent._handle_scan(_obs(step=step)) == int(Action.TURN_LEFT)
     assert agent._handle_scan(_obs(step=11)) == 9
-    assert calls == {"ground_frame": 0, "ground_object": 1}
+    assert calls == {"ground_frame": 0, "ground_object": 0}
     assert captured["event"] == "scan_complete"
     assert len(captured["images"]) == 4
 

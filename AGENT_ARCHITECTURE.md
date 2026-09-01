@@ -6,7 +6,8 @@
 确定性模块充当 VLM 的"感知、记忆与执行工具"，VLM 自己规划探索路径、
 决定何时检索、何时实例化、何时报告。语义链路（caption 检索 → 看图 →
 pointing → 实例化 → 导航 → 报告）的每一步都是 VLM 可独立调用的工具；
-同时保留来源可追踪的复合工具 `ground_target`，减少简单场景的调用轮数。
+首选候选事务将 pointing、语义审核与 3D 实例化分开，避免把未经核验的像素
+直接写入导航记忆。
 
 系统不维护 `belief anchor / confirmed / rejected` 等先验语义状态，也不建立
 永久黑名单。凡是能由 VGGT 点云恢复出有效 3D 点的像素都可以成为可导航
@@ -23,8 +24,8 @@ flowchart LR
     MEM["single InstanceMemory"] --> STATE["world-state JSON"]
     STATE --> VLM
     TOP --> VLM
-    VLM -- "tools: search/view/point_frame/instantiate_points..." --> MEM
-    VLM -- "tools: point_frame / instantiate_points" --> P3D
+    VLM -- "tools: search/view/propose/commit..." --> MEM
+    VLM -- "tools: use_molmo_point / propose_candidates" --> P3D
     VLM --> HIGH["high-level action / START_ADJUST"]
     HIGH --> EXEC["A* / follower / collision recovery"]
     EXEC --> RGB
@@ -42,7 +43,7 @@ flowchart LR
 | 三层语义记忆 | `agents/memory.py` | 追加式 Observation、Canonical Instance、一次性 ReportClaim |
 | 实体解析器 | `agents/entity_resolver.py` | 几何近邻召回 + 标注照片 VLM 比较，完成跨视角实例关联 |
 | 决策状态 | `agents/decision_state.py` | 将实例、frontier、任务进度和几何代价组织成 JSON |
-| 决策 harness | `decision/agent_loop.py` | 工具循环（默认最多 7 轮）、动作 schema、ID 校验与 trace |
+| 决策 harness | `decision/agent_loop.py` | 工具循环（默认最多 15 轮）、动作 schema、ID 校验与 trace |
 | 决策提示词 | `decision/prompts.py` | 系统契约、事件说明和 world-state prompt 组装 |
 | 高层状态机 | `agents/nav_agent.py` | 感知—记忆—决策—执行闭环及确定性降级 |
 | 几何执行 | `agents/navigator.py` | 占据栅格（射线法自由空间）、A*、路径跟随、碰撞恢复 |
@@ -53,7 +54,10 @@ flowchart LR
 
 ## 3. 语义感知链路（全部由 VLM 按需驱动）
 
-系统不再自动执行 ground 管线。以下每一步都是独立工具，VLM 自由组合：
+系统采用候选事务而非自动 ground 入库。首选工具链是
+`propose_candidates → commit_candidates`：Pointing 结果先作为不可导航
+proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 ACCEPT 才
+批量解析为 active instance。扫描和 caption 刷新绝不直接入库。
 
 1. **caption**：每个关键帧由 API VLM（`NAV_CAPTION_API_MODEL`，当前为
    qwen3.7-plus + `enable_thinking=false`，`NAV_CAPTION_WORKERS=4` 并发）
@@ -64,31 +68,30 @@ flowchart LR
    `[{frame_id, score, caption}]`；
 3. **view_frame(frame_id)**：把关键帧原始 RGB 附到 VLM 下一轮输入，
    VLM 亲眼核实；
-4. **point_frame(frame_id, query)**：调用 pointing 模型只返回像素坐标，
+4. **use_molmo_point(frame_id, query)**：调用 pointing 模型只返回像素坐标，
    不注册任何实例。backends：
    - `molmo`（当前默认，`NAV_POINTING_BACKEND=molmo`）：Molmo-7B-D-0924
      经本地 vLLM 服务，输出 `<point>/<points>` XML 标签，0-100 归一化
      坐标，无 bbox/confidence；
    - `qwen`：JSON 输出绝对像素坐标 + 可选 bbox 交叉验证。
    返回给决策 VLM 的坐标统一为 0-1000 归一化（x 向右、y 向下）；
-5. **review_crosshair(frame_id, pixel_1000, verdict, reason)**：Decision VLM
+5. **review_crosshair(frame_id, pixel_1000, verdict, reason)**：旧的单点兼容
+   接口；新代码优先使用批量 `commit_candidates`。Decision VLM
    对已展示的十字证据图给出 `ACCEPT / REJECT / UNCERTAIN`。只有 `ACCEPT`
    允许实例化；后两者记录为 `semantic_rejections`，绝不入实例记忆；
 6. **instantiate_points(frame_id, pixels_1000, label)**：把 0-1000 归一化像素
-   坐标变成可导航 3D 实例。`pixels_1000` 可来自 point_frame 工具，也可以是
+   坐标变成可导航 3D 实例。`pixels_1000` 可来自 `use_molmo_point`，也可以是
    VLM 看过帧图像后自己给出的坐标。先生成标记证据面板，再由
    `review_crosshair` 的显式 `ACCEPT` 作为 2D 语义硬门；随后才进行 VGGT
    confidence 过滤、patch 深度采样和 3D 坐标恢复。深度无效的候选进入
    `geometry_rejections`；通过两阶段后才形成 Observation，再由 Entity Resolver
    关联到 Canonical Instance；
-7. **ground_target(query, frame_id=null, top_k=2)**：pointing + 实例化的复合
-   工具。传入 `frame_id` 时严格使用指定帧且不重新检索；仅在 `frame_id=null`
-   时执行 caption 检索，供 VLM 不知道哪帧相关时使用；
-8. 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等；
+7. 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等；
    非重放 Observation 先在 1.2m 内召回最多 3 个 Canonical Instance，再把
    新照片及候选实例的标注照片交给专用 VLM 判断 `SAME / NEW / UNCERTAIN`。
-   只有 `SAME` 会关联已有实例，`NEW/UNCERTAIN` 都新建实例以保护召回率；
-   该 VLM 调用同时更新实例描述，不额外占用决策 VLM 的 7 轮工具预算。
+   只有 `SAME` 会关联已有实例；跨视角 `UNCERTAIN` 保留为 proposal，等待
+   新证据，不直接新建可导航实例。该 VLM 调用同时更新实例描述，不额外占用
+   决策 VLM 的 15 轮工具预算。
 
 建图不把每个观测都作为关键帧。默认在相对上一关键帧的平均光流超过 40
 像素时取帧；即使光流不足，也最多间隔 3 个观测强制刷新。每个子图包含
@@ -136,8 +139,9 @@ Observation 的身份与原始证据不变；SLAM 回环后只允许通过 candi
 不会仅凭类别相同或距离接近合并。实例导航点取关联 Observation 中质量最高的
 真实 3D 点，不对不同视角点做坐标平均；回环后仍可由 candidate 重投影刷新。
 
-关联结果采用保守规则：`SAME` 绑定已有 canonical ID；`NEW` 新建；
-`UNCERTAIN` 或解析失败也新建。旧的人工 `merge_instances/undo_merge` 已删除，
+关联结果采用三态生命周期：`proposal → active canonical instance →
+reported instance`。`SAME` 绑定已有 canonical ID；`NEW` 新建 active；
+`UNCERTAIN` 保持 proposal，不参与导航。旧的人工 `merge_instances/undo_merge` 已删除，
 避免错误合并后破坏证据来源和报告状态。召回半径、候选数分别由
 `NAV_ENTITY_CANDIDATE_RADIUS_M`（默认 1.2m）和
 `NAV_ENTITY_MAX_CANDIDATES`（默认 3）控制。
@@ -156,7 +160,8 @@ instance，不能用另一个近邻实例或空 ID 代替。
 每次事件决策包含三类输入：
 
 - **world-state JSON**：任务账本（goal/mode/found/expected）、
-  step/max_steps/steps_remaining、frontier 表（id + 预计算 path_cost_m）、
+  step/max_steps/steps_remaining、frontier 表（路径代价、几何/语义 gain、
+  branch、失败数和新颖度）及 `frontier_branches` 局部路径分支摘要、
   导航状态（当前位姿、active target）、`notes`（VLM 自己的持久工作记忆，
   上限 500 字符，经 set_notes 维护）、`recent_actions`（最近 3 个高层
   动作及 ok/collision/arrived 结果，更早的经 get_action_history 分页查询）、
@@ -179,10 +184,10 @@ instance，不能用另一个近邻实例或空 ID 代替。
 
 ## 6. 决策工具一览
 
-VLM 在最终动作前每轮可调用一个工具，每次决策硬上限为 7 轮；
-`NAV_DECIDER_MAX_TOOL_ROUNDS` 可将上限调低但不能超过 7。初始 prompt 明确
+VLM 在最终动作前每轮可调用一个工具，每次决策硬上限为 15 轮；
+`NAV_DECIDER_MAX_TOOL_ROUNDS` 可将上限调低但不能超过 15。初始 prompt 明确
 告知实际上限，每次工具结果
-也携带 `已用/上限/剩余`。第 7 次工具返回后切换到独立的
+也携带 `已用/上限/剩余`。第 15 次工具返回后切换到独立的
 final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校验。若两次
 最终动作请求仍无效，harness 直接选择合法的实例、frontier 或扫描动作，避免
 以空 action 返回上层 fallback：
@@ -191,10 +196,11 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 |---|---|
 | `search_frames(query, top_k=5)` | `[{frame_id, score, caption}]`，只读 |
 | `view_frame(frame_id)` | 下一轮附加该关键帧原始 RGB，只读 |
-| `point_frame(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
+| `propose_candidates(frame_id, query)` | Pointing + 批量十字证据图，创建不可导航 proposal，只读 |
+| `commit_candidates(reviews, label)` | 对已审核子集批量给出 `ACCEPT/REJECT/UNCERTAIN`；只解析 ACCEPT 并写入 active instance，未提交 proposal 保持 pending，写 |
+| `use_molmo_point(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
 | `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录 `ACCEPT` / `REJECT` / `UNCERTAIN`；只有 `ACCEPT` 允许实例化，写 |
 | `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
-| `ground_target(query, frame_id=null, top_k=2)` | 指定帧走 2D 语义审核→3D 几何验证；自动检索模式保持兼容并在入库前做语义审核，随后完成实体关联，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
 | `get_instance(instance_id)` | 完整实例记录（无图像），只读 |
 | `view_instance(instance_id)` | 下一轮附加该实例证据图（pointing overlay 优先），只读 |
@@ -211,7 +217,7 @@ harness 重新生成 world-state 并随工具结果下发。
 
 semantic mapping server 启动时必须调用 `/v1/models` 探测 pointing endpoint，
 并确认 `NAV_POINTING_MODEL_PATH` 对应模型已加载；探测失败直接终止启动。
-运行中 endpoint 失效时，`point_frame`/`ground_target` 返回稳定错误码
+运行中 endpoint 失效时，`use_molmo_point`/`propose_candidates` 返回稳定错误码
 `POINTING_BACKEND_UNAVAILABLE`，不得降级成空 points/results。该错误只表示
 基础设施不可用，不构成“图中没有目标”的语义证据。
 
@@ -282,6 +288,22 @@ VLM 必须输出一个 JSON 对象：
 `NAV_NAV_COLLISION_LIMIT`（默认 3）次前进碰撞，才把当前实例标为
 unreachable 并触发 `nav_failed` 决策事件；benchmark 没有后退动作，因此
 恢复不产生不受支持的动作。
+
+frontier 不维护依赖 VGGT 全局精度的永久房间标记。每次地图 snapshot 按
+A* 的局部路径前缀分组为短期 branch，记录该 branch 的碰撞、成功移动、
+新关键帧和最近尝试时间；重复且无新观察的 branch 自动降权。实例导航和
+frontier 跟随共享“转向脱困 → 临时封路 → 重规划”的运动恢复语义。
+
+所有米制消费者使用同一版本化 `MetricTransformSnapshot`。新尺度与当前值
+差异超过 12% 时须连续三次一致才切换；切换才提升 revision，避免单次
+VGGT 尺度漂移同时污染去重、路径代价、冷却半径和 target pool。revision
+切换会废弃 follower、临时障碍和 frontier 路径，并从同一服务端 frame snapshot
+重规划；目标导航不得混用独立 pose RPC 与点云 RPC。
+
+前进受阻先由连续两帧 RGB 静止确认（`MAPPING_STUCK_CONFIRM_STEPS=2`），避免
+低纹理墙面把单次正常前进误判为碰撞。adjust 的 `END_ADJUST` 也不是自由退出：
+verify_instance 至少要有新视图、clear_path 至少成功前进一次、inspect_sector
+至少产生一个 mapping keyframe；否则 harness 继续一个有界的观察动作。
 
 到达实例后由决策 VLM 直接查看当前 RGB 和候选证据，决定报告、离开、
 换目标或 START_ADJUST；到达本身不强制微调。

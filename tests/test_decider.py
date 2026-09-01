@@ -786,7 +786,9 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
     assert state["instances_total"] == 1
     assert state["instances_omitted_ids"] == []
     assert state["reported_instance_ids"] == []
-    assert set(state["frontiers"][0]) == {"id", "path_cost_m"}
+    assert {"id", "path_cost_m", "branch_id", "geometry_gain",
+            "semantic_gain", "failure_count", "recently_attempted",
+            "novelty"} <= set(state["frontiers"][0])
     assert "dist_m" not in row
 
 
@@ -1068,7 +1070,7 @@ def test_ingest_skips_identity_vlm_without_new_marked_photo():
     assert agent.vlm.calls == []
 
 
-def test_ingest_rejects_same_for_candidate_without_visual_evidence():
+def test_ingest_keeps_uncertain_cross_view_candidate_as_proposal():
     agent = _make_agent()
     agent.memory.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
@@ -1085,7 +1087,31 @@ def test_ingest_rejects_same_for_candidate_without_visual_evidence():
                   point=[1.05, 2.02, 0.0])
     agent._ingest_semantic_hits(
         SimpleNamespace(step_count=50), [second], select=False)
-    assert len(agent.memory.nodes) == 2
+    assert len(agent.memory.nodes) == 1
+    assert agent._proposals["c6"]["status"] == "uncertain"
+    assert len(agent.vlm.calls) == 1
+
+
+def test_uncertain_evidence_replay_does_not_create_another_observation():
+    agent = _make_agent()
+    agent.memory.add(
+        [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
+        candidate_id="c4")
+    agent.vlm = _FakeResolverVLM({
+        "decision": "UNCERTAIN", "instance_id": None,
+        "description": "", "reason": "only one ambiguous view",
+    })
+    agent.client = SimpleNamespace(
+        get_candidate_evidence=lambda cid:
+            ({"found": cid == "c6"}, b"new" if cid == "c6" else b""),
+        get_frame_image=lambda fid: ({"found": False}, b""))
+    hit = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
+               point=[1.05, 2.02, 0.0])
+    obs = SimpleNamespace(step_count=50)
+    agent._ingest_semantic_hits(obs, [hit], select=False)
+    agent._ingest_semantic_hits(obs, [hit], select=False)
+    assert len(agent.memory.nodes) == 1
+    assert len(agent.memory.observations) == 2
     assert len(agent.vlm.calls) == 1
 
 
@@ -1102,7 +1128,7 @@ def test_wait_for_captions_logs_timeout_and_swallows_errors():
         del os.environ["NAV_CAPTION_WAIT_S"]
 
 
-def test_scan_flushes_tail_map_before_waiting_and_retrieving():
+def test_scan_flushes_tail_map_before_waiting_without_auto_retrieving():
     agent = _make_agent()
     order = []
     agent.client = SimpleNamespace(
@@ -1114,7 +1140,7 @@ def test_scan_flushes_tail_map_before_waiting_and_retrieving():
     obs = SimpleNamespace(step_count=50, max_steps=500,
                           goal_text="Find all baskets")
     assert agent._scan_complete_decision(obs) == 123
-    assert order == ["flush", "wait", "retrieve"]
+    assert order == ["flush", "wait"]
 
 
 def test_navagent_search_instances_uses_vlm_keywords():

@@ -30,12 +30,12 @@ FINISH is irreversible: the episode ends immediately.
    - task: goal / mode / found / expected, as above.
    - step, max_steps, steps_remaining: your action budget. Plan around it.
    - instances: candidate targets registered so far (see Memory below).
-   - frontiers: reachable exploration candidates, each {{id, path_cost_m}};
-     path_cost_m is the precomputed path length in meters. The topdown map
-     shows where each frontier lies relative to you: treat several
-     frontiers clustered in the same direction as one exploration goal,
-     and pick the frontier that advances into a NEW area rather than
-     merely the closest one.
+   - frontiers: reachable exploration candidates with path cost, branch id,
+     geometry/semantic gain, failure count and novelty. frontier_branches
+     groups frontiers by the LOCAL A* path prefix and records successful
+     moves, collisions and new keyframes. It is not a permanent room map:
+     prefer an untried branch, and avoid a recently blocked/revisited branch
+     unless its gain is materially better.
    - navigation: current_pose (x, y, yaw), current_frame_id (the frame id
      of the latest RGB just fed to the map server — the current view; usable
      with view_frame and instantiate_points) and active_target.
@@ -101,6 +101,16 @@ Perception and retrieval:
   frames may contain the target. Read-only.
 - view_frame(frame_id): attach the keyframe's raw RGB image to your next
   input. Use it to verify what a frame actually shows. Read-only.
+- propose_candidates(frame_id, query) -> {{proposals: [{{candidate_id,
+  frame_id, pixel}}]}}: preferred batch perception transaction. It runs
+   pointing, attaches one crosshair panel per proposal, and registers no 3D
+   instance. You may commit a reviewed subset, but inspect every panel you
+   include and give it exactly one verdict; unsubmitted proposals stay pending.
+- commit_candidates(reviews, label) -> {{instances, accepted, rejected,
+  uncertain, geometry_rejections}}: reviews is a list of
+  {{candidate_id, verdict: ACCEPT|REJECT|UNCERTAIN, reason}}. Only ACCEPT
+  proposals are batch-resolved into navigable instances. UNCERTAIN remains a
+  non-navigable proposal for later evidence; it is never a navigation target.
 - use_molmo_point(frame_id, query) -> {{points: [{{pixel: [x, y],
   confidence}}]}}: ask the pointing model to locate the described object
   in ONE keyframe. Returns 0-1000 normalized pixel coordinates AND attaches
@@ -157,7 +167,8 @@ Housekeeping:
 - get_action_history(before_step, limit) -> [{{step, action, target_id,
   outcome}}]: your older action history; recent_actions covers the last 3.
 
-After a write tool (update_instance, set_notes, instantiate_points) the
+After a write tool (update_instance, set_notes, instantiate_points,
+commit_candidates) the
 refreshed world state is
 included in your next prompt — rely on it, not on the pre-write state.
 Stop calling tools as soon as the supplied evidence is sufficient.
@@ -172,7 +183,8 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   frontiers or adjustment does not work.
 - GOTO_FRONTIER id: follow the precomputed path to an exploration frontier.
   New frames are collected along the way and listed in new_keyframes at
-  the next decision.
+  the next decision. Prefer a frontier in an untried branch rather than
+  repeatedly selecting the first marker in a stalled branch.
 - CONTINUE_NAVIGATION (en_route only): keep following the precomputed path
   to the current navigation goal — the orange ACTIVE star on the topdown
   map. That frontier may no longer appear as an fN diamond in the fresh
@@ -194,8 +206,10 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   once, then you receive a fresh RGB image. LOOK_UP/LOOK_DOWN tilt the camera
   by 30 degrees without moving the robot and are useful for high/low or
   occluded targets. The harness bounds relative pitch and automatically
-  returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
-  as soon as the view or position is sufficient. Never emit movement actions
+   returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
+   is accepted only after its stated success condition has measurable progress:
+   a fresh view for verify_instance, a successful move for clear_path, or a
+   new mapping keyframe for inspect_sector. Never emit movement actions
   outside takeover, and never START_ADJUST while already adjusting.
   To land a reliable click on a distant or unclear target, START_ADJUST
   with MOVE_FORWARD to approach it directly: the closer view makes the

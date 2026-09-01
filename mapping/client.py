@@ -308,6 +308,24 @@ class MappingClient:
             [float(v) for v in bbox]})
         return resp, payload
 
+    def som_segment(self, frame_id, max_masks=None):
+        """SoM 全景分割：返回 (meta, overlay jpeg)。
+
+        meta = {found, frame_id, masks: [{mask_id, centroid, bbox,
+        area_frac}]}；centroid/bbox 均为 0-1000 归一化坐标。
+        """
+        header = {"cmd": "som_segment", "frame_id": int(frame_id)}
+        if max_masks is not None:
+            header["max_masks"] = int(max_masks)
+        return self._request(header)
+
+    def som_pick(self, frame_id, mask_ids):
+        """按 mask_id 注册候选（质心 + 实例 mask）；返回 {candidates: [...]}。"""
+        resp, _ = self._request({
+            "cmd": "som_pick", "frame_id": int(frame_id),
+            "mask_ids": [int(v) for v in (mask_ids or [])]})
+        return resp
+
     def ground_frame(self, rgb, text):
         """对当前实时帧做 VQA + pointing；仅保留给诊断/兼容调用。"""
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)

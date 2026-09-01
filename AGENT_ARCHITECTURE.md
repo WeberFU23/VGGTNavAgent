@@ -94,6 +94,27 @@ proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 
    新证据，不直接新建可导航实例。该 VLM 调用同时更新实例描述，不额外占用
    决策 VLM 的 15 轮工具预算。
 
+### SAM mask 精化与 SoM 全分割
+
+`mapping/sam_backend.py`（server 端，惰性加载 `segment_anything`，
+`NAV_SAM_CKPT`/`NAV_SAM_MODEL_TYPE`/`NAV_SAM_DEVICE`/`NAV_SAM_ENABLED`
+配置；未安装或权重缺失时自动禁用并退回旧行为）：
+
+- **点提示精化**：`point_pixels`/`prepare_pixels`/`instantiate_pixels`/
+  `point_frame` 拿到的每个粗落点先经 SAM 点提示分割，用 mask 质心替换
+  原始像素、mask bbox 作为证据裁剪框；深度采样优先在 mask 区域内取
+  中位数（`sample_point_depth(mask_hw=...)`），不再受 patch 边缘背景
+  污染。候选注册的 mask 也随之从合成圆盘升级为真实实例 mask，
+  `resolve_candidate` 重采样时复用。
+- **SoM 全分割（升级路径）**：`som_segment(frame_id)` 用 SAM automatic
+  mask generator 输出整帧物体级 mask（过滤面积 <0.2% 的碎片与 >55% 的
+  背景区域），渲染编号 overlay 返回给决策 VLM；VLM 用
+  `som_pick(frame_id, mask_ids, query)` 把选中 mask 注册为 proposal
+  （质心为候选像素），后续走与 `propose_candidates` 完全相同的证据
+  面板 + `commit_candidates` 流程。mask 在服务端按帧缓存（LRU 8 帧）。
+  用途：pointing 模型反复把点落在背景/错误物体上（review 连续 REJECT）
+  时，由决策 VLM 自行把"生成坐标"降级为"选择题"。
+
 建图不把每个观测都作为关键帧。默认在相对上一关键帧的平均光流超过 40
 像素时取帧；即使光流不足，也最多间隔 3 个观测强制刷新。每个子图包含
 16 个新关键帧，并与下一子图共享 3 帧。
@@ -204,6 +225,8 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 | `use_molmo_point(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
 | `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录 `ACCEPT` / `REJECT` / `UNCERTAIN`；只有 `ACCEPT` 允许实例化，写 |
 | `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
+| `som_segment(frame_id)` | SAM 全分割编号 overlay + mask 元数据列表（0-1000 归一化 centroid/bbox/area_frac），只读 |
+| `som_pick(frame_id, mask_ids, query)` | 选中 mask 注册为 proposal（质心为像素、mask 用于深度采样），随后走 commit 流程，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
 | `get_instance(instance_id)` | 完整实例记录（无图像），只读 |
 | `view_instance(instance_id)` | 下一轮附加该实例证据图（pointing overlay 优先），只读 |

@@ -219,7 +219,7 @@ class PointingGrounder:
 # ----------------------------------------------------------------------
 def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
                        min_points=5, cam_origin=None, bbox=None,
-                       bbox_margin=0.15):
+                       bbox_margin=0.15, mask_hw=None, max_mask_points=2000):
     """point 像素周围 patch 采样 3D 点。
 
     points_hw3: (H, W, 3) 世界系点（NaN = 无效）；
@@ -241,6 +241,31 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
         conf = np.ones((h, w), dtype=bool)
     half = max(int(patch), 1) // 2
     x, y = int(round(pixel[0])), int(round(pixel[1]))
+
+    # SAM mask 优先：在物体完整范围内采样，避免 patch 边缘混入背景。
+    # mask 内有效点不足时退回 patch/bbox 窗口。
+    if mask_hw is not None:
+        mask = np.asarray(mask_hw, dtype=bool)
+        if mask.shape == (h, w):
+            sel = mask & conf & np.isfinite(points).all(axis=2)
+            valid = points[sel]
+            if len(valid) >= int(min_points):
+                if len(valid) > int(max_mask_points):
+                    idx = np.random.choice(
+                        len(valid), int(max_mask_points), replace=False)
+                    valid = valid[idx]
+                origin = (np.asarray(cam_origin, dtype=np.float64)
+                          if cam_origin is not None else np.zeros(3))
+                depths = np.linalg.norm(valid - origin, axis=1)
+                return {
+                    "found": True,
+                    "point": np.median(valid, axis=0),
+                    "num_points": int(len(valid)),
+                    "depth_std": float(np.std(depths)),
+                    "spread": float(np.percentile(depths, 90)
+                                    - np.percentile(depths, 10)),
+                    "sampled_from": "mask",
+                }
 
     def _window(cx, cy):
         return (max(0, cx - half), min(w, cx + half + 1),
@@ -280,6 +305,7 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
         "num_points": int(len(valid)),
         "depth_std": float(np.std(depths)),
         "spread": float(np.percentile(depths, 90) - np.percentile(depths, 10)),
+        "sampled_from": "patch",
     }
 
 

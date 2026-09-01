@@ -152,6 +152,17 @@ Perception and retrieval:
   returns error code POINTING_BACKEND_UNAVAILABLE. This is not evidence that
   the target is absent: inspect a retrieved frame and use your own pixel
   coordinates with instantiate_points, or continue exploration.
+- som_segment(frame_id) -> {{masks: [{{mask_id, centroid, bbox, area_frac}}]}}
+  plus an attached overlay image: segment the whole frame into numbered
+  object regions (centroid/bbox are 0-1000 normalized, matching the numbers
+  printed on the overlay). Escalation path: when use_molmo_point/
+  propose_candidates keep coming back REJECT because the point lands on
+  background or the wrong object, call this and pick regions yourself.
+- som_pick(frame_id, mask_ids, query) -> {{proposals: [{{candidate_id,
+  frame_id, mask_id, pixel}}]}}: register the picked regions as reviewable
+  proposals; each mask's centroid becomes the candidate pixel and the mask
+  itself is used for depth sampling. Evidence panels are attached; review
+  them and commit with commit_candidates exactly as with propose_candidates.
 
 Instance memory:
 - search_instances(query, reported=null, top_k=10) -> compact rows: keyword

@@ -131,6 +131,8 @@ class NavAgent(MappingAgent):
                            "use_molmo_point": self._tool_use_molmo_point,
                            "review_crosshair": self._tool_review_crosshair,
                            "instantiate_points": self._tool_instantiate_points,
+                           "som_segment": self._tool_som_segment,
+                           "som_pick": self._tool_som_pick,
                            "get_agent_status": self._tool_get_agent_status,
                            "set_notes": self._tool_set_notes,
                            "get_action_history": self._tool_get_action_history},
@@ -1648,6 +1650,81 @@ class NavAgent(MappingAgent):
             if meta.get("found") and payload:
                 images.append((f"proposal_{cid}", payload))
             rows.append({"candidate_id": cid, "frame_id": int(fid),
+                         "pixel": list(pixel)})
+        if len(self._proposals) > self._proposal_limit:
+            oldest = sorted(self._proposals.values(),
+                            key=lambda row: row["step"])[:-self._proposal_limit]
+            for row in oldest:
+                self._proposals.pop(row["candidate_id"], None)
+        out = {"proposals": rows, "next":
+               "inspect panels, then commit any reviewed subset with one "
+               "verdict per submitted candidate; other proposals stay pending"}
+        if images:
+            out["_tool_images"] = images
+        return out
+
+    def _tool_som_segment(self, frame_id, max_masks=None):
+        """SoM 全分割：整帧 SAM 分割，返回编号 mask 列表 + overlay 图。
+
+        pointing 模型反复选错物体（review REJECT 且理由是落点在背景/
+        其他物体上）时的升级路径：把"生成坐标"变成"选编号"。
+        """
+        try:
+            meta, payload = self.client.som_segment(int(frame_id), max_masks)
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+        if meta.get("error"):
+            return self._pointing_error(meta)
+        if not meta.get("found"):
+            return {"masks": []}
+        out = {"frame_id": int(frame_id),
+               "masks": meta.get("masks") or [],
+               "next": "mask ids match the numbered labels on the attached "
+                       "overlay; call som_pick with the ids matching the "
+                       "target description"}
+        if payload:
+            out["_tool_images"] = [(f"som_{int(frame_id)}", payload)]
+        return out
+
+    def _tool_som_pick(self, frame_id, mask_ids, query=""):
+        """把 SoM 选中的 mask 注册为待审核候选（复用 commit 流程）。
+
+        每个 mask 的质心成为候选像素、mask 本体用于深度采样与证据图。
+        返回后需照常检查证据面板并用 commit_candidates 提交裁决。
+        """
+        if not isinstance(mask_ids, (list, tuple)) or not mask_ids:
+            return {"error": "mask_ids must be a non-empty list of ints"}
+        try:
+            resp = self.client.som_pick(int(frame_id), list(mask_ids))
+        except Exception as exc:
+            return {"error": str(exc)[:200]}
+        if resp.get("error"):
+            return self._pointing_error(resp)
+        images, rows = [], []
+        for candidate in resp.get("candidates") or []:
+            cid = str(candidate.get("candidate_id") or "")
+            fid = candidate.get("frame_id")
+            pixel = candidate.get("pixel_norm")
+            if not cid or fid is None or not pixel:
+                continue
+            self._proposals[cid] = {
+                "candidate_id": cid, "frame_id": int(fid),
+                "pixel_norm": list(pixel), "bbox": candidate.get("bbox"),
+                "query": str(query)[:300]
+                         or f"som mask {candidate.get('mask_id')}",
+                "step": int(
+                    getattr(self._last_observation, "step_count", 0)),
+                "status": "pending",
+            }
+            self._record_crosshair_evidence(fid, pixel)
+            try:
+                meta, payload = self.client.get_candidate_evidence(cid)
+            except Exception:
+                meta, payload = {"found": False}, b""
+            if meta.get("found") and payload:
+                images.append((f"proposal_{cid}", payload))
+            rows.append({"candidate_id": cid, "frame_id": int(fid),
+                         "mask_id": candidate.get("mask_id"),
                          "pixel": list(pixel)})
         if len(self._proposals) > self._proposal_limit:
             oldest = sorted(self._proposals.values(),

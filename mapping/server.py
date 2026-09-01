@@ -182,6 +182,18 @@ class MappingServer:
         if not args.no_semantic:
             self._init_semantic_memory()
 
+        # SAM mask 精化 + SoM 全分割；未安装/无权重时自动禁用，退回旧行为。
+        from mapping.sam_backend import SAMRefiner
+        self.sam = SAMRefiner.from_env()
+        if self.sam.available:
+            print(f"[server] SAM 就绪: {self.sam.ckpt} ({self.sam.model_type})",
+                  flush=True)
+        else:
+            print(f"[server] SAM 不可用（{self.sam.disabled_reason}），"
+                  "mask 精化/SoM 禁用", flush=True)
+        self._som_cache = {}
+        self._som_cache_order = []
+
         self.keyframe_paths = []
         self.target_size = args.submap_size + args.overlapping_window_size
         self.num_frames = 0
@@ -925,6 +937,12 @@ class MappingServer:
             raise
         results = []
         for pt in pts:
+            x, y = pt["pixel"]
+            ref = self._refine_point_with_sam(sid, idx, fid, x, y)
+            pt = {"pixel": (ref["x"], ref["y"]),
+                  "confidence": pt["confidence"],
+                  "bbox": ref["bbox"] if ref["refined"] else pt.get("bbox"),
+                  "mask": ref["mask"]}
             resolved = self._resolve_point(sid, idx, fid, pt)
             resolved["frame_id"] = fid
             results.append(resolved)
@@ -967,17 +985,33 @@ class MappingServer:
                         "error_code": "POINTING_BACKEND_UNAVAILABLE",
                         "error": str(exc)[:300]}
             raise
+        # SAM 点提示精化：粗落点替换为物体 mask 质心，附 mask bbox 与面积占比
+        refined = []
+        for pt in pts:
+            x, y = pt["pixel"]
+            ref = self._refine_point_with_sam(sid, idx, fid, x, y)
+            row = {"pixel": (ref["x"], ref["y"]),
+                   "confidence": pt["confidence"],
+                   "bbox": ref["bbox"] if ref["refined"] else pt.get("bbox"),
+                   "refined": bool(ref["refined"])}
+            if ref["area_frac"] is not None:
+                row["area_frac"] = ref["area_frac"]
+            refined.append(row)
+        pts = refined
         self._diag_write({
             "cmd": "point_pixels", "text": text, "frame_id": fid,
             "num_points": len(pts),
             "points": [{"pixel": list(pt["pixel"]),
-                        "point_score": pt["confidence"]} for pt in pts],
+                        "point_score": pt["confidence"],
+                        "refined": pt.get("refined", False)} for pt in pts],
         })
         return {"width": int(pil.size[0]), "height": int(pil.size[1]),
                 "points": [
             {"pixel": [float(pt["pixel"][0]), float(pt["pixel"][1])],
              "confidence": float(pt["confidence"]),
-             "bbox": pt.get("bbox")} for pt in pts]}
+             "bbox": pt.get("bbox"),
+             "refined": bool(pt.get("refined", False)),
+             "area_frac": pt.get("area_frac")} for pt in pts]}
 
     def instantiate_pixels(self, frame_id, pixels, normalized=True):
         """按给定像素实例化：patch 深度采样 + 候选注册。
@@ -1003,7 +1037,10 @@ class MappingServer:
                 x, y = x / 1000.0 * w, y / 1000.0 * h
             x = min(max(x, 0.0), w - 1)
             y = min(max(y, 0.0), h - 1)
-            pt = {"pixel": (x, y), "confidence": 1.0, "bbox": None}
+            ref = self._refine_point_with_sam(sid, idx, fid, x, y)
+            pt = {"pixel": (ref["x"], ref["y"]), "confidence": 1.0,
+                  "bbox": ref["bbox"] if ref["refined"] else None,
+                  "mask": ref["mask"]}
             resolved = self._resolve_point(sid, idx, fid, pt)
             resolved["frame_id"] = fid
             results.append(resolved)
@@ -1035,16 +1072,107 @@ class MappingServer:
                 x, y = x / 1000.0 * w, y / 1000.0 * h
             x = min(max(x, 0.0), w - 1)
             y = min(max(y, 0.0), h - 1)
+            ref = self._refine_point_with_sam(sid, idx, fid, x, y)
             meta = self._register_point_candidate(
-                sid, idx, fid, (x, y), None, 1.0)
+                sid, idx, fid, (ref["x"], ref["y"]),
+                ref["bbox"] if ref["refined"] else None, 1.0,
+                mask=ref["mask"])
             candidates.append({
                 "candidate_id": meta["candidate_id"],
                 "frame_id": fid,
-                "pixel": [x, y],
+                "pixel": [ref["x"], ref["y"]],
                 "pixel_norm": meta["pixel_norm"],
                 "point_score": 1.0,
                 "bbox": meta.get("bbox"),
+                "refined": bool(ref["refined"]),
             })
+        return {"candidates": candidates}
+
+    # ------------------------------------------------------------------
+    # SoM 全分割：整帧 SAM 分割 -> 编号 overlay -> VLM 选 mask -> 注册候选
+    # ------------------------------------------------------------------
+    def som_segment(self, frame_id, max_masks=None):
+        """对指定关键帧做全景分割，返回 mask 元数据 + 编号 overlay JPEG。
+
+        mask 缓存在服务端（_som_cache），供后续 som_pick 按 mask_id 引用；
+        overlay 中每个 mask 半透明着色并在质心标注 mask_id。
+        """
+        if self.sam is None or not self.sam.available:
+            return {"found": False, "error_code": "SAM_UNAVAILABLE",
+                    "error": f"SAM disabled: {getattr(self.sam, 'disabled_reason', None)}"}, b""
+        located = self._locate_frame(int(frame_id))
+        if located is None:
+            return {"found": False, "error": f"unknown frame_id {frame_id}"}, b""
+        sid, idx = located
+        fid = int(frame_id)
+        from torchvision.transforms.functional import to_pil_image
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            frame = submap.get_frame_at_index(idx)
+        rgb = np.asarray(to_pil_image(frame))
+        h, w = rgb.shape[:2]
+        masks = self.sam.segment_all(rgb, max_masks=max_masks)
+        # LRU 缓存：同帧重复分割直接换新结果，最多保留 8 帧
+        self._som_cache[fid] = {"submap_id": sid, "frame_index": idx,
+                                "masks": masks, "shape": (h, w)}
+        if fid in self._som_cache_order:
+            self._som_cache_order.remove(fid)
+        self._som_cache_order.append(fid)
+        while len(self._som_cache_order) > 8:
+            oldest = self._som_cache_order.pop(0)
+            self._som_cache.pop(oldest, None)
+        from mapping.sam_backend import render_som_overlay
+        jpeg = render_som_overlay(rgb, masks)
+        rows = []
+        for row in masks:
+            cx, cy = row["centroid"]
+            x0, y0, x1, y1 = row["bbox"]
+            rows.append({
+                "mask_id": int(row["mask_id"]),
+                "centroid": [round(cx / w * 1000, 1), round(cy / h * 1000, 1)],
+                "bbox": [round(x0 / w * 1000, 1), round(y0 / h * 1000, 1),
+                         round(x1 / w * 1000, 1), round(y1 / h * 1000, 1)],
+                "area_frac": round(float(row["area_frac"]), 4),
+            })
+        self._diag_write({"cmd": "som_segment", "frame_id": fid,
+                          "num_masks": len(masks)})
+        meta = {"found": True, "frame_id": fid, "width": w, "height": h,
+                "masks": rows}
+        if jpeg:
+            meta["mime_type"] = "image/jpeg"
+        return meta, (jpeg or b"")
+
+    def som_pick(self, frame_id, mask_ids):
+        """按 mask_id 注册候选（质心 + 实例 mask），供 commit 流程复用。"""
+        fid = int(frame_id)
+        cached = self._som_cache.get(fid)
+        if cached is None:
+            return {"candidates": [], "error_code": "SOM_CACHE_MISS",
+                    "error": "no segmentation cached for this frame; "
+                             "call som_segment first"}
+        by_id = {int(row["mask_id"]): row for row in cached["masks"]}
+        sid, idx = cached["submap_id"], cached["frame_index"]
+        candidates = []
+        for raw_id in list(mask_ids or [])[:16]:
+            row = by_id.get(int(raw_id))
+            if row is None or row.get("centroid") is None:
+                continue
+            cx, cy = row["centroid"]
+            meta = self._register_point_candidate(
+                sid, idx, fid, (cx, cy), row["bbox"], 1.0, mask=row["mask"])
+            candidates.append({
+                "candidate_id": meta["candidate_id"],
+                "frame_id": fid,
+                "mask_id": int(raw_id),
+                "pixel": [cx, cy],
+                "pixel_norm": meta["pixel_norm"],
+                "point_score": 1.0,
+                "bbox": meta.get("bbox"),
+                "refined": True,
+            })
+        self._diag_write({"cmd": "som_pick", "frame_id": fid,
+                          "mask_ids": [int(v) for v in (mask_ids or [])][:16],
+                          "num_candidates": len(candidates)})
         return {"candidates": candidates}
 
     def _ground_object_semantic(self, text, top_k):
@@ -1113,7 +1241,8 @@ class MappingServer:
         """pointing 像素 -> patch 深度采样 -> 当前图优化坐标系 3D 点。
 
         保留"图像定位 -> 点云采深度 -> 3D 点"这一跳：VLM 可能隔几米
-        认出目标，导航端不能只用拍照位姿。
+        认出目标，导航端不能只用拍照位姿。point_info 带 mask 时优先在
+        SAM mask 区域内采样（见 sample_point_depth）。
         """
         from mapping.pointing import sample_point_depth
 
@@ -1132,7 +1261,8 @@ class MappingServer:
         cam_origin = (hom @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
         sampled = sample_point_depth(
             pts_world, conf, pixel, patch=self.point_patch,
-            cam_origin=cam_origin, bbox=point_info.get("bbox"))
+            cam_origin=cam_origin, bbox=point_info.get("bbox"),
+            mask_hw=point_info.get("mask"))
         pixel_norm = [float(pixel[0]) / w * 1000.0,
                       float(pixel[1]) / h * 1000.0]
         if not sampled["found"]:
@@ -1153,13 +1283,45 @@ class MappingServer:
         if register:
             out.update(self._register_point_candidate(
                 sid, idx, frame_id, pixel, point_info.get("bbox"),
-                point_info["confidence"]))
+                point_info["confidence"], mask=point_info.get("mask")))
         return out
 
+    def _refine_point_with_sam(self, sid, idx, fid, x, y):
+        """SAM 点提示精化：粗落点 -> 物体 mask -> 质心 + mask bbox。
+
+        返回 {x, y, mask, bbox, area_frac, refined}；SAM 不可用或选中
+        背景时 refined=False 且坐标原样返回（调用方退回旧行为）。
+        """
+        result = {"x": float(x), "y": float(y), "mask": None, "bbox": None,
+                  "area_frac": None, "refined": False}
+        if self.sam is None or not self.sam.available:
+            return result
+        from torchvision.transforms.functional import to_pil_image
+        with self.data_lock:
+            submap = self.solver.map.get_submap(sid)
+            frame = submap.get_frame_at_index(idx)
+        rgb = np.asarray(to_pil_image(frame))
+        try:
+            hit = self.sam.segment_at_point(
+                rgb, (float(x), float(y)),
+                cache_key=f"{self._current_episode or 'unknown'}_sam_{fid}")
+        except Exception as exc:  # noqa: BLE001 - 单次失败退回旧行为
+            print(f"[server] SAM 精化失败 frame={fid}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return result
+        if hit is None or hit.get("centroid") is None:
+            return result
+        result.update({
+            "x": float(hit["centroid"][0]), "y": float(hit["centroid"][1]),
+            "mask": hit["mask"], "bbox": hit["bbox"],
+            "area_frac": float(hit["area_frac"]), "refined": True,
+        })
+        return result
+
     def _register_point_candidate(self, sid, idx, frame_id, pixel, bbox,
-                                  score):
-        """point 候选注册：存像素 + patch，供 resolve_candidate 在最新
-        图优化坐标系下重采样；同时合成小圆盘 mask 供 evidence 复用。"""
+                                  score, mask=None):
+        """point 候选注册：存像素 + mask，供 resolve_candidate 在最新
+        图优化坐标系下重采样；mask 为 SAM 实例 mask，缺省时合成小圆盘。"""
         self._candidate_seq += 1
         candidate_id = f"c{self._candidate_seq}"
         with self.data_lock:
@@ -1171,9 +1333,12 @@ class MappingServer:
             r = max(self.point_patch, 8)
             x0, y0 = pixel[0] - r, pixel[1] - r
             x1, y1 = pixel[0] + r, pixel[1] + r
-        yy, xx = np.mgrid[0:h, 0:w]
-        disk = (xx - pixel[0]) ** 2 + (yy - pixel[1]) ** 2 \
-            <= (max(self.point_patch, 8) / 2.0) ** 2
+        if mask is not None and np.asarray(mask).shape == (h, w):
+            disk = np.asarray(mask, dtype=bool)
+        else:
+            yy, xx = np.mgrid[0:h, 0:w]
+            disk = (xx - pixel[0]) ** 2 + (yy - pixel[1]) ** 2 \
+                <= (max(self.point_patch, 8) / 2.0) ** 2
         # pixel_norm 与决策 VLM 的 pixels_1000 同约定（0-1000 归一化），
         # 供语义审核拒绝记录原样返回，避免 VLM 把原始帧坐标当归一化坐标。
         pixel_norm = [float(pixel[0]) / w * 1000.0,
@@ -1203,7 +1368,7 @@ class MappingServer:
         resolved = self._resolve_point(
             cand["submap_id"], cand["frame_index"], cand["frame_id"],
             {"pixel": cand["pixel"], "confidence": cand["point_score"],
-             "bbox": None}, register=False)
+             "bbox": None, "mask": cand.get("mask")}, register=False)
         if not resolved.get("found"):
             return {"found": False,
                     "num_points": resolved.get("num_points", 0)}
@@ -1441,6 +1606,13 @@ class MappingServer:
             return {"ok": True, **self.prepare_pixels(
                 int(header["frame_id"]), header.get("pixels", []),
                 bool(header.get("normalized", True)))}, b""
+        if cmd == "som_segment":
+            resp, overlay = self.som_segment(
+                int(header["frame_id"]), header.get("max_masks"))
+            return {"ok": True, **resp}, overlay
+        if cmd == "som_pick":
+            return {"ok": True, **self.som_pick(
+                int(header["frame_id"]), header.get("mask_ids", []))}, b""
         if cmd == "resolve_candidate":
             return {"ok": True, **self.resolve_candidate(
                 header["candidate_id"])}, b""

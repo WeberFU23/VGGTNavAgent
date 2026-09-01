@@ -25,9 +25,13 @@ import numpy as np
 
 from mapping.vllm_client import Priority, VLLMError
 
-CAPTION_PROMPT = """List all visible objects in this indoor RGB image for later text-based retrieval.
-Skip room surfaces entirely (walls, floor, ceiling).
-First line: "Objects:" followed by the object category names only, comma-separated
+CAPTION_PROMPT = """Describe this indoor RGB image for later text-based retrieval.
+First line: "Scene context:" followed by the probable room/area type and salient
+fixed fixtures (for example bathroom with shower area, kitchen with sink), or
+"unknown" when the image does not support a room label. Mark uncertain labels as
+probable rather than asserting them.
+Skip generic room surfaces (walls, floor, ceiling) from the object list.
+Second line: "Objects:" followed by the object category names only, comma-separated
 (e.g. "chair, table, clock"); list each category once even if several are visible.
 Then write one natural-language sentence per object instance, numbered per
 category (e.g. "chair 1: ...", "chair 2: ...").
@@ -42,7 +46,7 @@ Do NOT mention:
 To tell same-category instances apart, use intrinsic differences only;
 if two instances are truly indistinguishable, still write one sentence each.
 At most 20 sentences. Query-independent; prefer completeness over brevity. No
-extra commentary."""
+extra commentary beyond the required Scene context and Objects sections."""
 
 
 def _safe_episode_component(value):

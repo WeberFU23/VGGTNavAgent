@@ -66,6 +66,15 @@ def test_disabled_client_is_network_free():
     assert called == []
 
 
+def test_decision_live_probe_requires_valid_json_generation():
+    fake = _FakePost([{"ok": True}])
+    client = VLMDecisionClient(
+        api_url="http://vlm.local/v1", model="test-vlm", enabled=True,
+        post_fn=fake)
+    assert client.probe() is True
+    assert fake.calls[0][1]["json"]["max_tokens"] == 16
+
+
 def test_png_topdown_map_uses_png_data_uri():
     fake = _FakePost([{"action": "END_ADJUST"}])
     client = VLMDecisionClient(

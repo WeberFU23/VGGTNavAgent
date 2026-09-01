@@ -97,7 +97,7 @@ def test_entity_resolver_attaches_cross_frame_same_object():
     assert node.text == "same chair from two views"
 
 
-def test_entity_resolver_preserves_uncertain_neighbor_as_new():
+def test_entity_resolver_keeps_uncertain_neighbor_non_navigable():
     mem = InstanceMemory()
     mem.create_instance(mem.new_observation(
         [0, 0, 0], "chair A", frame_id=1, candidate_id="c1"))
@@ -109,7 +109,9 @@ def test_entity_resolver_preserves_uncertain_neighbor_as_new():
             "decision": "UNCERTAIN", "instance_id": None,
             "description": "possibly another chair",
         })
-    assert result.is_new and len(mem.nodes) == 2
+    assert not result.is_new and result.node is None
+    assert result.observation is second and result.verdict == "UNCERTAIN"
+    assert len(mem.nodes) == 1
 
 
 def test_reported_instances_are_not_available():

@@ -81,6 +81,8 @@ class NavAgent(MappingAgent):
         self.finish_map_stable_steps = int(os.environ.get(
             "NAV_FINISH_MAP_STABLE_STEPS", "100"))
         self.ground_top_k = int(os.environ.get("NAV_GROUND_TOP_K", "2"))
+        self.relevant_frame_top_k = max(1, min(20, int(os.environ.get(
+            "NAV_RELEVANT_FRAME_TOP_K", "5"))))
         self.adjust_max_steps = max(1, int(os.environ.get(
             "NAV_ADJUST_MAX_STEPS", "10")))
         self.adjust_max_tilt_steps = max(0, int(os.environ.get(
@@ -109,6 +111,13 @@ class NavAgent(MappingAgent):
         self.decision_loop = None
         if self.decider_mode == "vlm":
             if self.vlm.enabled:
+                require_vlm_probe = os.environ.get(
+                    "NAV_REQUIRE_DECISION_PREFLIGHT", "1").strip().lower() in {
+                        "1", "true", "yes", "on"}
+                if require_vlm_probe and not self.vlm.probe():
+                    raise RuntimeError(
+                        "DECISION_BACKEND_UNAVAILABLE: live generation failed: "
+                        f"{self.vlm._last_error or 'invalid response'}")
                 self.decision_loop = DecisionLoop(
                     chat_fn=self.vlm.agentic_chat,
                     tools={"search_frames": self._tool_search_frames,
@@ -184,6 +193,7 @@ class NavAgent(MappingAgent):
         self._target_mode = "any"
         self._target_count = None
         self._selected_evidence = None
+        self._arrival_transition_active = False
         # VLM 显式 START_ADJUST/END_ADJUST 控制的通用微调状态。
         self._adjusting = False
         self._adjust_steps = 0
@@ -1010,36 +1020,7 @@ class NavAgent(MappingAgent):
                     # 连续碰撞无法到达：登记不可达并让决策 VLM 介入换目标
                     action = self._nav_failed_recovery(observation)
                 elif arrived:
-                    self._mark_goto_arrived()
-                    result, decided_action = self._arrival_vlm_decision(
-                        observation)
-                    if result is None:
-                        self._log_event(
-                            "arrival decision unavailable; leaving candidate "
-                            "without report")
-                        self._clear_current_target()
-                        self.mode = "explore"
-                        action = self._explore_action(observation)
-                    elif result.action == "REPORT_FOUND":
-                        # 报告由决策 VLM 直接授权；不再做 ground_frame 或 servo。
-                        action = self._report_found(result.target_id)
-                    elif result.action == "SCAN":
-                        # SCAN 只有在决策 VLM 明确选择后才启动。
-                        self._scanning = True
-                        self._scan_steps = 0
-                        self._scan_images = []
-                        action = int(Action.TURN_LEFT)
-                    elif result.action == "EXPLORE":
-                        # _decider_next 已把 EXPLORE 映射为确定性最优前沿；
-                        # 不要再次 clear，否则会删掉刚建立的 frontier follower。
-                        action = (decided_action if decided_action is not None
-                                  else self._autonomous_explore_action(
-                                      observation))
-                    else:
-                        # GOTO_INSTANCE/GOTO_FRONTIER/FINISH 已由
-                        # _decider_next 映射到底层动作。
-                        action = (decided_action if decided_action is not None
-                                  else self._explore_action(observation))
+                    action = self._handle_arrival_transition(observation)
                 elif action is None:    # 路径走丢，退回探索
                     self.mode = "explore"
                     action = self._explore_action(observation)
@@ -1082,6 +1063,41 @@ class NavAgent(MappingAgent):
         self._scan_steps = 0
         self._scan_images = []
         self._selected_evidence = None
+
+    def _handle_arrival_transition(self, observation):
+        """Enter the arrival decision exactly once from every nav call path."""
+        if self._arrival_transition_active:
+            self._log_event(
+                "suppressed recursive immediate arrival; returning to explore")
+            self._clear_current_target()
+            self.mode = "explore"
+            return self._autonomous_explore_action(observation)
+        self._mark_goto_arrived()
+        self._arrival_transition_active = True
+        try:
+            result, decided_action = self._arrival_vlm_decision(observation)
+        finally:
+            self._arrival_transition_active = False
+        if result is None:
+            self._log_event(
+                "arrival decision unavailable; leaving candidate without report")
+            self._clear_current_target()
+            self.mode = "explore"
+            return self._explore_action(observation)
+        if result.action == "REPORT_FOUND":
+            return self._report_found(result.target_id)
+        if result.action == "SCAN":
+            self._scanning = True
+            self._scan_steps = 0
+            self._scan_images = []
+            return int(Action.TURN_LEFT)
+        if result.action == "EXPLORE":
+            # _decider_next has already activated the selected frontier.
+            return (decided_action if decided_action is not None
+                    else self._autonomous_explore_action(observation))
+        # GOTO_INSTANCE/GOTO_FRONTIER/FINISH are mapped by _decider_next.
+        return (decided_action if decided_action is not None
+                else self._explore_action(observation))
 
     def _ensure_alignment(self):
         """每个 episode 固定一套重力对齐坐标，供地图、记忆、TSP 共用。"""
@@ -2057,6 +2073,22 @@ class NavAgent(MappingAgent):
                 self._last_notified_frame_id = max(new_ids)
         except Exception:
             pass
+        # Always expose task-directed retrieval candidates.  They remain
+        # hypotheses until their RGB is viewed and the explicit tri-state
+        # semantic review accepts a marked point.
+        query = self.target_text or self._target_phrase(observation)
+        if query:
+            try:
+                relevant = self.client.retrieve_captions(
+                    query, top_k=self.relevant_frame_top_k)
+                state["relevant_frames"] = [
+                    {"frame_id": int(row["frame_id"]),
+                     "score": round(float(row.get("score", 0.0)), 3),
+                     "caption": str(row.get("caption", ""))[:300]}
+                    for row in relevant if row.get("frame_id") is not None]
+            except Exception as exc:
+                state["semantic_retrieval"] = {
+                    "available": False, "error": str(exc)[:160]}
         map_png = None
         if grid is not None:
             try:
@@ -2120,7 +2152,15 @@ class NavAgent(MappingAgent):
                 self._log_event(f"decider -> GOTO_INSTANCE {nd.iid}")
                 if self._plan_to_target(observation):
                     self.mode = "nav"
-                return
+                    return True
+                # Planning failure must not leave an instance displayed as an
+                # active target while control has already returned to explore.
+                failed_id = nd.iid
+                self._clear_current_target()
+                self.mode = "explore"
+                self._log_event(
+                    f"GOTO_INSTANCE {failed_id} plan failed; target cleared")
+                return False
         if result.action == "GOTO_FRONTIER" and result.target_id is not None:
             cluster = None
             for i, c in enumerate(self._last_frontier_clusters):
@@ -2128,10 +2168,12 @@ class NavAgent(MappingAgent):
                     cluster = c
                     break
             if cluster is None:
-                return
+                return False
             self._activate_frontier(
                 observation, cluster,
                 source=f"decider GOTO_FRONTIER {result.target_id}")
+            return self._explore_follower is not None
+        return False
 
     def _autonomous_explore_action(self, observation):
         """Map EXPLORE to the best deterministic frontier, not random motion.
@@ -2253,9 +2295,14 @@ class NavAgent(MappingAgent):
         if result.action in ("GOTO_INSTANCE", "GOTO_FRONTIER"):
             self._apply_decider_steering(observation, result)
             if self.mode == "nav":
-                action, _arrived, _stuck = self._nav_action(observation)
+                action, arrived, stuck = self._nav_action(observation)
+                if stuck:
+                    return result, self._nav_failed_recovery(observation)
+                if arrived:
+                    return result, self._handle_arrival_transition(observation)
                 if action is not None:
                     return result, action
+                self._clear_current_target()
                 self.mode = "explore"
             action = self._explore_follow(observation)
             return result, (action if action is not None else

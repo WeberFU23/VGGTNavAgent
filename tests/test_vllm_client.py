@@ -40,6 +40,29 @@ def test_healthcheck_requires_requested_model():
         gw.healthcheck("qwen", get_fn=get)
 
 
+def test_live_chat_probe_detects_quota_error_without_retries():
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append((args, kwargs))
+        response = _FakeResponse(status_code=400)
+        response.text = "insufficient balance"
+        return response
+
+    gw = _gateway(post, start_worker=False, max_retries=5)
+    with pytest.raises(VLLMError, match="insufficient balance"):
+        gw.probe_chat("caption-model", timeout=1)
+    assert len(calls) == 1
+
+
+def test_live_chat_probe_accepts_nonempty_generation():
+    gw = _gateway(
+        lambda *args, **kwargs: _FakeResponse("OK"), start_worker=False)
+    result = gw.probe_chat("caption-model", timeout=1)
+    assert result["model"] == "caption-model"
+    assert result["output"] == "OK"
+
+
 def _gateway(post_fn, **kwargs):
     kwargs.setdefault("backoff_base", 0.0)
     return VLLMGateway("http://fake/v1", post_fn=post_fn, **kwargs)

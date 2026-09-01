@@ -163,6 +163,38 @@ class VLLMGateway:
                 f"pointing model {requested!r} is not loaded; available={loaded}")
         return {"url": models_url, "models": loaded}
 
+    def probe_chat(self, model, timeout=15.0, post_fn=None):
+        """Run one real generation without retries to detect auth/quota errors."""
+        if not model:
+            raise VLLMError("model 名为空（无法执行生成预检）")
+        post_fn = post_fn or self._post_fn
+        if post_fn is None:
+            import requests
+            post_fn = requests.post
+        payload = self._build_payload(
+            model, "Reply with OK only.", [], max_tokens=4)
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        try:
+            response = post_fn(self._chat_url(), headers=headers, json=payload,
+                               timeout=float(timeout))
+            status = getattr(response, "status_code", 200)
+            if status >= 400:
+                body = str(getattr(response, "text", ""))[:300]
+                raise VLLMError(
+                    f"live generation failed HTTP {status}: {body}")
+            response.raise_for_status()
+            text = self._extract_text(response.json())
+            if not str(text or "").strip():
+                raise VLLMError("live generation returned empty output")
+            return {"url": self._chat_url(), "model": str(model),
+                    "output": str(text)[:80]}
+        except VLLMError:
+            raise
+        except Exception as exc:
+            raise VLLMError(
+                f"live generation failed at {self._chat_url()}: {exc}") from exc
+
     def chat(self, model, prompt, images=None, *, kind="generic",
              cache_key=None, priority=Priority.POINTING, max_tokens=1024):
         """同步调用，返回模型文本输出。"""

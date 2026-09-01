@@ -45,6 +45,10 @@ FINISH is irreversible: the episode ends immediately.
    - new_keyframes (only when present): {{frame_id, caption excerpt}} rows
      for frames collected since your last decision. Frame images are NOT
      attached — call view_frame(frame_id) to see one.
+   - relevant_frames (only when semantic retrieval is available): task-directed
+     top caption matches over all collected keyframes. Treat them as hypotheses,
+     not detections. Before repeatedly exploring with no usable instance, inspect
+     plausible unreviewed rows with view_frame and propose_candidates.
 2. A bird's-eye map image reconstructed from the 3D point cloud. Legend:
    blue AGENT arrow = current pose, purple diamonds fN = frontiers, green
    circles tN = instances, orange ACTIVE star = active target; marker ids
@@ -228,7 +232,7 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   instance twice.
 - FINISH: end the episode (see task modes above).
 
-Cold start: if new_keyframes is absent and there are no instances yet, no
+Cold start: if new_keyframes and relevant_frames are absent and there are no instances yet, no
 observations have been collected, so retrieval tools will return nothing.
 SCAN to look around, or pick a frontier to move to first.
 

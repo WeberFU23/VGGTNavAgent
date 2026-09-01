@@ -54,6 +54,7 @@ class VLMDecisionClient:
         self._trace_context = {}
         self._trace_warned = False
         self._trace_seq = 0
+        self._last_error = None
 
     def set_trace_path(self, path):
         self.trace_path = str(path or "").strip()
@@ -82,6 +83,19 @@ class VLMDecisionClient:
         列表，返回解析后的 JSON dict；API 不可达自动回退 None（调用方
         走确定性规则），并打 warning。复用同一 HTTP/JSON 解析通路。"""
         return self.chat_json(user_prompt, images, trace_kind="decision")
+
+    def probe(self):
+        """Perform a real minimal generation so quota/auth failures fail fast."""
+        if not self.enabled:
+            return False
+        payload = self._build_payload(
+            'Return exactly {"ok": true}.', [], self.JSON_SYSTEM, True)
+        payload["max_tokens"] = 16
+        response = self._send(payload)
+        parsed = self._extract_json(response)
+        self._trace("healthcheck", "minimal live generation", [], response,
+                    parsed)
+        return isinstance(parsed, dict) and parsed.get("ok") is True
 
     def chat_json(self, user_prompt, images=None, trace_kind="json"):
         """Focused structured visual call outside the decision tool loop.
@@ -144,6 +158,8 @@ class VLMDecisionClient:
                     "ok": response is not None and parsed is not None,
                     "context": dict(self._trace_context),
                 }
+                if self._last_error:
+                    record["error"] = self._last_error
                 if self.trace_path:
                     os.makedirs(
                         os.path.dirname(self.trace_path) or ".", exist_ok=True)
@@ -276,8 +292,11 @@ class VLMDecisionClient:
                 self._chat_url(), headers=headers, json=payload,
                 timeout=self.timeout)
             response.raise_for_status()
-            return response.json()
+            value = response.json()
+            self._last_error = None
+            return value
         except Exception as exc:
+            self._last_error = str(exc)
             if not self._warned:
                 print(f"[VLMDecision] API 不可用，回退确定性决策: {exc}")
                 self._warned = True

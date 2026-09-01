@@ -236,6 +236,19 @@ class MappingServer:
             print(f"[server] caption 走独立 API: {caption_api_model} @ "
                   f"{caption_api_url} (workers={caption_workers}, "
                   f"thinking={caption_thinking})", flush=True)
+            require_caption_probe = os.environ.get(
+                "NAV_REQUIRE_CAPTION_PREFLIGHT", "1").strip().lower() in {
+                    "1", "true", "yes", "on"}
+            if require_caption_probe:
+                try:
+                    probe = self.vllm_caption.probe_chat(
+                        caption_api_model, timeout=float(os.environ.get(
+                            "NAV_CAPTION_HEALTH_TIMEOUT", "15")))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"CAPTION_BACKEND_UNAVAILABLE: {exc}") from exc
+                print("[server] caption live generation 就绪: "
+                      f"{probe['model']} @ {probe['url']}", flush=True)
         else:
             self.vllm_caption = None
         store_path = os.environ.get(

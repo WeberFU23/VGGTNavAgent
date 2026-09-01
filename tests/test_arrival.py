@@ -60,6 +60,49 @@ def test_arrival_decision_goes_directly_to_vlm_without_grounding():
     assert node in agent.memory.available()
 
 
+def test_immediate_goto_arrival_runs_arrival_decision_and_reports():
+    """A zero-length GOTO path must not be converted into exploration."""
+    agent = _make_agent()
+    node = agent.memory.add([1, 2, 0], "gray fabric sofa")
+    agent.client = _MockClient()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
+    agent._build_decider_input = lambda obs, **kwargs: (
+        {"instances": [], "task": {}}, None)
+    replies = {
+        "world_state_updated": DecisionResult(
+            "GOTO_INSTANCE", str(node.iid)),
+        "arrival": DecisionResult("REPORT_FOUND", str(node.iid)),
+    }
+    agent.decision_loop = SimpleNamespace(
+        decide=lambda event, *args, **kwargs: replies[event])
+
+    def steer(_obs, result):
+        agent.target_instance_id = int(result.target_id)
+        agent.target_point = np.asarray(node.point)
+        agent.mode = "nav"
+        return True
+
+    agent._apply_decider_steering = steer
+    agent._nav_action = lambda obs: (None, True, False)
+    _result, action = agent._decider_next(
+        _obs(), "world_state_updated")
+    assert action == int(Action.TARGET_FOUND)
+    assert agent._reported_count == 1
+    assert node.reported is True
+
+
+def test_failed_instance_plan_clears_stale_active_target():
+    agent = _make_agent()
+    node = agent.memory.add([3, 4, 0], "gray fabric sofa")
+    agent._plan_to_target = lambda obs: False
+    ok = agent._apply_decider_steering(
+        _obs(), DecisionResult("GOTO_INSTANCE", str(node.iid)))
+    assert ok is False
+    assert agent.mode == "explore"
+    assert agent.target_instance_id is None
+    assert agent.target_point is None
+
+
 def test_adjustment_executes_one_vlm_motion_per_observation_then_resumes():
     agent = _make_agent()
     node = agent.memory.add([1, 2, 0], "possibly a gray sofa")

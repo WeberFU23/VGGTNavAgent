@@ -61,8 +61,9 @@ proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 
 
 1. **caption**：每个关键帧由 API VLM（`NAV_CAPTION_API_MODEL`，当前为
    qwen3.7-plus + `enable_thinking=false`，`NAV_CAPTION_WORKERS=4` 并发）
-   生成查询无关描述——首行 `Objects:` 列类别（每类一次），随后逐实例一句
-   自然语言内在属性描述（不含位置/空间关系，跳过 wall/floor/ceiling，
+   生成查询无关描述——首行 `Scene context:` 单独记录可能的房间类型与固定
+   设施，次行 `Objects:` 列类别（每类一次），随后逐实例一句自然语言内在
+   属性描述（实例描述不含位置/空间关系，跳过 wall/floor/ceiling，
    window/curtain 保留），BGE-M3 建立文本检索索引；
 2. **search_frames(query, top_k)**：BGE 检索相关关键帧，返回
    `[{frame_id, score, caption}]`；
@@ -166,7 +167,9 @@ instance，不能用另一个近邻实例或空 ID 代替。
   上限 500 字符，经 set_notes 维护）、`recent_actions`（最近 3 个高层
   动作及 ok/collision/arrived 结果，更早的经 get_action_history 分页查询）、
   `new_keyframes`（仅当存在：自上次决策以来收集的 `{frame_id, caption
-  摘要}`，图像不自动附）、实例表的有界摘要（top-K，文本截断，其余折叠为
+  摘要}`，图像不自动附）、`relevant_frames`（每次决策按完整目标短语自动
+  检索的 top-K caption 帧，默认 `NAV_RELEVANT_FRAME_TOP_K=5`；只是假设，仍须
+  view/propose/三值审核）、实例表的有界摘要（top-K，文本截断，其余折叠为
   `instances_omitted_ids`，仍是合法导航目标；实例摘要携带
   `observation_count`。已报告实例通过 `reported_instances` 保留 canonical ID、
   文本、观测数和 claim ID，并同时提供 `report_claims` 账本）；
@@ -217,6 +220,11 @@ harness 重新生成 world-state 并随工具结果下发。
 
 semantic mapping server 启动时必须调用 `/v1/models` 探测 pointing endpoint，
 并确认 `NAV_POINTING_MODEL_PATH` 对应模型已加载；探测失败直接终止启动。
+独立 caption API 还必须执行一次最小真实生成（默认开启，
+`NAV_REQUIRE_CAPTION_PREFLIGHT=1`），因为 `/models` 无法发现欠费、鉴权和生成
+配额错误；失败以 `CAPTION_BACKEND_UNAVAILABLE` 终止。Decision VLM 同样在
+创建决策循环前执行最小 JSON 生成（`NAV_REQUIRE_DECISION_PREFLIGHT=1`），失败
+以 `DECISION_BACKEND_UNAVAILABLE` 终止，避免整个 episode 在盲目回退中耗尽。
 运行中 endpoint 失效时，`use_molmo_point`/`propose_candidates` 返回稳定错误码
 `POINTING_BACKEND_UNAVAILABLE`，不得降级成空 points/results。该错误只表示
 基础设施不可用，不构成“图中没有目标”的语义证据。
@@ -306,7 +314,10 @@ verify_instance 至少要有新视图、clear_path 至少成功前进一次、in
 至少产生一个 mapping keyframe；否则 harness 继续一个有界的观察动作。
 
 到达实例后由决策 VLM 直接查看当前 RGB 和候选证据，决定报告、离开、
-换目标或 START_ADJUST；到达本身不强制微调。
+换目标或 START_ADJUST；到达本身不强制微调。`act()` 常规跟随和 VLM 刚下发
+`GOTO_INSTANCE` 后的即时跟随共用同一个 arrival transition，因此零长度路径/
+已在阈值内也会当轮审核，不会被误转成探索。实例路径规划失败时立即清除
+active target，避免物理控制在探索而 world-state 长期保留旧目标。
 
 ## 9. 诊断与可复盘输出
 
@@ -332,9 +343,11 @@ verify_instance 至少要有新视图、clear_path 至少成功前进一次、in
 
 ## 10. 确定性降级
 
-决策 VLM 不可用或连续输出非法结构时才回退：优先最近的未报告实例，否则
-最高 utility 的可达 frontier，再否则基础探索。frontier utility 由加权
-几何/语义信息增益、路径代价和执行失败次数构成，不含目标类别 belief。
+启动后的单次非法结构仍可确定性回退：优先最近的未报告实例，否则最高
+utility 的可达 frontier，再否则基础探索。已配置的 Decision/Caption 后端若
+连最小生成预检都失败则启动即中止，不允许把鉴权、欠费或服务故障伪装成
+长期确定性降级。frontier utility 由加权几何/语义信息增益、路径代价和执行
+失败次数构成，不含目标类别 belief。
 
 ## 11. 当前边界
 
@@ -346,7 +359,8 @@ verify_instance 至少要有新视图、clear_path 至少成功前进一次、in
 - 决策 VLM（API 模型）自己读图给像素坐标的能力受 API 侧图像缩放影响，
   0-1000 归一化约定可吸收 resize，但精度未经系统验证；
 - 跨视角实例关联依赖标注照片的专用 VLM 判定；遮挡、视角差过大或证据图
-  过期时按 `UNCERTAIN→NEW` 保守处理，可能保留重复实例但不会冒险误合并；
+  过期时按 `UNCERTAIN→proposal` 保守处理，既不误合并，也不创建可导航、
+  可报告的假实例，等待后续视角消歧；
 - `REPORT_FOUND` 依赖 VLM 在目标旁的直接观察，主要风险是图像语义正确
   但报告位置未满足 benchmark 近距离阈值；
 - 完整效果需要在真实模型、VGGT-SLAM 服务和 benchmark episode 上做闭环

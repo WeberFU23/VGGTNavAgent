@@ -13,7 +13,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mapping.caption_store import (BGEM3Embedder, CaptionStore, CaptionWorker)
+from mapping.caption_store import (CAPTION_PROMPT, BGEM3Embedder, CaptionStore,
+                                   CaptionWorker)
 
 
 def _vec(seed, dim=8):
@@ -36,6 +37,12 @@ class _MockGateway:
              max_tokens):
         self.calls.append((model, kind, cache_key, priority))
         return self.reply
+
+
+def test_caption_prompt_keeps_scene_context_separate_from_object_identity():
+    assert 'First line: "Scene context:"' in CAPTION_PROMPT
+    assert 'Second line: "Objects:"' in CAPTION_PROMPT
+    assert "intrinsic appearance" in CAPTION_PROMPT
 
 
 # ----------------------------------------------------------------------

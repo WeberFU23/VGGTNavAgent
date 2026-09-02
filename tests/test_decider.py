@@ -56,8 +56,9 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
         "arrival", _state())
     flat = " ".join(prompt.split())
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
+                 "propose_candidates(frame_id, query)",
+                 "som_pick(frame_id, mask_ids, query)",
                  "instantiate_points(frame_id, pixels_1000, label)",
-                 "use_molmo_point(frame_id, query)",
                  "review_crosshair(frame_id, pixel_1000, verdict, reason)",
                  "search_instances(",
                  "get_instance(instance_id)",
@@ -81,8 +82,8 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     # 工具调用 JSON 格式必须写进 prompt（VLM 才能正确发起调用）
     assert '"tool_call":' in prompt
     assert '"name": "<tool_name>"' in prompt
-    # 报告亲见约束 + takeover 禁工具
-    assert "never from captions, memory text, or tool-returned" in flat
+    # 报告按距离判定（走到目标附近即可，不要求目标在视野内）+ takeover 禁工具
+    assert "Success is judged by DISTANCE, not by vision" in flat
     assert "tools are disabled" in flat
     # 写工具后状态刷新说明
     assert "the refreshed world state is" in flat
@@ -789,7 +790,8 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
     assert {"id", "path_cost_m", "branch_id", "geometry_gain",
             "semantic_gain", "failure_count", "recently_attempted",
             "novelty"} <= set(state["frontiers"][0])
-    assert "dist_m" not in row
+    # dist_m（agent 当前位置到实例的直线距离）进表，供距离判定上报
+    assert row["dist_m"] is not None and row["dist_m"] > 0
 
 
 def test_world_state_uses_explicit_map_snapshot_pose():
@@ -802,7 +804,7 @@ def test_world_state_uses_explicit_map_snapshot_pose():
                           goal_text="Find all baskets")
     state = build_world_state(agent, obs, start_xy=(0.0, 0.0))
     assert state["instances"][0]["id"] == 1
-    assert "dist_m" not in state["instances"][0]
+    assert state["instances"][0]["dist_m"] == 5.0  # (3,4) 距起点 5m
 
 
 def _build_state(agent, step=50):
@@ -964,23 +966,17 @@ def _ingest_hit():
 
 
 def test_ingest_generates_instance_level_text():
+    """实例化不再调专用 VLM 改写描述：实例文本直接取 caption/label。"""
     agent = _make_agent()
-    agent.vlm = _FakeResolverVLM({
-        "decision": "NEW", "instance_id": None,
-        "description": "a red ceramic cup beside the sink",
-        "reason": "first observation",
-    })
+    agent.vlm = _FakeResolverVLM(None)
     agent.client = SimpleNamespace(
         get_candidate_evidence=lambda cid: ({"found": True}, b"overlay-jpeg"),
         get_frame_image=lambda fid: ({"found": True}, _jpeg_bytes()))
     obs = SimpleNamespace(step_count=50)
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
     node = agent.memory.nodes[0]
-    assert node.text == "a red ceramic cup beside the sink"
-    prompt, images = agent.vlm.calls[0]
-    assert "basket" in prompt          # 任务上下文进入描述 prompt
-    assert "kitchen counter" in prompt  # 关键帧 caption 作为上下文
-    assert [name for name, _ in images] == ["new_observation"]
+    assert node.text == "a kitchen counter with several objects on it"
+    assert agent.vlm.calls == []  # 实例化路径不调 VLM
 
 
 def test_ingest_keeps_caption_text_when_vlm_unavailable():
@@ -1013,98 +1009,70 @@ def test_ingest_does_not_redescribe_existing_instance():
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
     assert len(agent.memory.nodes) == 1      # 同 candidate_id 只更新
-    assert len(agent.vlm.calls) == 1         # 已有实例不重复生成
+    assert len(agent.vlm.calls) == 0         # 实例化路径不调 VLM
 
 
-def test_ingest_visual_relation_attaches_cross_frame_observation():
+def test_ingest_duplicate_review_attaches_cross_frame_observation():
+    """跨帧同一物体：3m 内挂起复核，VLM 裁决 DUPLICATE 后并入既有实例。"""
     agent = _make_agent()
-    replies = [
-        {"decision": "NEW", "instance_id": None,
-         "description": "dark wooden chair", "reason": "first view"},
-        {"decision": "SAME", "instance_id": 1,
-         "description": "dark wooden chair, two views",
-         "reason": "same distinctive slatted back"},
-    ]
-
-    class SequencedVLM(_FakeResolverVLM):
-        def chat_json(self, prompt, images, trace_kind="json"):
-            self.calls.append((prompt, images))
-            return replies.pop(0)
-
-    agent.vlm = SequencedVLM(None)
-    agent.client = SimpleNamespace(
-        get_candidate_evidence=lambda cid:
-            ({"found": True}, f"overlay-{cid}".encode()),
-        get_frame_image=lambda fid: ({"found": False}, b""))
     obs = SimpleNamespace(step_count=50)
     first = _ingest_hit()
     second = dict(first, frame_id=6, candidate_id="c6",
                   point=[1.05, 2.02, 0.0], pixel=[14, 14])
     agent._ingest_semantic_hits(obs, [first], select=False)
     agent._ingest_semantic_hits(obs, [second], select=False)
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.memory.nodes) == 1  # 复核挂起，未新建
+    review = agent._last_dup_reviews[0]
+    assert review["neighbors"][0]["instance_id"] == 1
+    out = agent._tool_resolve_duplicate(
+        review["observation_id"], "DUPLICATE", duplicate_of=1,
+        text="dark wooden chair, two views")
+    assert out["resolved"] == "duplicate"
     node = agent.memory.nodes[0]
     assert len(node.observation_ids) == 2
     assert node.text == "dark wooden chair, two views"
-    assert [name for name, _ in agent.vlm.calls[1][1]] == \
-        ["new_observation", "candidate_instance_1"]
 
 
-def test_ingest_skips_identity_vlm_without_new_marked_photo():
+def test_ingest_suspends_nearby_candidate_without_vlm():
+    """3m 内已有实例：挂起 duplicate_review，不调任何 VLM。"""
     agent = _make_agent()
     agent.memory.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
         candidate_id="c4")
-    agent.vlm = _FakeResolverVLM({
-        "decision": "SAME", "instance_id": 1,
-        "description": "same chair", "reason": "unsupported",
-    })
-    agent.client = SimpleNamespace(
-        get_candidate_evidence=lambda cid: ({"found": False}, b""),
-        get_frame_image=lambda fid: ({"found": False}, b""))
-    second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
-                  point=[1.05, 2.02, 0.0])
-    agent._ingest_semantic_hits(
-        SimpleNamespace(step_count=50), [second], select=False)
-    assert len(agent.memory.nodes) == 2
-    assert agent.vlm.calls == []
-
-
-def test_ingest_keeps_uncertain_cross_view_candidate_as_proposal():
-    agent = _make_agent()
-    agent.memory.add(
-        [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
-        candidate_id="c4")
-    agent.vlm = _FakeResolverVLM({
-        "decision": "SAME", "instance_id": 1,
-        "description": "same chair", "reason": "unsupported",
-    })
-    agent.client = SimpleNamespace(
-        get_candidate_evidence=lambda cid:
-            ({"found": cid == "c6"}, b"new" if cid == "c6" else b""),
-        get_frame_image=lambda fid: ({"found": False}, b""))
+    agent.vlm = _FakeResolverVLM(None)
     second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
                   point=[1.05, 2.02, 0.0])
     agent._ingest_semantic_hits(
         SimpleNamespace(step_count=50), [second], select=False)
     assert len(agent.memory.nodes) == 1
-    assert agent._proposals["c6"]["status"] == "uncertain"
-    assert len(agent.vlm.calls) == 1
+    assert agent._proposals["c6"]["status"] == "duplicate_review"
+    assert agent.vlm.calls == []
 
 
-def test_uncertain_evidence_replay_does_not_create_another_observation():
+def test_ingest_duplicate_review_new_creates_instance():
+    """复核裁决 NEW：挂起的 observation 建成独立实例。"""
     agent = _make_agent()
     agent.memory.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
         candidate_id="c4")
-    agent.vlm = _FakeResolverVLM({
-        "decision": "UNCERTAIN", "instance_id": None,
-        "description": "", "reason": "only one ambiguous view",
-    })
-    agent.client = SimpleNamespace(
-        get_candidate_evidence=lambda cid:
-            ({"found": cid == "c6"}, b"new" if cid == "c6" else b""),
-        get_frame_image=lambda fid: ({"found": False}, b""))
+    second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
+                  point=[1.05, 2.02, 0.0])
+    agent._ingest_semantic_hits(
+        SimpleNamespace(step_count=50), [second], select=False)
+    assert len(agent.memory.nodes) == 1
+    assert agent._proposals["c6"]["status"] == "duplicate_review"
+    oid = agent._last_dup_reviews[0]["observation_id"]
+    out = agent._tool_resolve_duplicate(oid, "NEW")
+    assert out["resolved"] == "new"
+    assert len(agent.memory.nodes) == 2
+
+
+def test_suspended_evidence_replay_does_not_create_another_observation():
+    """同一挂起证据重放：不新建 observation，也不重复挂起复核。"""
+    agent = _make_agent()
+    agent.memory.add(
+        [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
+        candidate_id="c4")
     hit = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
                point=[1.05, 2.02, 0.0])
     obs = SimpleNamespace(step_count=50)
@@ -1112,7 +1080,6 @@ def test_uncertain_evidence_replay_does_not_create_another_observation():
     agent._ingest_semantic_hits(obs, [hit], select=False)
     assert len(agent.memory.nodes) == 1
     assert len(agent.memory.observations) == 2
-    assert len(agent.vlm.calls) == 1
 
 
 def test_wait_for_captions_logs_timeout_and_swallows_errors():
@@ -1208,10 +1175,39 @@ def test_goto_unreachable_instance_rejected_but_report_allowed():
     assert result.action == "REPORT_FOUND"
 
 
+def test_report_found_near_non_active_instance_allowed():
+    # 走到目标附近即可上报：非 active 但 dist_m 在阈值内 → 放行
+    state = _state(instances=[
+        {"id": 1, "text": "basket", "reported": False},
+        {"id": 2, "text": "other basket", "reported": False,
+         "dist_m": 0.4},
+    ])
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "REPORT_FOUND", "target_id": "2"}])).decide(
+        "world_state_updated", state)
+    assert result.action == "REPORT_FOUND" and result.target_id == "2"
+
+
+def test_report_found_far_non_active_instance_rejected():
+    # 远离实例且非 active → 拒绝，重试后换动作
+    state = _state(instances=[
+        {"id": 1, "text": "basket", "reported": False},
+        {"id": 2, "text": "other basket", "reported": False,
+         "dist_m": 5.2},
+    ])
+    result = DecisionLoop(_ScriptedChat([
+        {"action": "REPORT_FOUND", "target_id": "2"},
+        {"action": "GOTO_FRONTIER", "target_id": "f0"},
+    ])).decide("world_state_updated", state)
+    assert result.action == "GOTO_FRONTIER"
+
+
 if __name__ == "__main__":
     test_goto_accepts_any_unreported_instance()
     test_nav_failed_event_allows_frontier_and_has_guidance()
     test_goto_unreachable_instance_rejected_but_report_allowed()
+    test_report_found_near_non_active_instance_allowed()
+    test_report_found_far_non_active_instance_rejected()
     test_prompt_documents_action_effects_tool_returns_and_no_confidence()
     test_search_frames_tool_call_uses_standard_result_envelope()
     test_view_instance_attaches_labeled_instance_evidence_image()

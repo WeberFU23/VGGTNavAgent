@@ -5,8 +5,8 @@
 本系统是一个面向多目标具身导航的 VLM harness，仿照 coding agent 的思路：
 确定性模块充当 VLM 的"感知、记忆与执行工具"，VLM 自己规划探索路径、
 决定何时检索、何时实例化、何时报告。语义链路（caption 检索 → 看图 →
-pointing → 实例化 → 导航 → 报告）的每一步都是 VLM 可独立调用的工具；
-首选候选事务将 pointing、语义审核与 3D 实例化分开，避免把未经核验的像素
+SAM 全分割选目标 → 实例化 → 导航 → 报告）的每一步都是 VLM 可独立调用的工具；
+首选候选事务将分割选择、语义审核与 3D 实例化分开，避免把未经核验的像素
 直接写入导航记忆。
 
 系统不维护 `belief anchor / confirmed / rejected` 等先验语义状态，也不建立
@@ -18,15 +18,18 @@ flowchart LR
     RGB["RGB + instruction"] --> MAP["VGGT-SLAM / 3D map"]
     RGB --> CAP["caption (API VLM) + BGE retrieval"]
     MAP --> P3D["pixel → VGGT 3D point"]
-    POINT["pointing (Molmo / Qwen)"] --> P3D
+    SOM["SAM 全分割 (AMG)"] -- "编号 mask overlay" --> VLM
+    VLM -- "som_pick 选 mask" --> SOMR["SAM mask 精化<br/>质心 + mask 深度采样"]
+    SOMR --> P3D
     CAP --> VLM["decision VLM (API)"]
     MAP --> TOP["RGB point-cloud bird's-eye map"]
-    MEM["single InstanceMemory"] --> STATE["world-state JSON"]
+    MEM["single InstanceMemory"] --> STATE["world-state JSON<br/>(含 nearby 3m 预筛)"]
     STATE --> VLM
     TOP --> VLM
     VLM -- "tools: search/view/propose/commit..." --> MEM
-    VLM -- "tools: use_molmo_point / propose_candidates" --> P3D
-    VLM --> HIGH["high-level action / START_ADJUST"]
+    VLM -- "tools: propose_candidates (SAM 全分割) / som_pick" --> SOM
+    VLM -- "REPORT_FOUND" --> HIGH["high-level action / TARGET_FOUND / START_ADJUST"]
+    MEM -- "3m 内有已有实例 → duplicate_review<br/>证据图交 VLM 裁决(resolve_duplicate)" --> VLM
     HIGH --> EXEC["A* / follower / collision recovery"]
     EXEC --> RGB
 ```
@@ -38,10 +41,9 @@ flowchart LR
 | SLAM 与语义服务 | `mapping/server.py` | VGGT 子图、caption 检索、pointing、像素到 3D、语义与图像诊断记录 |
 | 关键帧策略 | `mapping/keyframes.py` | 组合光流阈值与最大观测间隔，保证弱纹理直行时仍定期刷新关键帧 |
 | caption 语义记忆 | `mapping/caption_store.py` | 异步 caption worker、BGE-M3 向量索引与检索、落盘持久化 |
-| VLM 网关 | `mapping/vllm_client.py` | OpenAI 兼容客户端：优先级队列、同帧缓存、重试；caption 与 pointing 各持一个实例 |
-| 语义模型接口 | `mapping/pointing.py` | 双后端 pointing（qwen JSON / molmo XML 标签）、patch 深度采样 |
+| VLM 网关 | `mapping/vllm_client.py` | OpenAI 兼容客户端：优先级队列、同帧缓存、重试；caption 网关 |
+| 语义模型接口 | `mapping/pointing.py` | pointing 双后端（qwen JSON / molmo XML 标签，已停用，仅保留 point_pixels RPC 兼容）、patch 深度采样 |
 | 三层语义记忆 | `agents/memory.py` | 追加式 Observation、Canonical Instance、一次性 ReportClaim |
-| 实体解析器 | `agents/entity_resolver.py` | 几何近邻召回 + 标注照片 VLM 比较，完成跨视角实例关联 |
 | 决策状态 | `agents/decision_state.py` | 将实例、frontier、任务进度和几何代价组织成 JSON |
 | 决策 harness | `decision/agent_loop.py` | 工具循环（默认最多 15 轮）、动作 schema、ID 校验与 trace |
 | 决策提示词 | `decision/prompts.py` | 系统契约、事件说明和 world-state prompt 组装 |
@@ -55,12 +57,13 @@ flowchart LR
 ## 3. 语义感知链路（全部由 VLM 按需驱动）
 
 系统采用候选事务而非自动 ground 入库。首选工具链是
-`propose_candidates → commit_candidates`：Pointing 结果先作为不可导航
-proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 ACCEPT 才
-批量解析为 active instance。扫描和 caption 刷新绝不直接入库。
+`propose_candidates → som_pick → commit_candidates`：SAM 全分割选中的
+mask（质心为像素）先作为不可导航 proposal，Decision VLM 批量给出三值
+审核，只有 ACCEPT 才批量解析为 active instance。扫描和 caption 刷新绝不
+直接入库。
 
 1. **caption**：每个关键帧由 API VLM（`NAV_CAPTION_API_MODEL`，当前为
-   qwen3.7-plus + `enable_thinking=false`，`NAV_CAPTION_WORKERS=4` 并发）
+   qwen3.8-flash + `enable_thinking=false`，`NAV_CAPTION_WORKERS=4` 并发）
    生成查询无关描述——首行 `Scene context:` 单独记录可能的房间类型与固定
    设施，次行 `Objects:` 列类别（每类一次），随后逐实例一句自然语言内在
    属性描述（实例描述不含位置/空间关系，跳过 wall/floor/ceiling，
@@ -69,30 +72,38 @@ proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 
    `[{frame_id, score, caption}]`；
 3. **view_frame(frame_id)**：把关键帧原始 RGB 附到 VLM 下一轮输入，
    VLM 亲眼核实；
-4. **use_molmo_point(frame_id, query)**：调用 pointing 模型只返回像素坐标，
-   不注册任何实例。backends：
-   - `molmo`（当前默认，`NAV_POINTING_BACKEND=molmo`）：Molmo-7B-D-0924
-     经本地 vLLM 服务，输出 `<point>/<points>` XML 标签，0-100 归一化
-     坐标，无 bbox/confidence；
-   - `qwen`：JSON 输出绝对像素坐标 + 可选 bbox 交叉验证。
-   返回给决策 VLM 的坐标统一为 0-1000 归一化（x 向右、y 向下）；
-5. **review_crosshair(frame_id, pixel_1000, verdict, reason)**：旧的单点兼容
-   接口；新代码优先使用批量 `commit_candidates`。Decision VLM
-   对已展示的十字证据图给出 `ACCEPT / REJECT / UNCERTAIN`。只有 `ACCEPT`
-   允许实例化；后两者记录为 `semantic_rejections`，绝不入实例记忆；
-6. **instantiate_points(frame_id, pixels_1000, label)**：把 0-1000 归一化像素
-   坐标变成可导航 3D 实例。`pixels_1000` 可来自 `use_molmo_point`，也可以是
-   VLM 看过帧图像后自己给出的坐标。先生成标记证据面板，再由
-   `review_crosshair` 的显式 `ACCEPT` 作为 2D 语义硬门；随后才进行 VGGT
-   confidence 过滤、patch 深度采样和 3D 坐标恢复。深度无效的候选进入
-   `geometry_rejections`；通过两阶段后才形成 Observation，再由 Entity Resolver
-   关联到 Canonical Instance；
-7. 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等；
-   非重放 Observation 先在 1.2m 内召回最多 3 个 Canonical Instance，再把
-   新照片及候选实例的标注照片交给专用 VLM 判断 `SAME / NEW / UNCERTAIN`。
-   只有 `SAME` 会关联已有实例；跨视角 `UNCERTAIN` 保留为 proposal，等待
-   新证据，不直接新建可导航实例。该 VLM 调用同时更新实例描述，不额外占用
-   决策 VLM 的 15 轮工具预算。
+4. **propose_candidates(frame_id, query)**：对整帧做 SAM automatic mask
+    generation（`som_segment` RPC），返回编号 mask 表（0-1000 归一化
+    centroid/bbox/area_frac）+ 编号 overlay 图，不注册任何实例。已在
+    `_rejected_spots` 中的质心会被硬过滤（全被滤时返回 `all_spots_rejected`，
+    提示 VLM 走近再试）。要求 VLM 在**近处、当前帧**调用——远距小目标
+    面积占比低于 0.2% 门槛不会被分割出来；
+5. **som_pick(frame_id, mask_ids, query)**：把选中 mask 注册为不可导航
+   proposal（质心为候选像素、mask 参与深度采样），随后走批量
+   `commit_candidates` 三值审核。只有 `ACCEPT` 允许实例化；后两者记录为
+   `semantic_rejections`，绝不入实例记忆；
+6. **commit_candidates(reviews, label)**：对已审核子集批量给出
+   `ACCEPT/REJECT/UNCERTAIN`，只解析 ACCEPT 写入 active instance（3m 内有
+   邻居的挂起 `duplicate_review`）；
+7. **instantiate_points(frame_id, pixels_1000, label)**（兜底）：把 0-1000
+   归一化像素坐标变成可导航 3D 实例。`pixels_1000` 只应来自 VLM 看过帧
+   图像后自己给出的坐标（主链路已不用 pointing 模型）。先生成标记证据
+   面板，再由显式 `ACCEPT` 作为 2D 语义硬门；随后才进行 VGGT confidence
+   过滤、patch 深度采样和 3D 坐标恢复。深度无效的候选进入
+   `geometry_rejections`；通过两阶段后形成 Observation 并尝试实例化；
+8. **review_crosshair(frame_id, pixel_1000, verdict, reason)**：旧的单点
+   兼容接口（同 5 的三值审核语义），新代码优先使用批量
+   `commit_candidates`；
+7. **实例化去重（实例化时，非报告时）**：同帧重复实例化先按
+   `candidate_id`、像素距离或 bbox IoU 确定性幂等。新 Observation 的 3D
+   点在 `NAV_INSTANCE_DUPLICATE_RADIUS_M`（默认 3m）内没有已有实例才直接
+   新建；有邻居则挂起为 `duplicate_review`（不建实例、不可导航），
+   `commit_candidates`/`instantiate_points` 返回该 observation 与邻居的
+   id/距离并附证据图（`dup_new_obs<N>` / `dup_existing_<id>`）。决策 VLM
+   用 `resolve_duplicate(observation_id, decision, duplicate_of, text)`
+   裁决：`DUPLICATE` 把观测并入既有实例（`attach_observation`，证据与
+   描述更新），`NEW` 才新建独立实例。world state 实例行的 `nearby` 字段
+   提前暴露 3m 内的空间冲突。
 
 ### SAM mask 精化与 SoM 全分割
 
@@ -106,14 +117,17 @@ proposal 返回十字证据图，Decision VLM 批量给出三值审核，只有 
   中位数（`sample_point_depth(mask_hw=...)`），不再受 patch 边缘背景
   污染。候选注册的 mask 也随之从合成圆盘升级为真实实例 mask，
   `resolve_candidate` 重采样时复用。
-- **SoM 全分割（升级路径）**：`som_segment(frame_id)` 用 SAM automatic
-  mask generator 输出整帧物体级 mask（过滤面积 <0.2% 的碎片与 >55% 的
-  背景区域），渲染编号 overlay 返回给决策 VLM；VLM 用
-  `som_pick(frame_id, mask_ids, query)` 把选中 mask 注册为 proposal
-  （质心为候选像素），后续走与 `propose_candidates` 完全相同的证据
+- **SoM 全分割（v8 起为主链路）**：`propose_candidates` 对整帧调用
+  SAM automatic mask generator（`points_per_side=32`、
+  `pred_iou_thresh=0.86`、`stability_score_thresh=0.92`、
+  `min_mask_region_area=100`），过滤面积 <0.2%（≈614px @640×480）的
+  碎片与 >55% 的背景区域，上限 `max_masks=24`；渲染编号 overlay 返回
+  给决策 VLM，VLM 用 `som_pick(frame_id, mask_ids, query)` 把选中 mask
+  注册为 proposal（质心为候选像素、mask 参与深度采样），后续走证据
   面板 + `commit_candidates` 流程。mask 在服务端按帧缓存（LRU 8 帧）。
-  用途：pointing 模型反复把点落在背景/错误物体上（review 连续 REJECT）
-  时，由决策 VLM 自行把"生成坐标"降级为"选择题"。
+  由此把"生成坐标"降级为"选择题"：决策 VLM 不再依赖 pointing 模型的
+  点指精度，只在近处帧上做 mask 选择。代价是**必须走近目标再 propose**
+  ——远距小目标过不了 AMG 的面积/网格门槛。
 
 建图不把每个观测都作为关键帧。默认在相对上一关键帧的平均光流超过 40
 像素时取帧；即使光流不足，也最多间隔 3 个观测强制刷新。每个子图包含
@@ -220,16 +234,15 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 |---|---|
 | `search_frames(query, top_k=5)` | `[{frame_id, score, caption}]`，只读 |
 | `view_frame(frame_id)` | 下一轮附加该关键帧原始 RGB，只读 |
-| `propose_candidates(frame_id, query)` | Pointing + 批量十字证据图，创建不可导航 proposal，只读 |
-| `commit_candidates(reviews, label)` | 对已审核子集批量给出 `ACCEPT/REJECT/UNCERTAIN`；只解析 ACCEPT 并写入 active instance，未提交 proposal 保持 pending，写 |
-| `use_molmo_point(frame_id, query)` | `{points: [{pixel: [x, y]}]}`，0-1000 归一化坐标，只读、不注册 |
-| `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录 `ACCEPT` / `REJECT` / `UNCERTAIN`；只有 `ACCEPT` 允许实例化，写 |
-| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 深度/几何验证 → Observation → canonical instance；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
-| `som_segment(frame_id)` | SAM 全分割编号 overlay + mask 元数据列表（0-1000 归一化 centroid/bbox/area_frac），只读 |
+| `propose_candidates(frame_id, query)` | SAM 全分割整帧（`som_segment` RPC）→ 编号 mask 表 + overlay 图，创建候选池（质心在 `_rejected_spots` 的硬过滤掉），只读 |
 | `som_pick(frame_id, mask_ids, query)` | 选中 mask 注册为 proposal（质心为像素、mask 用于深度采样），随后走 commit 流程，写 |
+| `commit_candidates(reviews, label)` | 对已审核子集批量给出 `ACCEPT/REJECT/UNCERTAIN`；只解析 ACCEPT 并写入 active instance（3m 内有邻居的挂起 duplicate_review），写 |
+| `resolve_duplicate(observation_id, decision, duplicate_of, text)` | 去重复核裁决：DUPLICATE 并入既有实例 / NEW 新建，写 |
+| `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录 `ACCEPT` / `REJECT` / `UNCERTAIN`；只有 `ACCEPT` 允许实例化（新代码优先走批量 commit），写 |
+| `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 深度/几何验证 → Observation → canonical instance（兜底路径，无 mask 深度采样）；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
 | `get_instance(instance_id)` | 完整实例记录（无图像），只读 |
-| `view_instance(instance_id)` | 下一轮附加该实例证据图（pointing overlay 优先），只读 |
+| `view_instance(instance_id)` | 下一轮附加该实例证据图（evidence overlay 优先），只读 |
 | `update_instance(instance_id, text)` | 只覆盖 text，写 |
 | `get_agent_status()` | 建图/caption/实例/预算快照，只读 |
 | `set_notes(text)` | 覆盖 notes 工作记忆（≤500 字符），写 |
@@ -241,16 +254,18 @@ final-action-only prompt；后续 `tool_call` 不执行也不进入 action 校�
 伪造或直接改写 3D 坐标、路径代价和 `reported` 状态。写工具成功执行后，
 harness 重新生成 world-state 并随工具结果下发。
 
-semantic mapping server 启动时必须调用 `/v1/models` 探测 pointing endpoint，
-并确认 `NAV_POINTING_MODEL_PATH` 对应模型已加载；探测失败直接终止启动。
+semantic mapping server 启动时对 pointing endpoint 做一次 `/v1/models`
+探测（`NAV_POINTING_HEALTH_TIMEOUT`，默认 10s）；失败只打
+`WARNING: pointing grounder 未就绪` 不再终止启动——v8 起主链路不依赖
+pointing（`point_pixels` 调用时返回 `POINTING_BACKEND_UNAVAILABLE`）。
 独立 caption API 还必须执行一次最小真实生成（默认开启，
 `NAV_REQUIRE_CAPTION_PREFLIGHT=1`），因为 `/models` 无法发现欠费、鉴权和生成
 配额错误；失败以 `CAPTION_BACKEND_UNAVAILABLE` 终止。Decision VLM 同样在
 创建决策循环前执行最小 JSON 生成（`NAV_REQUIRE_DECISION_PREFLIGHT=1`），失败
 以 `DECISION_BACKEND_UNAVAILABLE` 终止，避免整个 episode 在盲目回退中耗尽。
-运行中 endpoint 失效时，`use_molmo_point`/`propose_candidates` 返回稳定错误码
-`POINTING_BACKEND_UNAVAILABLE`，不得降级成空 points/results。该错误只表示
-基础设施不可用，不构成“图中没有目标”的语义证据。
+SAM 不可用时 `propose_candidates` 返回稳定错误码 `SAM_UNAVAILABLE`，不得
+降级成空 mask 表。该错误只表示基础设施不可用，不构成”图中没有目标”的
+语义证据。
 
 ## 7. VLM 最终输出
 
@@ -278,11 +293,12 @@ VLM 必须输出一个 JSON 对象：
 
 - `GOTO_INSTANCE`：到达目标的方式就是"先实例化再导航"——对只存在于
   图像中的目标盲目走 frontier 是无效的；
-- `REPORT_FOUND`：报告**当前就站在旁边**的 active canonical instance，并
-  创建一次性 ReportClaim。记忆实例只是未核实的
-  假设；只允许基于到达时的 RGB 或 takeover 亲眼观察报告，禁止仅凭
-  caption、记忆文本或工具返回的图片远程报告。many/all 模式不得重复
-  报告同一物理实例；
+- `REPORT_FOUND`：报告**已走到附近**的 active canonical instance，并创建
+  一次性 ReportClaim。harness 校验目标必须是 active canonical instance，
+  或 agent 距其实例点 `dist_m ≤ NAV_REPORT_NEAR_DIST_M`（默认 1.0m）——
+  成功判定是**距离**而非目标在不在视野里（贴太近时目标可能反而出画）。
+  记忆实例只是未核实的假设，禁止仅凭 caption、记忆文本或工具返回的图片
+  远程报告。many/all 模式不得重复报告同一物理实例；
 - `SCAN`：原地 360° 环视（12 次左转、四个采样视角），只能看到当前位置
   可见的东西，无法看到物体另一面，不能用于核实候选；
 - `START_ADJUST`：有界微调/主动观察，每轮一个原子动作，执行后收到新
@@ -352,9 +368,8 @@ active target，避免物理控制在探索而 world-state 长期保留旧目标
 |---|---|
 | `action_trace.jsonl` | 每步实际 Habitat 动作、agent mode、当前目标、碰撞状态 |
 | `decision_trace.jsonl` | 事件、校验后高层动作、理由、工具调用与校验结果 |
-| `vlm_calls.jsonl` | 决策/实体解析 VLM 的 prompt、图像标签与哈希、原始响应；`NAV_VLM_TRACE_INLINE_IMAGES=1` 时内联图像 |
-| `entity_resolution.jsonl` | 每条 Observation 的几何候选、距离、视觉判定和最终 canonical ID |
-| `vlm_caption.jsonl` / `vlm_pointing.jsonl` | mapping 端 caption/pointing VLM 按角色拆分的完整调用记录 |
+| `vlm_calls.jsonl` | 决策 VLM 的 prompt、图像标签与哈希、原始响应；`NAV_VLM_TRACE_INLINE_IMAGES=1` 时内联图像 |
+| `vlm_caption.jsonl` / `vlm_pointing.jsonl` | mapping 端 caption/pointing VLM 按角色拆分的完整调用记录（pointing 已停用，仅保留 RPC 兼容时记录） |
 | `<episode>_frames/` | mapping server 收到的全部 RGB |
 | `<episode>_frame_captions.jsonl` | 每帧的 `frame_saved` 与关键帧 `caption_result` |
 | `<episode>_queries.jsonl` | caption 检索、ground_object 与 3D 候选诊断摘要 |
@@ -374,18 +389,20 @@ utility 的可达 frontier，再否则基础探索。已配置的 Decision/Capti
 
 ## 11. 当前边界
 
-- pointing 精度是感知链路的主要瓶颈。本地 7B Qwen2.5-VL 对远距小目标
-  系统性失准（指到前景大物体），已切换 Molmo-7B-D-0924 后端，实测对
-  远距小目标召回显著更好，但有一定误报率（误指实例靠标注文本让决策
-  VLM 自行排除）。Molmo 为 bf16，需 ~17GB 显存，与 VGGT-SLAM 在 24GB
-  显卡上无法共存，需 40GB+ 显卡或分卡部署；
-- 决策 VLM（API 模型）自己读图给像素坐标的能力受 API 侧图像缩放影响，
-  0-1000 归一化约定可吸收 resize，但精度未经系统验证；
+- v8 起感知主链路为"走近 → SAM 全分割 → som_pick 选 mask"，pointing
+  模型（Molmo/Qwen）已整体移出 agent 工具链（RPC 保留兼容）。代价是
+  SAM AMG 有两道硬门槛：面积 <0.2% 的 mask 被过滤（远距小目标分割不出）、
+  `points_per_side=32` 的网格采样对极小目标覆盖不足，因此**必须走近目标
+  再 propose**，VLM 若在远帧 propose 会拿到空表或错过目标；
+- `search_frames` 的 caption 检索在部分场景只召回个别帧（实测 8 次检索
+  仅返回同一 2 帧），会锁死旧帧导致 propose 无法推进——必要时需扩大
+  top_k 或加"新帧强制入表"机制；
 - 跨视角实例关联依赖标注照片的专用 VLM 判定；遮挡、视角差过大或证据图
   过期时按 `UNCERTAIN→proposal` 保守处理，既不误合并，也不创建可导航、
   可报告的假实例，等待后续视角消歧；
-- `REPORT_FOUND` 依赖 VLM 在目标旁的直接观察，主要风险是图像语义正确
-  但报告位置未满足 benchmark 近距离阈值；
+- `REPORT_FOUND` 已改为纯距离判定（`dist_m ≤ NAV_REPORT_NEAR_DIST_M`，
+  默认 1.0m），评估器 TP 也按测地线距离到 view point 计分（0.25m），
+  与视野无关；主要风险是实例 3D 点漂移导致"走到附近"判定失败；
 - 完整效果需要在真实模型、VGGT-SLAM 服务和 benchmark episode 上做闭环
   评测。
 

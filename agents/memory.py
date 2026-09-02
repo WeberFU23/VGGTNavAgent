@@ -272,7 +272,7 @@ class InstanceMemory:
                  candidate_id=None, pixel=None, bbox=None):
         """Compatibility entry point with observation-level idempotency only.
 
-        Production ingestion uses EntityResolver for cross-frame identity.
+        Production ingestion: 3m 邻域预筛 + 决策 VLM resolve_duplicate 复核。
         """
         rows = list(evidence or [])
         first = dict(rows[0]) if rows else {}

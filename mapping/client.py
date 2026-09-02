@@ -133,6 +133,14 @@ class MappingClient:
         poses = np.asarray(resp["poses"], dtype=np.float32).reshape(-1, 4, 4)
         return poses, list(resp["frame_ids"])
 
+    def get_frame_pose(self, frame_id):
+        """按 frame_id 返回该关键帧的 cam2world 4x4 位姿；未知帧返回 None。"""
+        resp, _ = self._request({"cmd": "get_frame_pose",
+                                 "frame_id": int(frame_id)})
+        if not resp.get("found"):
+            return None
+        return np.asarray(resp["pose"], dtype=np.float32).reshape(4, 4)
+
     def get_map_points(self, max_points=200000):
         """返回 (points (N,3) float32, colors (N,3) uint8)。"""
         resp, payload = self._request({"cmd": "get_map", "max_points": max_points})

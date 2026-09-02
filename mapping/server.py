@@ -297,10 +297,15 @@ class MappingServer:
                   "NAV_CAPTION_MODEL_PATH）", flush=True)
         self.pointer = PointingGrounder(
             self.vllm, model=os.environ.get("NAV_POINTING_MODEL_PATH", ""))
-        health = self.pointer.check_health(timeout=float(os.environ.get(
-            "NAV_POINTING_HEALTH_TIMEOUT", "10")))
-        print("[server] pointing grounder 就绪: "
-              f"{health['url']} model={self.pointer.model}", flush=True)
+        try:
+            health = self.pointer.check_health(timeout=float(os.environ.get(
+                "NAV_POINTING_HEALTH_TIMEOUT", "10")))
+            print("[server] pointing grounder 就绪: "
+                  f"{health['url']} model={self.pointer.model}", flush=True)
+        except Exception as exc:  # pointing 后端缺失不应阻止启动（som 主链路不依赖它）
+            print(f"[server] WARNING: pointing grounder 未就绪（{exc}），"
+                  "point_pixels 将返回 POINTING_BACKEND_UNAVAILABLE",
+                  flush=True)
 
     # ------------------------------------------------------------------
     # 帧输入与子图处理
@@ -614,6 +619,22 @@ class MappingServer:
             "frame_id": frame_ids[-1],
             "pose": poses[-1].tolist(),
         }
+
+    def get_frame_pose(self, frame_id):
+        """按 frame_id 返回优化后世界位姿；找不到返回 found=False。
+
+        供 agent 把"geometry 解析失败"的候选重看目标导航到该帧拍摄位置。
+        """
+        with self.data_lock:
+            frame_ids, poses = self._collect_poses()
+        if poses is None:
+            return {"found": False}
+        pose_by_fid = {int(fid): pose for fid, pose in zip(frame_ids, poses)}
+        pose = pose_by_fid.get(int(frame_id))
+        if pose is None:
+            return {"found": False, "frame_id": int(frame_id)}
+        return {"found": True, "frame_id": int(frame_id),
+                "pose": np.asarray(pose).tolist()}
 
     def get_map_points(self, max_points):
         with self.data_lock:
@@ -1571,6 +1592,9 @@ class MappingServer:
             return {"ok": True, **self.get_latest_pose()}, b""
         if cmd == "get_all_poses":
             return {"ok": True, **self.get_all_poses()}, b""
+        if cmd == "get_frame_pose":
+            return {"ok": True, **self.get_frame_pose(
+                header.get("frame_id"))}, b""
         if cmd == "get_map":
             resp, points_payload = self.get_map_points(
                 int(header.get("max_points", 200000)))

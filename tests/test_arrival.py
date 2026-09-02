@@ -334,6 +334,12 @@ def test_same_candidate_updates_but_different_candidates_do_not_auto_merge():
     agent._ingest_semantic_hits(_obs(), [
         _hit([3, 4, 0], candidate_id="c1"),
         _hit([3.1, 4, 0], frame_id=2, candidate_id="c2")])
+    # 新机制：第二个候选在 3m 内，挂起 duplicate_review 由 VLM 裁决，
+    # 不自动合并也不自动新建
+    assert len(agent.memory.nodes) == 1
+    assert len(agent._last_dup_reviews) == 1
+    agent._tool_resolve_duplicate(
+        agent._last_dup_reviews[0]["observation_id"], "NEW")
     assert len(agent.memory.nodes) == 2
     agent._ingest_semantic_hits(_obs(step=101), [
         _hit([3.2, 4, 0], frame_id=3, candidate_id="c1")])

@@ -1,9 +1,9 @@
 """多目标导航 agent：语义记忆 -> 实例定位 -> 栅格规划 -> 路径跟随。
 
 流程（多目标状态机）：
-1. EXPLORE：持续建图；决策 VLM 自主调用 use_molmo_point、
-   review_crosshair、instantiate_points 检索并定位目标。十字图必须经 VLM
-   显式给出 ACCEPT 才能进入 3D 几何验证并写入实例记忆。
+1. EXPLORE：持续建图；决策 VLM 自主调用 propose_candidates（SAM 全分割）
+   挑选编号 mask → som_pick 注册候选 → commit_candidates 裁决，经 3D
+   几何验证后写入实例记忆。
 2. 拿到目标点后用点云构建 2D 占据栅格（agents/navigator.py），A* 规划，
    进入 NAV 模式沿路径输出离散动作。位姿锚定最新关键帧 + 航位推算，
    定期重建栅格并重规划（地图随探索增长，回环也会改写历史位姿）。
@@ -31,35 +31,8 @@ from agents import planner
 from agents import skeleton as skel
 from agents.mapping_agent import MappingAgent
 from agents.memory import InstanceMemory
-from agents.entity_resolver import EntityResolver, ResolutionResult
 from decision import DecisionLoop, DecisionTraceLogger, VLMDecisionClient
 from runtime_paths import env_debug_path
-
-# Observation 入库时同时做跨视角实体关联和实例描述。
-# 关键帧 caption 描述整张图像，不足以区分图中哪个物体被 pointing 命中。
-ENTITY_RESOLUTION_PROMPT = """You resolve object identity for an embodied agent.
-Task instruction: "{task}".
-
-Image `new_observation` marks the newly pointed object. Candidate images mark
-existing canonical instances that are geometrically nearby. Decide whether the
-new marked object is the SAME PHYSICAL OBJECT as exactly one candidate, or is a
-NEW object. Same category, color, or material is not enough. Compare distinctive
-parts, shape, texture, damage, and fixed surroundings. Adjacent similar objects
-must remain different. If the views are insufficient, answer UNCERTAIN.
-
-Candidate metadata (distances are system-computed metres):
-{candidates}
-
-Source text: "{caption}"
-
-Return exactly one JSON object:
-{{"decision":"SAME|NEW|UNCERTAIN", "instance_id":<candidate id or null>,
-  "description":"concise description of the newly marked object",
-  "reason":"short identity evidence"}}
-SAME must use an id from the candidate list. NEW and UNCERTAIN must use null."""
-
-
-
 
 class NavAgent(MappingAgent):
     def __init__(self):
@@ -128,11 +101,10 @@ class NavAgent(MappingAgent):
                            "view_frame": self._tool_view_frame,
                            "propose_candidates": self._tool_propose_candidates,
                            "commit_candidates": self._tool_commit_candidates,
-                           "use_molmo_point": self._tool_use_molmo_point,
                            "review_crosshair": self._tool_review_crosshair,
                            "instantiate_points": self._tool_instantiate_points,
-                           "som_segment": self._tool_som_segment,
                            "som_pick": self._tool_som_pick,
+                           "resolve_duplicate": self._tool_resolve_duplicate,
                            "get_agent_status": self._tool_get_agent_status,
                            "set_notes": self._tool_set_notes,
                            "get_action_history": self._tool_get_action_history},
@@ -146,10 +118,6 @@ class NavAgent(MappingAgent):
                 print("[NavAgent] WARNING: NAV_DECIDER=vlm 但 VLM API 未配置，"
                       "回退规则决策")
                 self.decider_mode = "rules"
-        self.entity_resolver = EntityResolver.from_env(
-            trace_path=env_debug_path(
-                "NAV_ENTITY_TRACE",
-                os.path.join(self.output_dir, "entity_resolution.jsonl")))
         self._nav_reset_state()
 
     def _nav_reset_state(self):
@@ -186,6 +154,7 @@ class NavAgent(MappingAgent):
         self._scan_images = []
         self.memory = InstanceMemory()
         self._reported_count = 0
+        self._last_dup_reviews = []
         # 评测采集（get_target_pool）只读锚点状态：世界系 (gps, compass)
         # 在首个有效 act 观测记录一次；SLAM 侧锚点（重力对齐系中最早
         # 关键帧位姿）在每次重规划时刷新，跟随回环对历史位姿的改写。
@@ -223,6 +192,15 @@ class NavAgent(MappingAgent):
         # only explicitly accepted proposals are inserted into InstanceMemory.
         self._proposals = {}
         self._proposal_limit = 128
+        # 被拒候选记忆：(frame_id, round(x), round(y)) -> {count, reason, step}。
+        # molmo/VLM 反复在同一个像素报同一个目标时，硬过滤禁止再次 propose；
+        # 全部被过滤时向 VLM 报 ALL_SPOTS_REJECTED，引导其先靠近再看。
+        self._rejected_spots = {}
+        # geometry 解析失败候选的重看导航：frame_id -> {point, attempts, step}。
+        # 系统把 agent 导航到该帧拍摄位姿附近重新观察，不再直接丢弃。
+        self._revisit_targets = {}
+        self.revisit_max_attempts = max(1, int(os.environ.get(
+            "NAV_REVISIT_MAX_ATTEMPTS", "3")))
         # 决策层状态：近期事件流 + 最近一次探索规划的 frontier 缓存
         self._events = []
         self._last_frontier_clusters = []
@@ -265,6 +243,10 @@ class NavAgent(MappingAgent):
             "NAV_DECISION_MAP_REFRESH_INTERVAL", "5")))
         self.map_max_instances = max(1, int(os.environ.get(
             "NAV_MAP_MAX_INSTANCES", "12")))
+        # 实例化去重：新观测 3D 点该半径（米）内有已有实例时不直接新建，
+        # 挂起为 duplicate_review，由决策 VLM 看证据图裁决（resolve_duplicate）。
+        self.instance_dup_radius_m = float(os.environ.get(
+            "NAV_INSTANCE_DUPLICATE_RADIUS_M", "3.0"))
         self.explore_enabled = os.environ.get(
             "NAV_FRONTIER_EXPLORE", "1") == "1"
         self._frontier_empty_streak = 0
@@ -1538,6 +1520,80 @@ class NavAgent(MappingAgent):
         }
         return key
 
+    # ------------------------------------------------------------------
+    # 被拒候选记忆：molmo 反复报同一错误像素、VLM 连续 REJECT 时，系统
+    # 硬过滤禁止再 propose；目标在视野中过小/过远时提示 VLM 先靠近。
+    # ------------------------------------------------------------------
+    def _record_rejected_spot(self, frame_id, pixel_norm, reason=""):
+        """记录被语义审核拒绝的像素点；返回拒绝 key 或 None。"""
+        try:
+            key = (int(frame_id), int(round(float(pixel_norm[0]))),
+                   int(round(float(pixel_norm[1]))))
+        except (TypeError, ValueError, IndexError):
+            return None
+        entry = self._rejected_spots.setdefault(
+            key, {"count": 0, "reason": "", "step": 0})
+        entry["count"] += 1
+        if reason:
+            entry["reason"] = str(reason)[:200]
+        entry["step"] = int(getattr(self._last_observation, "step_count", 0))
+        return key
+
+    def _spot_rejected(self, frame_id, pixel_norm):
+        """pixel 距任一被拒点 40/1000 以内视为同一位置（硬过滤）。"""
+        try:
+            fid = int(frame_id)
+            x, y = float(pixel_norm[0]), float(pixel_norm[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        for (fkey, kx, ky) in self._rejected_spots:
+            if fkey == fid and math.hypot(kx - x, ky - y) <= 40.0:
+                return True
+        return False
+
+    def _schedule_revisit(self, frame_id):
+        """geometry 解析失败候选：导航到该帧拍摄位姿附近重新观察。
+
+        目标帧位姿由 mapping server 按 frame_id 查询（世界系 4x4）。
+        超过 NAV_REVISIT_MAX_ATTEMPTS 次后放弃该帧，避免循环导航。
+        """
+        fid = int(frame_id)
+        try:
+            pose = self.client.get_frame_pose(fid)
+        except Exception as exc:
+            print(f"[NavAgent] revisit frame {fid}: pose query failed: {exc}")
+            pose = None
+        if pose is None:
+            return {"frame_id": fid, "attempts": 0, "navigating": False,
+                    "error": "no pose for this frame; re-observe from a "
+                             "fresh viewpoint"}
+        entry = self._revisit_targets.setdefault(
+            fid, {"point": None, "attempts": 0, "step": 0})
+        entry["attempts"] += 1
+        entry["step"] = int(getattr(self._last_observation, "step_count", 0))
+        if entry["attempts"] > self.revisit_max_attempts:
+            return {"frame_id": fid, "attempts": entry["attempts"],
+                    "navigating": False,
+                    "error": "max revisit attempts reached for this frame"}
+        entry["point"] = np.asarray(pose[:3, 3], dtype=np.float64)
+        # 复用实例导航链：设世界系目标点 + 取消候选重投影，规划后切入 nav。
+        self.target_instance_id = None
+        self.target_candidate_id = None
+        self.target_point = entry["point"]
+        self._selected_evidence = None
+        self._explore_follower = None
+        self._active_frontier_key = None
+        self._log_event(f"geometry revisit frame {fid} "
+                        f"attempt {entry['attempts']}")
+        if not self._plan_to_target(self._last_observation):
+            self._clear_current_target()
+            return {"frame_id": fid, "attempts": entry["attempts"],
+                    "navigating": False,
+                    "error": "no navigable path to the frame pose"}
+        self.mode = "nav"
+        return {"frame_id": fid, "attempts": entry["attempts"],
+                "navigating": True}
+
     def _tool_review_crosshair(self, frame_id, pixel_1000, verdict,
                                reason=""):
         """记录 VLM 对已展示十字图的显式三值语义审核。"""
@@ -1548,142 +1604,59 @@ class NavAgent(MappingAgent):
             frame_id, pixel_1000, self._crosshair_evidence)
         if key is None:
             return {"error": "no crosshair evidence was shown for this pixel; "
-                    "call use_molmo_point or instantiate_points first"}
+                    "call instantiate_points first"}
         review = {"verdict": verdict, "reason": str(reason or "")[:300]}
         self._crosshair_reviews[key] = review
+        if verdict == "REJECT":
+            # 同一像素被否 → 进入被拒记忆；propose 硬过滤防止 molmo
+            # 反复报同一个错误位置，逼 VLM 靠近后从新视角再试。
+            self._record_rejected_spot(key[0], key[1:], reason)
         return {"frame_id": key[0], "pixel": [key[1], key[2]], **review,
                 "instantiation_allowed": verdict == "ACCEPT"}
 
-    def _tool_use_molmo_point(self, frame_id, query):
-        """调用 pointing 模型在指定关键帧定位描述目标。
+    def _tool_propose_candidates(self, frame_id, query=""):
+        """SAM 全分割整帧 → 编号 mask 表 + overlay；VLM 选编号走 som_pick。
 
-        返回 0-1000 归一化坐标，同时为每个标点渲染十字证据图（全帧 +
-        bbox 放大，不注册候选）。VLM 必须先调用 review_crosshair 给出
-        ACCEPT / REJECT / UNCERTAIN，只有 ACCEPT 的坐标才可实例化。
+        molmo 点指已废弃：分割只依赖 SAM（不依赖 pointing 模型），把
+        "生成坐标"变成"选编号"。目标太小/太远时 SAM 会漏分割——先
+        START_ADJUST 靠近当前帧再调用，近处 mask 才完整可靠。
         """
         try:
-            resp = self.client.point_pixels(int(frame_id), str(query))
-        except Exception as exc:
-            return {"error": str(exc)[:200]}
-        if resp.get("error"):
-            return self._pointing_error(resp)
-        w = float(resp.get("width") or 0)
-        h = float(resp.get("height") or 0)
-        fid = int(frame_id)
-        points = []
-        images = []
-        for i, pt in enumerate(resp.get("points") or []):
-            px = pt.get("pixel") or []
-            if len(px) != 2 or w <= 0 or h <= 0:
-                continue
-            norm = [round(float(px[0]) / w * 1000, 1),
-                    round(float(px[1]) / h * 1000, 1)]
-            try:
-                meta, payload = self.client.evidence_for_point(
-                    fid, [float(px[0]), float(px[1])], pt.get("bbox"))
-            except Exception:
-                meta, payload = {"found": False}, b""
-            if meta.get("found") and payload:
-                label = f"molmo_point_{fid}_{i}"
-                images.append((label, payload))
-                self._record_crosshair_evidence(fid, norm)
-            points.append({"pixel": norm,
-                           "confidence": round(float(pt.get(
-                               "confidence", 0.0)), 3)})
-        out = {"points": points}
-        if images:
-            out["_tool_images"] = images
-        return out
-
-    def _tool_propose_candidates(self, frame_id, query):
-        """Point one frame and create a bounded, reviewable proposal batch.
-
-        This is the preferred perception transaction.  It deliberately does
-        not resolve 3D or mutate InstanceMemory: the decision VLM first sees
-        all crosshair panels, then commits a batch of tri-state verdicts.
-        """
-        try:
-            pointed = self.client.point_pixels(int(frame_id), str(query))
-        except Exception as exc:
-            return {"error": str(exc)[:200]}
-        if pointed.get("error"):
-            return self._pointing_error(pointed)
-        pixels = []
-        width, height = float(pointed.get("width") or 0), \
-            float(pointed.get("height") or 0)
-        if width <= 0 or height <= 0:
-            return {"proposals": []}
-        for row in (pointed.get("points") or [])[:16]:
-            px = row.get("pixel") or []
-            if len(px) != 2:
-                continue
-            pixels.append([round(float(px[0]) / width * 1000, 1),
-                           round(float(px[1]) / height * 1000, 1)])
-        if not pixels:
-            return {"proposals": []}
-        try:
-            prepared = self.client.prepare_pixels(
-                int(frame_id), pixels, normalized=True)
-        except Exception as exc:
-            return {"error": str(exc)[:200]}
-        if prepared.get("error"):
-            return self._pointing_error(prepared)
-        images, rows = [], []
-        for candidate in prepared.get("candidates") or []:
-            cid = str(candidate.get("candidate_id") or "")
-            fid = candidate.get("frame_id")
-            pixel = candidate.get("pixel_norm")
-            if not cid or fid is None or not pixel:
-                continue
-            self._proposals[cid] = {
-                "candidate_id": cid, "frame_id": int(fid),
-                "pixel_norm": list(pixel), "bbox": candidate.get("bbox"),
-                "query": str(query)[:300], "step": int(
-                    getattr(self._last_observation, "step_count", 0)),
-                "status": "pending",
-            }
-            self._record_crosshair_evidence(fid, pixel)
-            try:
-                meta, payload = self.client.get_candidate_evidence(cid)
-            except Exception:
-                meta, payload = {"found": False}, b""
-            if meta.get("found") and payload:
-                images.append((f"proposal_{cid}", payload))
-            rows.append({"candidate_id": cid, "frame_id": int(fid),
-                         "pixel": list(pixel)})
-        if len(self._proposals) > self._proposal_limit:
-            oldest = sorted(self._proposals.values(),
-                            key=lambda row: row["step"])[:-self._proposal_limit]
-            for row in oldest:
-                self._proposals.pop(row["candidate_id"], None)
-        out = {"proposals": rows, "next":
-               "inspect panels, then commit any reviewed subset with one "
-               "verdict per submitted candidate; other proposals stay pending"}
-        if images:
-            out["_tool_images"] = images
-        return out
-
-    def _tool_som_segment(self, frame_id, max_masks=None):
-        """SoM 全分割：整帧 SAM 分割，返回编号 mask 列表 + overlay 图。
-
-        pointing 模型反复选错物体（review REJECT 且理由是落点在背景/
-        其他物体上）时的升级路径：把"生成坐标"变成"选编号"。
-        """
-        try:
-            meta, payload = self.client.som_segment(int(frame_id), max_masks)
+            meta, payload = self.client.som_segment(int(frame_id))
         except Exception as exc:
             return {"error": str(exc)[:200]}
         if meta.get("error"):
             return self._pointing_error(meta)
         if not meta.get("found"):
-            return {"masks": []}
-        out = {"frame_id": int(frame_id),
-               "masks": meta.get("masks") or [],
-               "next": "mask ids match the numbered labels on the attached "
-                       "overlay; call som_pick with the ids matching the "
-                       "target description"}
+            return {"masks": [], "error": "unknown or unsegmentable frame"}
+        fid = int(frame_id)
+        masks = []
+        for row in meta.get("masks") or []:
+            centroid = row.get("centroid") or []
+            if len(centroid) != 2:
+                continue
+            # 被拒记忆硬过滤：同一帧同一区域已被语义审核否定过。
+            if self._spot_rejected(fid, centroid):
+                continue
+            masks.append({"mask_id": int(row["mask_id"]),
+                          "centroid": [round(float(centroid[0]), 1),
+                                       round(float(centroid[1]), 1)],
+                          "bbox": row.get("bbox"),
+                          "area_frac": row.get("area_frac")})
+        out = {"frame_id": fid, "masks": masks,
+               "next": "the numbered labels on the attached overlay match "
+                       "mask_id; call som_pick(frame_id, mask_ids, query) "
+                       "with the ids of the regions matching the target, "
+                       "then review and commit them with commit_candidates"}
         if payload:
-            out["_tool_images"] = [(f"som_{int(frame_id)}", payload)]
+            out["_tool_images"] = [(f"som_{fid}", payload)]
+        if not masks:
+            out["all_spots_rejected"] = True
+            out["next"] = ("every candidate region on this frame has already "
+                           "been rejected; do NOT re-propose here. If the "
+                           "target is small or far away, START_ADJUST with "
+                           "MOVE_FORWARD (or go to a frontier) to get "
+                           "closer, then propose from the new viewpoint")
         return out
 
     def _tool_som_pick(self, frame_id, mask_ids, query=""):
@@ -1764,6 +1737,9 @@ class NavAgent(MappingAgent):
                 accepted.append(proposal)
             elif verdict == "REJECT":
                 rejected.append(cid)
+                self._record_rejected_spot(
+                    proposal["frame_id"], proposal["pixel_norm"],
+                    row.get("reason"))
             else:
                 unresolved.append(cid)
         if not accepted:
@@ -1785,6 +1761,8 @@ class NavAgent(MappingAgent):
                 geometry_rejections.append({"candidate_id": cid,
                     "reason": str(row.get("error") or "no valid 3D depth")[:240]})
                 proposal["status"] = "geometry_rejected"
+                # 不丢弃：导航到该帧拍摄位姿附近重新观察，近处深度更可靠。
+                self._schedule_revisit(proposal["frame_id"])
                 continue
             proposal["status"] = "active"
             valid_hits.append({**row, "found": True,
@@ -1795,16 +1773,27 @@ class NavAgent(MappingAgent):
                                "text": str(label or proposal["query"])})
         changed = self._ingest_semantic_hits(
             self._last_observation, valid_hits, select=False) or []
-        return {"instances": self._ground_rows(changed),
-                "accepted": [row["candidate_id"] for row in accepted],
-                "rejected": rejected, "uncertain": unresolved,
-                "geometry_rejections": geometry_rejections}
+        dup_rows, dup_images = self._dup_review_payload()
+        out = {"instances": self._ground_rows(changed),
+               "accepted": [row["candidate_id"] for row in accepted],
+               "rejected": rejected, "uncertain": unresolved,
+               "geometry_rejections": geometry_rejections}
+        if dup_rows:
+            out["duplicate_review"] = dup_rows
+            out["next"] = ("duplicate_review lists new observations near "
+                           "existing instances; compare the attached evidence "
+                           "images and call resolve_duplicate for each: "
+                           "DUPLICATE merges into the existing instance, "
+                           "NEW creates a separate one")
+            if dup_images:
+                out["_tool_images"] = dup_images
+        return out
 
     def _tool_instantiate_points(self, frame_id, pixels_1000, label=""):
         """按像素坐标实例化 3D 目标（0-1000 归一化坐标）。
 
-        两段式确认：像素必须先经过"十字证据图给 VLM 看过"（use_molmo_point
-        渲染登记，或本工具第一次调用渲染返回并登记）。VLM 看图后原样重发
+        两段式确认：像素必须先经过"十字证据图给 VLM 看过"（本工具第一次
+        调用渲染返回并登记）。VLM 看图后原样重发
         同坐标即确认，跳过语义审核直接做 3D 几何验证；未确认的坐标返回
         pending_confirmation + 十字图，不注册任何实例。
         """
@@ -1856,6 +1845,10 @@ class NavAgent(MappingAgent):
                         "verdict": review["verdict"],
                         "reason": review.get("reason", ""),
                     })
+                    if review["verdict"] == "REJECT":
+                        self._record_rejected_spot(
+                            fid, pixel or hit.get("pixel"),
+                            review.get("reason", ""))
             if pending:
                 # 第一段：渲染十字图返回给 VLM 看图确认，不注册实例。
                 images = []
@@ -1900,6 +1893,8 @@ class NavAgent(MappingAgent):
                         "pixel": hit.get("pixel_norm") or hit.get("pixel"),
                         "reason":
                         str(row.get("error") or "no valid 3D depth")[:240]})
+                    # 不丢弃：导航到该帧拍摄位姿附近重新观察。
+                    self._schedule_revisit(hit.get("frame_id"))
                     continue
                 hit.update(row)
                 valid_hits.append(hit)
@@ -3063,12 +3058,21 @@ class NavAgent(MappingAgent):
             self.mode = "nav"
         return True
 
-    # EXPLORE：pointing observation 经 EntityResolver 归入 canonical instance
+    # EXPLORE：pointing observation 经 3m 邻域预筛；疑似重复挂起交决策 VLM
     def _ingest_semantic_hits(self, observation, hits, select=True):
-        """Observation 幂等 -> 跨视角实体关联 -> canonical instance。"""
+        """Observation 幂等 -> 3m 邻域预筛 -> canonical instance。
+
+        去重策略：新观测的 3D 点 instance_dup_radius_m 内没有已有实例才
+        直接新建；有邻居则挂起为 duplicate_review（不建实例、不可导航），
+        由决策 VLM 通过 resolve_duplicate 工具看证据图后裁决 NEW（新建）
+        或 DUPLICATE（并入既有实例）。复核记录经 self._last_dup_reviews
+        交给工具层随返回附上证据图。
+        """
         step = observation.step_count
         hits.sort(key=lambda r: r.get("point_score", 0.0), reverse=True)
         changed = []
+        dup_reviews = []
+        self._last_dup_reviews = dup_reviews
         for h in hits:
             if "point" not in h:
                 continue
@@ -3095,134 +3099,152 @@ class NavAgent(MappingAgent):
             replay = (self.memory.instance_for_observation(
                 replay_observation.oid)
                 if replay_observation is not None else None)
+            is_new = False
+            association = None
             if replay is not None:
                 node = self.memory.register_replay(
                     replay, candidate_id=h.get("candidate_id"),
                     evidence=evidence, point=aligned, step=step)
-                result = ResolutionResult(
-                    node, is_new=False, method="observation_replay",
-                    verdict="SAME", reason="same evidence or same-frame mark")
+                association = "observation_replay"
                 observation_id = (node.observation_ids[-1]
                                   if node.observation_ids else None)
             elif replay_observation is not None:
-                # The same raw evidence was previously left UNCERTAIN.  It is
-                # not a new visual observation and must not be re-resolved into
-                # a second canonical instance merely because commit was retried.
+                # 同一原始证据此前已挂起（duplicate_review/未决）：commit
+                # 重试不得再次新建实例。
                 node = None
                 observation_id = replay_observation.oid
-                result = ResolutionResult(
-                    None, replay_observation, is_new=False,
-                    method="unresolved_observation_replay", verdict="UNCERTAIN",
-                    reason="same unresolved evidence; await a new view")
             else:
                 observed = self.memory.new_observation(
                     aligned, text=initial_text, evidence=evidence,
                     frame_id=h.get("frame_id"), step=step,
                     candidate_id=h.get("candidate_id"),
                     pixel=h.get("pixel"), bbox=h.get("bbox"))
-                scale = self._metric_scale_value() or 1.0
-                result = self.entity_resolver.resolve(
-                    self.memory, observed, scale,
-                    compare_fn=self._resolve_observation_visual)
-                node = result.node
                 observation_id = observed.oid
+                scale = self._metric_scale_value() or 1.0
+                neighbors = self.memory.nearby(
+                    observed.point, scale, self.instance_dup_radius_m,
+                    top_k=4)
+                if neighbors:
+                    node = None
+                    dup_reviews.append({
+                        "observation_id": observed.oid,
+                        "candidate_id": h.get("candidate_id"),
+                        "frame_id": h.get("frame_id"),
+                        "text": initial_text[:200],
+                        "neighbors": [
+                            {"instance_id": nd.iid,
+                             "dist_m": round(float(dist), 2),
+                             "text": str(nd.text)[:120],
+                             "reported": bool(nd.reported)}
+                            for dist, nd in neighbors],
+                    })
+                else:
+                    node = self.memory.create_instance(
+                        observed, text=initial_text)
+                    is_new = True
+                    association = "new"
             if node is None:
                 cid = str(h.get("candidate_id") or f"obs{observation_id}")
+                under_review = any(
+                    row["observation_id"] == observation_id
+                    for row in dup_reviews)
                 self._proposals[cid] = {
                     "candidate_id": cid, "frame_id": h.get("frame_id"),
                     "pixel_norm": h.get("pixel"), "bbox": h.get("bbox"),
                     "query": initial_text[:300], "step": int(step),
-                    "status": "uncertain", "reason": result.reason,
+                    "status": ("duplicate_review" if under_review
+                               else "uncertain"),
                     "observation_id": observation_id,
                 }
                 self._log_event(
-                    f"observation {observation_id} retained as uncertain proposal")
+                    f"observation {observation_id} retained as "
+                    f"{'duplicate_review' if under_review else 'uncertain'} "
+                    "proposal")
                 continue
             changed.append({
                 "instance_id": node.iid,
                 "observation_id": observation_id,
-                "is_new": result.is_new,
-                "association": result.method,
+                "is_new": is_new,
+                "association": association,
                 "reported": node.reported,
                 "frame_id": h.get("frame_id"),
                 "confidence": round(float(h.get("point_score", 0.0)), 3),
             })
-        if not changed:
+        if not changed and not dup_reviews:
             self._no_hit_queries += 1
             return None if select else []
         self._no_hit_queries = 0
-        ids = ", ".join(
-            f"obs{row['observation_id']}->#{row['instance_id']}"
-            f" ({'new' if row['is_new'] else row['association']})"
-            for row in changed)
-        self._log_event(f"pointing updated instances {ids}")
-        print(f"[NavAgent] step={step} 3D 实例记忆更新: {ids}")
+        if changed:
+            ids = ", ".join(
+                f"obs{row['observation_id']}->#{row['instance_id']}"
+                f" ({'new' if row['is_new'] else row['association']})"
+                for row in changed)
+            self._log_event(f"pointing updated instances {ids}")
+            print(f"[NavAgent] step={step} 3D 实例记忆更新: {ids}")
+        if dup_reviews:
+            self._log_event(
+                "duplicate review pending for observations "
+                + str([row["observation_id"] for row in dup_reviews]))
         if select:
             return self._choose_high_level_target(
                 observation, "world_state_updated")
         return changed
 
-    def _resolve_observation_visual(self, observation, nearby):
-        """Compare marked photos and describe the new observation in one call."""
-        vlm = getattr(self, "vlm", None)
-        chat_json = getattr(vlm, "chat_json", None)
-        if vlm is None or not getattr(vlm, "enabled", False) or \
-                chat_json is None:
-            return None
+    def _dup_review_payload(self):
+        """读取并清空 _last_dup_reviews，附新观测与邻近实例的证据图。"""
+        rows = list(getattr(self, "_last_dup_reviews", []) or [])
+        self._last_dup_reviews = []
+        if not rows:
+            return [], []
         images = []
-        new_image_found = False
-        if observation.candidate_id:
-            try:
-                meta, payload = self.client.get_candidate_evidence(
-                    observation.candidate_id)
-                if meta.get("found") and payload:
-                    images.append(("new_observation", payload))
-                    new_image_found = True
-            except Exception:
-                pass
-        if not new_image_found:
-            return None
-        candidate_rows = []
-        visual_candidate_ids = set()
-        for distance_m, node in nearby:
-            payload = self._tool_view_instance(node.iid)
-            if payload:
-                candidate_rows.append({
-                    "instance_id": node.iid,
-                    "distance_m": round(float(distance_m), 3),
-                    "reported": node.reported,
-                    "description": node.text[:240],
-                })
-                visual_candidate_ids.add(node.iid)
-                images.append((f"candidate_instance_{node.iid}", payload))
-        prompt = ENTITY_RESOLUTION_PROMPT.format(
-            task=self.target_text or "",
-            candidates=json.dumps(candidate_rows, ensure_ascii=False),
-            caption=observation.text[:500])
-        try:
-            obs = self._last_observation
-            vlm.set_trace_context(
-                episode=str(getattr(obs, "episode_id", "")),
-                step=int(getattr(obs, "step_count", 0) or 0),
-                event="entity_resolution")
-            response = chat_json(
-                prompt, images, trace_kind="entity_resolution")
-            if isinstance(response, dict) and \
-                    str(response.get("decision", "")).upper() == "SAME":
+        for entry in rows:
+            cid = entry.get("candidate_id")
+            if cid:
                 try:
-                    matched_id = int(response.get("instance_id"))
-                except (TypeError, ValueError):
-                    matched_id = None
-                if matched_id not in visual_candidate_ids:
-                    return {
-                        "decision": "UNCERTAIN",
-                        "instance_id": None,
-                        "description": response.get("description", ""),
-                        "reason": "SAME candidate had no visual evidence",
-                    }
-            return response
-        except Exception:
-            return None
+                    meta, payload = self.client.get_candidate_evidence(cid)
+                except Exception:
+                    meta, payload = {"found": False}, b""
+                if meta.get("found") and payload:
+                    images.append(
+                        (f"dup_new_obs{entry['observation_id']}", payload))
+            for neighbor in entry.get("neighbors", [])[:2]:
+                payload = self._tool_view_instance(neighbor["instance_id"])
+                if payload:
+                    images.append(
+                        (f"dup_existing_{neighbor['instance_id']}", payload))
+        return rows, images
+
+    def _tool_resolve_duplicate(self, observation_id, decision,
+                                duplicate_of=None, text=""):
+        """实例化去重裁决：NEW 新建实例；DUPLICATE 并入既有实例。"""
+        observation = self.memory.get_observation(observation_id)
+        if observation is None:
+            return {"error": f"observation {observation_id!r} not found"}
+        if self.memory.instance_for_observation(observation.oid) is not None:
+            return {"error": f"observation {observation.oid} already resolved"}
+        decision = str(decision or "").strip().upper()
+        if decision == "NEW":
+            node = self.memory.create_instance(
+                observation, text=str(text or observation.text))
+            resolved = "new"
+        elif decision == "DUPLICATE":
+            node = self.memory.get(duplicate_of)
+            if node is None:
+                return {"error": f"duplicate_of {duplicate_of!r} is not an "
+                                 "existing instance"}
+            self.memory.attach_observation(
+                node, observation, text=str(text or ""))
+            resolved = "duplicate"
+        else:
+            return {"error": "decision must be NEW or DUPLICATE"}
+        for proposal in self._proposals.values():
+            if proposal.get("observation_id") == observation.oid:
+                proposal["status"] = f"resolved_{resolved}"
+        self._log_event(
+            f"observation {observation.oid} resolved as {resolved} "
+            f"-> instance {node.iid}")
+        return {"instance_id": node.iid, "observation_id": observation.oid,
+                "resolved": resolved, "reported": bool(node.reported)}
 
     # 规划
     def _refresh_anchor(self, poses, frame_ids):

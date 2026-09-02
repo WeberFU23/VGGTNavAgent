@@ -23,9 +23,14 @@ ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "CONTINUE_NAVIGATION",
 DEFAULT_MAX_TOOL_ROUNDS = 15
 FINAL_ACTION_ATTEMPTS = 2
 
+# 走到目标附近即可上报：成功按距离判定（评估器 0.25m 测地线阈值），
+# 不要求目标在视野内——太近时物体落在相机视野外是正常现象。非 active
+# 实例只要 dist_m ≤ 该值也放行 REPORT_FOUND。
+REPORT_NEAR_DIST_M = float(os.environ.get("NAV_REPORT_NEAR_DIST_M", "1.0"))
+
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
 WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points",
-               "commit_candidates")
+               "commit_candidates", "resolve_duplicate")
 
 EVENT_ACTIONS = {
     # 除 finish_check / adjustment 外放行高层动作（EXPLORE 除外——VLM 滥用
@@ -125,7 +130,7 @@ class DecisionLoop:
                 self._log(event, state, None, "model_unavailable",
                           tool_calls)
                 return None
-            tool_call = data.get("tool_call")
+            tool_call = self._extract_tool_call(data)
             if tool_call and str(event) == "adjustment":
                 # takeover 期间禁止工具调用：按非法输出走校验失败重试路径。
                 result, err = None, "tools are disabled during adjustment"
@@ -177,7 +182,7 @@ class DecisionLoop:
             data2 = self._chat(prompt, images)
             if data2 is None:
                 result2, err2 = None, "model_unavailable"
-            elif data2.get("tool_call"):
+            elif self._extract_tool_call(data2):
                 result2, err2 = None, (
                     "a final action JSON was required; tool_call is not "
                     "allowed on validation retry")
@@ -210,7 +215,7 @@ class DecisionLoop:
             data = self._chat(prompt, images)
             if data is None:
                 last_error = "model_unavailable"
-            elif data.get("tool_call"):
+            elif self._extract_tool_call(data):
                 last_error = (
                     "tool_call is disabled after the hard limit; output one "
                     "final action JSON")
@@ -316,6 +321,28 @@ class DecisionLoop:
         if isinstance(refreshed, dict):
             return refreshed, None, False
         return fallback, None, False
+
+    @staticmethod
+    def _extract_tool_call(data):
+        """归一化工具调用：约定 {"tool_call": {"name", ...}}；兼容部分模型
+        输出的 {"tool": name, "arguments": {...}} 以及 tool_call 内嵌套
+        arguments/args/parameters 的格式。"""
+        tool_call = data.get("tool_call")
+        if tool_call is None and isinstance(data.get("tool"), str):
+            tool_call = {"name": data["tool"]}
+            for key in ("arguments", "args", "parameters"):
+                if isinstance(data.get(key), dict):
+                    tool_call.update(data[key])
+                    break
+        if isinstance(tool_call, dict):
+            for key in ("arguments", "args", "parameters"):
+                nested = tool_call.get(key)
+                if isinstance(nested, dict):
+                    tool_call = {k: v for k, v in tool_call.items()
+                                 if k != key}
+                    tool_call.update(nested)
+                    break
+        return tool_call
 
     def _build_prompt(self, event, world_state):
         return build_decision_prompt(
@@ -468,10 +495,17 @@ class DecisionLoop:
                               "an available canonical instance")
             active = (world_state.get("navigation", {})
                       .get("active_target") or {})
-            if active.get("type") != "instance" or \
-                    str(active.get("id")) != target_id:
-                return None, ("REPORT_FOUND must target the active canonical "
-                              "instance")
+            is_active = (active.get("type") == "instance" and
+                         str(active.get("id")) == target_id)
+            if not is_active:
+                # 走到目标附近即可上报：距离判定，与视野无关。
+                near = {str(i["id"]): i.get("dist_m")
+                        for i in world_state.get("instances", [])}
+                d = near.get(target_id)
+                if d is None or d > REPORT_NEAR_DIST_M:
+                    return None, ("REPORT_FOUND must target the active "
+                                  "canonical instance (or one you are "
+                                  f"within {REPORT_NEAR_DIST_M:g}m of)")
         else:
             target_id = None
         return DecisionResult(action, target_id,

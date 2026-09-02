@@ -8,7 +8,6 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.memory import InstanceMemory
-from agents.entity_resolver import EntityResolver
 from agents import planner
 
 
@@ -77,43 +76,6 @@ def test_replaying_old_view_keeps_its_observation_and_canonical_point():
     assert node.step == 10
 
 
-def test_entity_resolver_attaches_cross_frame_same_object():
-    mem = InstanceMemory()
-    first = mem.new_observation(
-        [0, 0, 0], "chair front", frame_id=1, candidate_id="c1")
-    node = mem.create_instance(first)
-    second = mem.new_observation(
-        [0.1, 0, 0], "chair side", frame_id=2, candidate_id="c2")
-    resolver = EntityResolver(candidate_radius_m=1.0)
-    result = resolver.resolve(
-        mem, second, scale=1.0,
-        compare_fn=lambda observation, nearby: {
-            "decision": "SAME", "instance_id": node.iid,
-            "description": "same chair from two views",
-            "reason": "same distinctive back",
-        })
-    assert not result.is_new and result.node is node
-    assert len(node.observation_ids) == 2
-    assert node.text == "same chair from two views"
-
-
-def test_entity_resolver_keeps_uncertain_neighbor_non_navigable():
-    mem = InstanceMemory()
-    mem.create_instance(mem.new_observation(
-        [0, 0, 0], "chair A", frame_id=1, candidate_id="c1"))
-    second = mem.new_observation(
-        [0.3, 0, 0], "chair B", frame_id=2, candidate_id="c2")
-    result = EntityResolver(candidate_radius_m=1.0).resolve(
-        mem, second, scale=1.0,
-        compare_fn=lambda observation, nearby: {
-            "decision": "UNCERTAIN", "instance_id": None,
-            "description": "possibly another chair",
-        })
-    assert not result.is_new and result.node is None
-    assert result.observation is second and result.verdict == "UNCERTAIN"
-    assert len(mem.nodes) == 1
-
-
 def test_reported_instances_are_not_available():
     mem = InstanceMemory()
     n1 = mem.add([0, 0, 0], "cup")
@@ -139,8 +101,6 @@ if __name__ == "__main__":
     test_stable_candidate_updates_same_instance_and_evidence()
     test_same_frame_reinstantiation_is_observation_idempotent()
     test_replaying_old_view_keeps_its_observation_and_canonical_point()
-    test_entity_resolver_attaches_cross_frame_same_object()
-    test_entity_resolver_preserves_uncertain_neighbor_as_new()
     test_reported_instances_are_not_available()
     test_planner_uses_all_unreported_instances()
     print("memory/planner tests passed")

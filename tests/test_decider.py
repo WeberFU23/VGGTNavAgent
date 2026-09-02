@@ -269,10 +269,42 @@ def test_vlm_explicitly_controls_adjustment_state_transitions():
         assert result.action == "START_ADJUST"
     for action in ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
                    "LOOK_DOWN", "END_ADJUST"):
-        result = DecisionLoop(_ScriptedChat([{
-            "action": action
-        }])).decide("adjustment", _state())
+        reply = {"action": action}
+        if action == "MOVE_FORWARD":
+            reply["steps"] = 2
+        result = DecisionLoop(_ScriptedChat([reply])).decide(
+            "adjustment", _state())
         assert result.action == action
+        if action == "MOVE_FORWARD":
+            assert result.steps == 2
+
+
+def test_adjustment_move_forward_requires_steps():
+    chat = _ScriptedChat([
+        {"action": "MOVE_FORWARD"},
+        {"action": "MOVE_FORWARD", "steps": 3},
+    ])
+    result = DecisionLoop(chat).decide("adjustment", _state())
+    assert result.action == "MOVE_FORWARD" and result.steps == 3
+    assert "requires \"steps\"" in chat.calls[1][0]
+
+
+def test_adjustment_move_forward_steps_must_fit_configured_range():
+    state = _state()
+    state["adjustment"] = {"max_forward_steps": 4}
+    chat = _ScriptedChat([
+        {"action": "MOVE_FORWARD", "steps": 9},
+        {"action": "MOVE_FORWARD", "steps": 4},
+    ])
+    result = DecisionLoop(chat).decide("adjustment", state)
+    assert result.action == "MOVE_FORWARD" and result.steps == 4
+    assert "1..4" in chat.calls[1][0]
+    chat = _ScriptedChat([
+        {"action": "MOVE_FORWARD", "steps": 0},
+        {"action": "END_ADJUST"},
+    ])
+    result = DecisionLoop(chat).decide("adjustment", state)
+    assert result.action == "END_ADJUST"
 
 
 def test_adjustment_pitch_actions_obey_configured_relative_limit():

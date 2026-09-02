@@ -302,7 +302,10 @@ VLM 必须输出一个 JSON 对象：
 - `SCAN`：原地 360° 环视（12 次左转、四个采样视角），只能看到当前位置
   可见的东西，无法看到物体另一面，不能用于核实候选；
 - `START_ADJUST`：有界微调/主动观察，每轮一个原子动作，执行后收到新
-  RGB，默认最多 10 步（`NAV_ADJUST_MAX_STEPS`）。benchmark 原生支持的
+  RGB，默认最多 10 步（`NAV_ADJUST_MAX_STEPS`）。其中 `MOVE_FORWARD`
+  必须带 `steps` 字段（1..`NAV_ADJUST_MAX_FORWARD_STEPS`，默认 8，每步
+  0.25m）：harness 逐步连续执行，碰撞即中断并把新观测交还 VLM，步数同时
+  受会话/目标预算钳制；转向与俯仰仍每次执行一次。benchmark 原生支持的
   `LOOK_UP/LOOK_DOWN` 每次改变俯仰 30°；相对中性姿态默认限制为 ±1 档
   （`NAV_ADJUST_MAX_TILT_STEPS`），`END_ADJUST` 后 harness 自动逐步回正再
   恢复导航，倾斜视角作为同一位置的现场观察证据保留。除此之外，同一

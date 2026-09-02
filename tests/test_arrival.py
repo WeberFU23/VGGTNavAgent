@@ -379,6 +379,57 @@ def test_scan_is_general_panorama_without_target_grounding():
     assert len(captured["images"]) == 4
 
 
+def _repeat_test_agent(vlm_calls):
+    agent = _make_agent()
+    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    agent.target_instance_id = node.iid
+    agent.target_candidate_id = "candidate-1"
+    agent.client = _MockClient()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"jpeg")
+    agent._build_decider_input = lambda obs, **kwargs: (
+        {"instances": [], "task": {}, "step": obs.step_count}, None)
+
+    def decide(event, *args, **kwargs):
+        vlm_calls.append(event)
+        if len(vlm_calls) == 1:
+            return DecisionResult("MOVE_FORWARD", steps=3)
+        return DecisionResult("TURN_LEFT")
+
+    agent.decision_loop = SimpleNamespace(decide=decide, logger=None)
+    return agent
+
+
+def test_adjustment_move_forward_repeats_steps_without_vlm():
+    vlm_calls = []
+    agent = _repeat_test_agent(vlm_calls)
+    first = agent._start_adjustment(_obs(step=100), "arrival", [])
+    assert first == int(Action.MOVE_FORWARD)
+    assert agent._adjust_repeat_remaining == 2
+    # 剩余两步由 harness 直接执行，不再咨询 VLM。
+    assert agent._adjustment_action(_obs(step=101)) == int(Action.MOVE_FORWARD)
+    assert agent._adjustment_action(_obs(step=102)) == int(Action.MOVE_FORWARD)
+    assert agent._adjust_repeat_remaining == 0
+    assert len(vlm_calls) == 1
+    # 重复执行完毕后才回到 VLM 重新决策。
+    assert agent._adjustment_action(_obs(step=103)) == int(Action.TURN_LEFT)
+    assert len(vlm_calls) == 2
+
+
+def test_adjustment_forward_repeat_aborts_on_collision():
+    vlm_calls = []
+    agent = _repeat_test_agent(vlm_calls)
+    assert agent._start_adjustment(_obs(step=100), "arrival", []) == \
+        int(Action.MOVE_FORWARD)
+    # 上一次前进碰撞：中断剩余步数，交还 VLM。
+    agent._last_motion_failed = True
+    action = agent._adjustment_action(
+        _obs(step=101, previous_action=int(Action.MOVE_FORWARD)))
+    assert agent._adjust_repeat_remaining == 0
+    assert len(vlm_calls) == 2
+    assert action == int(Action.TURN_LEFT)
+    agent._last_motion_failed = False
+
+
 if __name__ == "__main__":
     test_arrival_decision_goes_directly_to_vlm_without_grounding()
     test_adjustment_executes_one_vlm_motion_per_observation_then_resumes()
@@ -388,4 +439,6 @@ if __name__ == "__main__":
     test_every_valid_3d_hit_becomes_an_instance_even_low_confidence()
     test_same_candidate_updates_but_different_candidates_do_not_auto_merge()
     test_scan_is_general_panorama_without_target_grounding()
+    test_adjustment_move_forward_repeats_steps_without_vlm()
+    test_adjustment_forward_repeat_aborts_on_collision()
     print("arrival tests passed")

@@ -31,7 +31,8 @@ from agents import planner
 from agents import skeleton as skel
 from agents.mapping_agent import MappingAgent
 from agents.memory import InstanceMemory
-from decision import DecisionLoop, DecisionTraceLogger, VLMDecisionClient
+from decision import (DecisionLoop, DecisionResult, DecisionTraceLogger,
+                      VLMDecisionClient)
 from runtime_paths import env_debug_path
 
 class NavAgent(MappingAgent):
@@ -66,6 +67,10 @@ class NavAgent(MappingAgent):
             "NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET", "8")))
         self.adjust_max_turns_per_target = max(1, int(os.environ.get(
             "NAV_ADJUST_MAX_TURNS_PER_TARGET", "4")))
+        # 一次 MOVE_FORWARD 决策允许连续执行的最大前进步数（每步 0.25m）；
+        # VLM 必须显式选择步数，harness 逐步执行、碰撞即停。
+        self.adjust_max_forward_steps = max(1, int(os.environ.get(
+            "NAV_ADJUST_MAX_FORWARD_STEPS", "8")))
         self.adjust_map_radius_m = max(1.0, float(os.environ.get(
             "NAV_ADJUST_MAP_RADIUS_M", "4.0")))
         # 唯一候选生成语义链路：caption 检索 + pointing + 3D instance memory
@@ -180,6 +185,9 @@ class NavAgent(MappingAgent):
         self._adjustment_budgets = {}
         self._adjust_goal = None
         self._adjust_start_frame_id = None
+        # MOVE_FORWARD steps>1 的续执行计数：逐步执行，碰撞即停并交还 VLM。
+        self._adjust_repeat_remaining = 0
+        self._adjust_repeat_total = 0
         self._adjust_progress = {"successful_moves": 0, "fresh_views": 0,
                                  "new_keyframes": 0}
         self._last_decision_output = None
@@ -2413,6 +2421,8 @@ class NavAgent(MappingAgent):
         self._adjust_pitch_steps = 0
         self._adjust_leveling = False
         self._adjust_end_reason = None
+        self._adjust_repeat_remaining = 0
+        self._adjust_repeat_total = 0
         # Current RGB must be regenerated after every action. Preserve only
         # historical/context evidence across adjustment rounds.
         self._adjust_context_images = [
@@ -2440,6 +2450,8 @@ class NavAgent(MappingAgent):
         self._adjust_end_reason = None
         self._adjust_goal = None
         self._adjust_start_frame_id = None
+        self._adjust_repeat_remaining = 0
+        self._adjust_repeat_total = 0
         self._clear_current_target()
         self.mode = "explore"
         return self._explore_action(observation)
@@ -2474,6 +2486,8 @@ class NavAgent(MappingAgent):
             "max_steps": self.adjust_max_steps,
             "steps_remaining": max(
                 0, self.adjust_max_steps - self._adjust_steps),
+            "max_forward_steps": self.adjust_max_forward_steps,
+            "forward_repeat_remaining": self._adjust_repeat_remaining,
             "target_budget": {
                 **target_budget,
                 "max_sessions": self.adjust_max_sessions_per_target,
@@ -2546,6 +2560,8 @@ class NavAgent(MappingAgent):
             self._adjust_end_reason = None
             return self._end_adjustment_and_resume(observation, reason)
         if self._adjust_steps >= self.adjust_max_steps:
+            self._adjust_repeat_remaining = 0
+            self._adjust_repeat_total = 0
             self._log_event(
                 f"adjustment safety limit reached ({self.adjust_max_steps})")
             if self._adjust_pitch_steps:
@@ -2553,6 +2569,35 @@ class NavAgent(MappingAgent):
                 self._adjust_end_reason = "safety_limit"
                 return self._level_adjustment_camera(observation)
             return self._end_adjustment_and_resume(observation, "safety_limit")
+        if self._adjust_repeat_remaining > 0:
+            if self._last_motion_failed:
+                # 连续前进途中碰撞：中断剩余步数，交还 VLM 用新观测重新决策。
+                self._log_event(
+                    f"adjustment forward repeat aborted by collision "
+                    f"({self._adjust_repeat_total - self._adjust_repeat_remaining}"
+                    f"/{self._adjust_repeat_total} done)")
+                self._adjust_repeat_remaining = 0
+                self._adjust_repeat_total = 0
+            else:
+                done = (self._adjust_repeat_total
+                        - self._adjust_repeat_remaining)
+                self._adjust_repeat_remaining -= 1
+                budget["steps"] = budget.get("steps", 0) + 1
+                budget["turn_streak"] = 0
+                budget["last_turn"] = None
+                self._adjust_steps += 1
+                trace_result = DecisionResult(
+                    "MOVE_FORWARD",
+                    reason=(f"forward repeat {done + 1}/"
+                            f"{self._adjust_repeat_total}"),
+                    validation="forward_repeat")
+                self._trace_adjustment_execution(
+                    observation, trace_result, int(Action.MOVE_FORWARD))
+                self._log_event(
+                    f"adjustment step {self._adjust_steps}/"
+                    f"{self.adjust_max_steps}: MOVE_FORWARD "
+                    f"(repeat {done + 1}/{self._adjust_repeat_total})")
+                return int(Action.MOVE_FORWARD)
         result, action = self._decider_next(
             observation, "adjustment",
             images=self._adjust_context_images,
@@ -2617,10 +2662,30 @@ class NavAgent(MappingAgent):
             self._adjust_pitch_steps += 1
         elif result.action == "LOOK_DOWN":
             self._adjust_pitch_steps -= 1
+        self._adjust_repeat_remaining = 0
+        self._adjust_repeat_total = 0
+        if result.action == "MOVE_FORWARD":
+            # VLM 必须显式给出 steps；本步已执行并计数，其余步数逐步续执行，
+            # 碰撞即停。上限同时受会话/目标预算钳制。
+            requested = max(1, int(result.steps or 1))
+            allowed = max(1, min(
+                requested, self.adjust_max_forward_steps,
+                self.adjust_max_steps - self._adjust_steps,
+                self.adjust_max_total_steps_per_target
+                - budget.get("steps", 0) + 1))
+            self._adjust_repeat_total = allowed
+            self._adjust_repeat_remaining = allowed - 1
         self._trace_adjustment_execution(observation, result, action)
-        self._log_event(
-            f"adjustment step {self._adjust_steps}/{self.adjust_max_steps}: "
-            f"{result.action}")
+        if result.action == "MOVE_FORWARD" and self._adjust_repeat_total > 1:
+            self._log_event(
+                f"adjustment step {self._adjust_steps}/"
+                f"{self.adjust_max_steps}: MOVE_FORWARD x"
+                f"{self._adjust_repeat_total} (requested "
+                f"{int(result.steps or 1)})")
+        else:
+            self._log_event(
+                f"adjustment step {self._adjust_steps}/{self.adjust_max_steps}: "
+                f"{result.action}")
         return action
 
     def _adjustment_goal_met(self):
@@ -2676,6 +2741,8 @@ class NavAgent(MappingAgent):
         self._adjust_goal = None
         self._adjust_start_frame_id = None
         self._adjustment_key = None
+        self._adjust_repeat_remaining = 0
+        self._adjust_repeat_total = 0
         self._adjust_reentry_blocked_step = observation.step_count
         self._log_event(f"adjustment ended ({reason}); resume {source_event}")
 

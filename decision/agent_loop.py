@@ -57,24 +57,27 @@ EVENT_ACTIONS = {
 }
 
 class DecisionResult:
-    __slots__ = ("action", "target_id", "reason", "validation", "tool_calls")
+    __slots__ = ("action", "target_id", "reason", "validation", "tool_calls",
+                 "steps")
 
     def __init__(self, action, target_id=None, reason="", validation="ok",
-                 tool_calls=0):
+                 tool_calls=0, steps=None):
         self.action = action
         self.target_id = target_id
         self.reason = reason
         self.validation = validation
         self.tool_calls = tool_calls
+        self.steps = steps
 
     def as_dict(self):
         return {"action": self.action, "target_id": self.target_id,
                 "reason": self.reason, "validation": self.validation,
-                "tool_calls": self.tool_calls}
+                "tool_calls": self.tool_calls, "steps": self.steps}
 
     def __repr__(self):
-        return (f"DecisionResult({self.action} target={self.target_id} "
-                f"{self.validation})")
+        steps = f" steps={self.steps}" if self.steps is not None else ""
+        return (f"DecisionResult({self.action} target={self.target_id}"
+                f"{steps} {self.validation})")
 
 
 class DecisionTraceLogger:
@@ -468,6 +471,25 @@ class DecisionLoop:
                     f"{action} would exceed the camera pitch limit "
                     f"(+/-{max_offset} steps); reverse pitch or choose another "
                     "action")
+        steps = None
+        if str(event) == "adjustment" and action == "MOVE_FORWARD":
+            adjustment = world_state.get("adjustment", {})
+            max_forward = max(1, int(
+                adjustment.get("max_forward_steps", 8) or 8))
+            raw_steps = data.get("steps")
+            if raw_steps is None:
+                return None, (
+                    "MOVE_FORWARD requires \"steps\": how many forward steps "
+                    f"to execute (1..{max_forward}, one step = 0.25m)")
+            try:
+                steps = int(raw_steps)
+            except (TypeError, ValueError):
+                return None, (
+                    f"MOVE_FORWARD steps must be an integer, got {raw_steps!r}")
+            if not 1 <= steps <= max_forward:
+                return None, (
+                    f"MOVE_FORWARD steps must be within 1..{max_forward}, "
+                    f"got {steps}")
         target_id = data.get("target_id")
         if target_id is not None:
             target_id = str(target_id)
@@ -510,7 +532,7 @@ class DecisionLoop:
             target_id = None
         return DecisionResult(action, target_id,
                               str(data.get("reason") or "")[:300],
-                              tool_calls=tool_calls), None
+                              tool_calls=tool_calls, steps=steps), None
 
     def _enforce_finish(self, result, world_state):
         """只强制 benchmark 明确给出的 many 数量；其他判断交给 VLM。"""

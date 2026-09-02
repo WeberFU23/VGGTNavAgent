@@ -12,16 +12,27 @@ DECIDER_PROMPT = """# Your task
 
 You control a robot navigating an indoor 3D scene. The task is in
 world_state.task.goal, e.g. "Find all bathroom shelf objects." Explore the
-scene, find the target object(s), and report each one when you are next to
-it and can actually see it.
+scene, find the target object(s), and report each one when you are near it.
 
-task.mode defines the completion rule:
+SCORING: you are credited for every DISTINCT correctly reported instance,
+weighted toward recall. Unreported targets score zero — a target you
+confirmed but never reported is a total loss. Reporting is cheap (one
+decision) and does not end the episode, so report each confirmed instance as
+soon as you are near it; never postpone a report to "finish exploring
+first". A report that misses is a small precision penalty; a target never
+reported is a full recall loss — when in doubt between reporting a
+near/confirmed instance and walking away to explore more, REPORT.
+
+task.mode defines the FINISH rule only:
 - "any": report any ONE matching instance, then FINISH.
 - "many": report exactly task.expected DISTINCT matching instances;
   task.found counts your accepted reports. FINISH is rejected until the
   count is reached.
-- "all": report EVERY matching instance in the scene; the total is unknown.
-  Explore until you are confident nothing remains unreported, then FINISH.
+- "all": find as many as the step budget allows. The scene total is UNKNOWN
+  and you are NOT required to find all of them; "completeness" is not a
+  checkpoint you wait for. Report iteratively: report what you confirm near,
+  keep exploring, report again. When steps run out you keep only what you
+  reported.
 FINISH is irreversible: the episode ends immediately.
 
 # What you receive at each decision
@@ -120,13 +131,25 @@ Perception and retrieval:
   bbox, area_frac}}]}} plus an attached numbered overlay image: segment the
   whole frame into object regions with SAM (no pointing model involved).
   centroid/bbox are 0-1000 normalized, matching the numbers printed on the
-  overlay. Use it on a NEAR, recent frame (current_frame_id) — small or far
-  targets are NOT segmented; if the target is small or far, START_ADJUST
-  with MOVE_FORWARD to get closer FIRST, then propose from the new view.
-  Then call som_pick with the ids of the regions matching the target.
+  overlay. Then call som_pick with the ids of the regions matching the target.
   Rejected regions (rejected_spots) are filtered out automatically; NEVER
   re-propose a frame whose regions were rejected, and never propose the
   same frame repeatedly from the same viewpoint.
+
+SAM TARGET-SIZE DISCIPLINE: SAM only yields clean, usable object masks
+when the object occupies a substantial share of the frame — a chair
+roughly 3m away fills a large area, while one 6m+ away either yields no
+mask or masks that merge with the rug/floor/wall behind it. Regions below
+~0.5% of frame area (area_frac < 0.005) are unreliable: masks in that
+range, or an overlay with no mask where you expect the object, mean you
+are too far. Do NOT pick or commit such candidates, and do NOT re-propose
+another distant frame hoping for better luck — DISTANCE is the problem,
+not the frame. Move closer FIRST (GOTO_INSTANCE for a registered
+instance; otherwise START_ADJUST with MOVE_FORWARD, or navigate toward
+that area), until the target region looks large in the view, THEN
+propose. The same logic applies when a prior commit was REJECTED because
+the mask fell on the floor/rug/wall beside the object: walk closer and
+re-propose from the new viewpoint instead of repeating from afar.
 - commit_candidates(reviews, label) -> {{instances, accepted, rejected,
   uncertain, geometry_rejections, duplicate_review}}: reviews is a list of
   {{candidate_id, verdict: ACCEPT|REJECT|UNCERTAIN, reason}}. Only ACCEPT
@@ -237,10 +260,18 @@ Stop calling tools as soon as the supplied evidence is sufficient.
 - START_ADJUST (takeover): short local adjustment when the camera pose
   needs refinement, or a small turn/step would reveal unseen space. Prefer
   it when no frontier or instance looks promising. During takeover tools
-  are disabled: reply with exactly one of MOVE_FORWARD, TURN_LEFT,
-  TURN_RIGHT, LOOK_UP, LOOK_DOWN, END_ADJUST per turn; the action executes
-  once, then you receive a fresh RGB image. LOOK_UP/LOOK_DOWN tilt the camera
-  by 30 degrees without moving the robot and are useful for high/low or
+  are disabled: reply with exactly one action per turn — MOVE_FORWARD,
+  TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN, or END_ADJUST; the action
+  executes, then you receive a fresh RGB image. MOVE_FORWARD requires a
+  "steps" field: an integer from 1 to
+  world_state.adjustment.max_forward_steps saying how many 0.25m forward
+  steps to execute in a row (one action type per reply — you cannot combine
+  forward and turn in one decision). Steps execute one by one and stop
+  early on collision, so prefer several steps over repeated single-step
+  replies when the path is clearly free. Turns and tilts always execute
+  once. LOOK_UP/LOOK_DOWN tilt
+  the camera by 30 degrees without moving the robot and are useful for
+  high/low or
   occluded targets. The harness bounds relative pitch and automatically
    returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
    is accepted only after its stated success condition has measurable progress:
@@ -276,6 +307,7 @@ SCAN to look around, or pick a frontier to move to first.
 Finally reply with exactly one JSON object and nothing else:
   {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|CONTINUE_NAVIGATION|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
     "target_id": "<instance id for GOTO_INSTANCE/REPORT_FOUND, frontier id for GOTO_FRONTIER, otherwise null>",
+    "steps": <integer 1..max_forward_steps; required for MOVE_FORWARD, omit otherwise>,
     "reason": "short reason (log only)"}}"""
 
 
@@ -364,10 +396,15 @@ EVENT_GUIDANCE = {
         "in that case use fresh RGB and the local map to reveal nearby space, "
         "then END_ADJUST instead of attempting long-range travel. Choose: "
         "MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN, or "
-        "END_ADJUST. Use LOOK_UP/LOOK_DOWN for vertical framing, not as a "
+        "END_ADJUST. MOVE_FORWARD must include \"steps\": an integer from 1 "
+        "to world_state.adjustment.max_forward_steps; each step moves 0.25m "
+        "and steps run one by one until done or a collision stops them — "
+        "choose several when the way ahead is clearly free, one when unsure. "
+        "One action type "
+        "per reply; never combine moving and turning in one decision. "
+        "Use LOOK_UP/LOOK_DOWN for vertical framing, not as a "
         "substitute for changing viewpoint; stay within the pitch limit in "
-        "world_state.adjustment. Execute only one "
-        "motion per observation. Choose END_ADJUST immediately when the "
+        "world_state.adjustment. Choose END_ADJUST immediately when the "
         "view/position is sufficient or further adjustment is unsafe or unhelpful."),
 }
 
@@ -420,7 +457,10 @@ choose the best executable final action from: {actions}.
 
 Use target_id for GOTO_INSTANCE, GOTO_FRONTIER, and REPORT_FOUND. For
 REPORT_FOUND it is required and must equal the active canonical instance id.
-Other actions use null. REPORT_FOUND is scored by DISTANCE, not vision: the
+Other actions use null. MOVE_FORWARD additionally requires "steps": an
+integer 1..world_state.adjustment.max_forward_steps (0.25m each, executed
+one by one until done or a collision stops them). REPORT_FOUND is scored by
+DISTANCE, not vision: the
 harness accepts it when you are within ~1m of the instance or it is the
 active target — a target that left your view because you are very close is
 still reportable. Do not report purely from historical/tool images. FINISH
@@ -435,5 +475,6 @@ Collected tool results (their referenced images remain attached):
 {transcript}
 
 Reply with exactly one JSON object and nothing else:
-{{"action": "{actions}", "target_id": "id or null", "reason": "short reason"}}
+{{"action": "{actions}", "target_id": "id or null",
+  "steps": <required for MOVE_FORWARD only>, "reason": "short reason"}}
 """

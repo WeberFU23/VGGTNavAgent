@@ -170,6 +170,9 @@ class NavAgent(MappingAgent):
         self._target_count = None
         self._selected_evidence = None
         self._arrival_transition_active = False
+        # 到达决策 API 故障计数：transient 失败时保持目标并逐步重试，
+        # 连续失败达到上限才放弃（避免单次网络抖动丢掉已到手的报告）。
+        self._arrival_failures = 0
         # VLM 显式 START_ADJUST/END_ADJUST 控制的通用微调状态。
         self._adjusting = False
         self._adjust_steps = 0
@@ -209,6 +212,13 @@ class NavAgent(MappingAgent):
         self._revisit_targets = {}
         self.revisit_max_attempts = max(1, int(os.environ.get(
             "NAV_REVISIT_MAX_ATTEMPTS", "3")))
+        # 到达决策失败处理：每次 arrival 事件内部先重试 NAV_ARRIVAL_RETRIES
+        # 次；仍失败则保持目标等待下一步重触发，连续失败达到
+        # NAV_ARRIVAL_MAX_FAILURES 才放弃该目标。
+        self.arrival_retries = max(0, int(os.environ.get(
+            "NAV_ARRIVAL_RETRIES", "2")))
+        self.arrival_max_failures = max(1, int(os.environ.get(
+            "NAV_ARRIVAL_MAX_FAILURES", "3")))
         # 决策层状态：近期事件流 + 最近一次探索规划的 frontier 缓存
         self._events = []
         self._last_frontier_clusters = []
@@ -242,11 +252,15 @@ class NavAgent(MappingAgent):
         self._last_explore_plan = -10 ** 9
         self.explore_replan_interval = int(
             os.environ.get("NAV_EXPL_REPLAN_INTERVAL", "25"))
-        # 途中决策间隔：follower 活跃时每 N 步咨询一次 VLM（en_route 事件），
-        # continue 保持当前路径；选其他动作即结束本次导航规划。
-        self.en_route_decision_interval = max(1, int(os.environ.get(
-            "NAV_EN_ROUTE_INTERVAL", "5")))
-        self._last_en_route_step = -10 ** 9
+        # caption 命中中断：follower 活跃期间每 N 步检查一次新关键帧的
+        # caption 与目标短语的 BGE 相关度，超过阈值则打断当前路径交还
+        # 决策层（代替已删除的 en_route 定期轮询）。
+        self.caption_hit_interval = max(1, int(os.environ.get(
+            "NAV_CAPTION_HIT_INTERVAL", "5")))
+        self.caption_hit_min_score = float(os.environ.get(
+            "NAV_CAPTION_HIT_MIN_SCORE", "0.6"))
+        self._last_caption_check_step = -10 ** 9
+        self._caption_hit_max_seen = -1
         self.decision_map_refresh_interval = max(1, int(os.environ.get(
             "NAV_DECISION_MAP_REFRESH_INTERVAL", "5")))
         self.map_max_instances = max(1, int(os.environ.get(
@@ -442,17 +456,22 @@ class NavAgent(MappingAgent):
             return self._explore_recovery_queue.pop(0)
         if self._explore_recovery_stage == 1:
             self._explore_recovery_stage = 0
-            self._plan_exploration(observation, select=True)
-            action = self._explore_follow(observation)
-            if action is not None:
-                return action
+            if self.decision_loop is not None:
+                # 脱困转向完成后交还决策层看新局势，而不是确定性自选
+                # frontier（旧行为会在 VLM 旁路的情况下连续撞墙空转）。
+                self._last_explore_plan = -10 ** 9
+            else:
+                self._plan_exploration(observation, select=True)
+                action = self._explore_follow(observation)
+                if action is not None:
+                    return action
         if not self.explore_enabled:
             return super()._explore_action(observation)
-        # 途中决策：follower 活跃时每 en_route_decision_interval 步咨询一次
-        # VLM。选 CONTINUE_NAVIGATION 保持当前路径；选其他动作即结束本次
-        # 导航规划（follower 在 _en_route_decision 内清理）。
+        # caption 命中中断：follower 活跃期间不再定期咨询 VLM（动作执行到
+        # 底）；只在沿途新关键帧的 caption 与目标高度相关时打断当前路径，
+        # 立即交还决策层。
         if self._explore_follower is not None and self.decision_loop is not None:
-            action = self._en_route_decision(observation)
+            action = self._caption_hit_decision(observation)
             if action is not None:
                 return action
         # 活跃探索路径：跟随；走完后立即尝试选新目标
@@ -498,55 +517,59 @@ class NavAgent(MappingAgent):
             self._explore_follower = None
             self._active_frontier_key = None
             self._active_branch_key = None
-            # 到达短 frontier 后保留正常重规划间隔，避免每一步重新选择
-            # 同一个已经到达的边界。
-            self._last_explore_plan = observation.step_count
+            # 一条路径执行到底后：有决策层时立即交还 VLM（强制下一步触发
+            # world_state_updated 决策）；无决策层时保持原重规划间隔，避免
+            # 每一步重新选择同一个已经到达的边界。
+            self._last_explore_plan = -10 ** 9 \
+                if self.decision_loop is not None else observation.step_count
             return None
         fl.dead_reckon(int(action))
         return int(action)
 
-    def _en_route_decision(self, observation):
-        """follower 活跃期间的周期性完整决策（event=en_route）。
+    def _caption_hit_decision(self, observation):
+        """caption 命中中断：沿途新关键帧的 caption 与目标短语高度相关时，
+        打断当前路径跟随，立即把控制权交还决策层（event=world_state_updated）。
 
-        输入与正常决策一致（当前 RGB + 新 topdown 图；图中橙色 ACTIVE 星
-        标记当前导航目标，即使该 frontier 已从 fN 候选表消失）。选
-        CONTINUE_NAVIGATION 保持当前路径；选任何其他动作即放弃本次导航
-        规划，按正常流程执行。决策层不可用/失败时静默继续跟随，绝不阻塞。
+        模仿 coding agent 的"长命令提前退出"：路径跟随本身不再定期咨询
+        VLM，只有新信息（caption 命中）才中断。返回 None 表示无命中，
+        继续静默跟随。决策层不可用/未命中时绝不阻塞跟随。
         """
-        if observation.step_count - self._last_en_route_step \
-                < self.en_route_decision_interval:
+        if observation.step_count - self._last_caption_check_step \
+                < self.caption_hit_interval:
             return None
-        self._last_en_route_step = observation.step_count
+        self._last_caption_check_step = observation.step_count
         try:
-            result, action = self._decider_next(observation, "en_route")
-        except Exception as exc:
-            self._log_event(f"en_route decision failed: {exc}")
+            enabled, ids = self.client.get_captioned_frame_ids()
+        except Exception:
             return None
-        if result is None:
-            self._log_event("en_route decision unavailable; keep following")
+        if not enabled:
             return None
-        if result.action == "CONTINUE_NAVIGATION":
-            self._log_event(
-                "en_route continue -> "
-                f"{result.target_id or 'active frontier'}")
-            # 路径可能刚走完/被碰撞清理；continue 落空由外层重规划。
-            return self._explore_follow(observation)
-        # 选其他动作 = 结束本次导航规划。注意 GOTO_INSTANCE / GOTO_FRONTIER
-        # / EXPLORE 已在 _decider_next 内部重建导航状态（GOTO_INSTANCE 清掉
-        # 旧 follower 并切 mode="nav"；GOTO_FRONTIER / EXPLORE 激活了新的
-        # frontier follower），这里再清会误杀刚选的新目标、丢回随机游走。
-        if result.action in ("SCAN", "START_ADJUST", "FINISH",
-                             "REPORT_FOUND"):
-            self._explore_follower = None
-            self._active_frontier_key = None
-        self._last_explore_plan = observation.step_count
-        if result.action == "SCAN":
-            # SCAN 由 _decider_next 返回 action=None，在此显式启动环视。
-            self._scanning = True
-            self._scan_steps = 0
-            self._scan_images = []
-            return int(Action.TURN_LEFT)
-        return action
+        new_ids = {int(i) for i in ids
+                   if int(i) > self._caption_hit_max_seen}
+        if not new_ids:
+            return None
+        # 每帧只参与一次命中判定，避免同一命中反复打断。
+        self._caption_hit_max_seen = max(new_ids)
+        query = str(getattr(self, "target_text", "") or "").strip()
+        if not query:
+            return None
+        try:
+            hits = self.client.retrieve_captions(query, top_k=3) or []
+        except Exception:
+            return None
+        hit = next((h for h in hits
+                    if int(h.get("frame_id", -1)) in new_ids), None)
+        if hit is None or float(hit.get("score", 0.0)) \
+                < self.caption_hit_min_score:
+            return None
+        self._log_event(
+            f"caption hit interrupt: frame {hit.get('frame_id')} "
+            f"score={float(hit.get('score', 0.0)):.3f}")
+        self._explore_follower = None
+        self._active_frontier_key = None
+        self._active_branch_key = None
+        return self._choose_high_level_target(
+            observation, "world_state_updated")
 
     def _plan_exploration(self, observation, select=True):
         """重建栅格并刷新可达 frontier；select=False 时只更新候选。"""
@@ -1019,7 +1042,7 @@ class NavAgent(MappingAgent):
         else:
             self._periodic_anchor(observation)
             if self._scanning:
-                # en_route 决策可启动 SCAN（explore 模式下同样消费转圈）。
+                # SCAN 期间消费转圈动作（explore/nav 模式共用）。
                 action = self._handle_scan(observation)
             else:
                 action = self._explore_action(observation)
@@ -1055,6 +1078,7 @@ class NavAgent(MappingAgent):
         self._scan_steps = 0
         self._scan_images = []
         self._selected_evidence = None
+        self._arrival_failures = 0
 
     def _handle_arrival_transition(self, observation):
         """Enter the arrival decision exactly once from every nav call path."""
@@ -1071,11 +1095,22 @@ class NavAgent(MappingAgent):
         finally:
             self._arrival_transition_active = False
         if result is None:
+            self._arrival_failures += 1
+            if self._arrival_failures < self.arrival_max_failures:
+                # 保持目标与 nav 模式：下一步仍在到达半径内，会重新触发
+                # arrival 决策。返回无害转向让仿真推进一格观测。
+                self._log_event(
+                    f"arrival decision unavailable "
+                    f"({self._arrival_failures}/{self.arrival_max_failures}); "
+                    "keep target and retry next step")
+                return int(Action.TURN_LEFT)
             self._log_event(
-                "arrival decision unavailable; leaving candidate without report")
+                "arrival decision unavailable after retries; "
+                "leaving candidate without report")
             self._clear_current_target()
             self.mode = "explore"
             return self._explore_action(observation)
+        self._arrival_failures = 0
         if result.action == "REPORT_FOUND":
             return self._report_found(result.target_id)
         if result.action == "SCAN":
@@ -1314,6 +1349,14 @@ class NavAgent(MappingAgent):
         self._events.append(str(message))
         if len(self._events) > 50:
             self._events = self._events[-50:]
+        # 关键事件同时落盘（revisit 调度、frontier 失败等），便于赛后诊断。
+        try:
+            path = os.path.join(self.output_dir, "events.log")
+            step = getattr(self._last_observation, "step_count", "?")
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(f"[step {step}] {message}\n")
+        except Exception:
+            pass
 
     def _tool_search_frames(self, query, top_k=5):
         """决策层只读工具：caption 语义记忆检索（纯检索，不 ground）。"""
@@ -1766,9 +1809,16 @@ class NavAgent(MappingAgent):
             cid = proposal["candidate_id"]
             row = (resolved_rows.get(cid) or {})
             if not row.get("found"):
+                num_pts = int(row.get("num_points") or 0)
                 geometry_rejections.append({"candidate_id": cid,
-                    "reason": str(row.get("error") or "no valid 3D depth")[:240]})
+                    "reason": (str(row.get("error") or "no valid 3D depth")
+                               + f" (valid_points={num_pts})")[:240]})
                 proposal["status"] = "geometry_rejected"
+                # 几何拒绝的像素同样进拒绝名单：防止 VLM 反复 commit 同一帧
+                # 同一位置空转；走近重拍发生在新帧上，不受此拦截。
+                self._record_rejected_spot(
+                    proposal["frame_id"], proposal["pixel_norm"],
+                    f"geometry_rejected valid_points={num_pts}")
                 # 不丢弃：导航到该帧拍摄位姿附近重新观察，近处深度更可靠。
                 self._schedule_revisit(proposal["frame_id"])
                 continue
@@ -1896,11 +1946,17 @@ class NavAgent(MappingAgent):
                 cid = str(hit.get("candidate_id"))
                 row = resolved.get(cid) or {}
                 if not row.get("found"):
+                    num_pts = int(row.get("num_points") or 0)
                     geometry_rejections.append({
                         "candidate_id": cid, "frame_id": hit.get("frame_id"),
                         "pixel": hit.get("pixel_norm") or hit.get("pixel"),
                         "reason":
-                        str(row.get("error") or "no valid 3D depth")[:240]})
+                        (str(row.get("error") or "no valid 3D depth")
+                         + f" (valid_points={num_pts})")[:240]})
+                    self._record_rejected_spot(
+                        hit.get("frame_id"),
+                        hit.get("pixel_norm") or hit.get("pixel"),
+                        f"geometry_rejected valid_points={num_pts}")
                     # 不丢弃：导航到该帧拍摄位姿附近重新观察。
                     self._schedule_revisit(hit.get("frame_id"))
                     continue
@@ -2230,6 +2286,7 @@ class NavAgent(MappingAgent):
                 self._explore_follower = None
                 self._active_frontier_key = None
                 self._log_event(f"decider -> GOTO_INSTANCE {nd.iid}")
+                self._arrival_failures = 0
                 if self._plan_to_target(observation):
                     self.mode = "nav"
                     return True
@@ -2324,7 +2381,7 @@ class NavAgent(MappingAgent):
                     event=str(event))
             images = list(images or [])
             if event in ("world_state_updated", "arrival", "scan_complete",
-                         "adjustment", "en_route", "nav_failed") and not any(
+                         "adjustment", "nav_failed") and not any(
                              label == "current_observation"
                              for label, _payload in images):
                 images.insert(0, (
@@ -2794,8 +2851,15 @@ class NavAgent(MappingAgent):
                    self.vlm.encode_rgb(observation.rgb))]
         if self._selected_evidence:
             images.append(("selected_candidate", self._selected_evidence))
-        return self._decider_next(
-            observation, "arrival", images=images, state_fn=arrival_state)
+        # transient API 故障直接放弃会丢掉已到手的报告：先就地重试。
+        result, action = None, None
+        for attempt in range(1 + self.arrival_retries):
+            result, action = self._decider_next(
+                observation, "arrival", images=images, state_fn=arrival_state)
+            if result is not None:
+                break
+            self._log_event(f"arrival decision retry {attempt + 1} failed")
+        return result, action
 
     def _block_failed_nav_direction(self, observation, follower=None):
         """把最近撞上的前向小段临时作为障碍，避免 A* 原样重走。"""

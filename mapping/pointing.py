@@ -230,9 +230,11 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
     避开边缘）：point 有像素级误差时 bbox 通常更可靠。point 远离
     bbox 导致窗口交集为空时，退化为在 bbox 内区中心开小窗采样。
 
-    先按 conf 过滤低分点再取中位数。返回 {found, point, num_points,
-    depth_std, spread}；depth_std 是 patch 内点到相机原点距离的标准差
-    （cam_origin 缺省时用世界原点），作为实例的几何证据供 VLM 判断。
+    不做 conf 硬过滤（对远处弱纹理物体会系统性误杀）：只排除非有限值，
+    按深度 10-90 分位修剪离群点后取中位数。conf 图仅作诊断参考。
+    返回 {found, point, num_points, depth_std, spread}；depth_std 是采样
+    点到相机原点距离的标准差（cam_origin 缺省时用世界原点），作为实例的
+    几何证据供 VLM 判断。
     """
     points = np.asarray(points_hw3, dtype=np.float64)
     conf = np.asarray(conf_mask_hw, dtype=bool)
@@ -242,21 +244,29 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
     half = max(int(patch), 1) // 2
     x, y = int(round(pixel[0])), int(round(pixel[1]))
 
-    # SAM mask 优先：在物体完整范围内采样，避免 patch 边缘混入背景。
-    # mask 内有效点不足时退回 patch/bbox 窗口。
+    # SAM mask 优先：在物体完整范围内采样。只用有限值过滤 + 中位数（目标
+    # 只需"目标附近可导航"的 3D 点，conf 硬阈值对远处弱纹理家具系统性
+    # 误杀）；按深度 10-90 分位修剪砍掉穿透背景/贴镜头的离群点。
+    # mask 内有效点不足时退回 patch/bbox 窗口（同样不做 conf 硬过滤）。
     if mask_hw is not None:
         mask = np.asarray(mask_hw, dtype=bool)
         if mask.shape == (h, w):
-            sel = mask & conf & np.isfinite(points).all(axis=2)
+            sel = mask & np.isfinite(points).all(axis=2)
             valid = points[sel]
             if len(valid) >= int(min_points):
-                if len(valid) > int(max_mask_points):
-                    idx = np.random.choice(
-                        len(valid), int(max_mask_points), replace=False)
-                    valid = valid[idx]
                 origin = (np.asarray(cam_origin, dtype=np.float64)
                           if cam_origin is not None else np.zeros(3))
                 depths = np.linalg.norm(valid - origin, axis=1)
+                # 先按深度 10-90 分位修剪离群点，再子采样（num_points 保持
+                # 等于 max_mask_points 上限，便于诊断口径一致）。
+                lo, hi = np.percentile(depths, 10), np.percentile(depths, 90)
+                keep = (depths >= lo) & (depths <= hi)
+                if int(keep.sum()) >= int(min_points):
+                    valid, depths = valid[keep], depths[keep]
+                if len(valid) > int(max_mask_points):
+                    idx = np.random.choice(
+                        len(valid), int(max_mask_points), replace=False)
+                    valid, depths = valid[idx], depths[idx]
                 return {
                     "found": True,
                     "point": np.median(valid, axis=0),
@@ -291,7 +301,7 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
             x0, x1, y0, y1 = _window(
                 min(max(bx, 0), w - 1), min(max(by, 0), h - 1))
     patch_pts = points[y0:y1, x0:x1, :].reshape(-1, 3)
-    patch_ok = conf[y0:y1, x0:x1].reshape(-1) & np.isfinite(patch_pts).all(axis=1)
+    patch_ok = np.isfinite(patch_pts).all(axis=1)
     valid = patch_pts[patch_ok]
     if len(valid) < int(min_points):
         return {"found": False, "point": None, "num_points": int(len(valid)),
@@ -299,6 +309,10 @@ def sample_point_depth(points_hw3, conf_mask_hw, pixel, patch=11,
     origin = (np.asarray(cam_origin, dtype=np.float64)
               if cam_origin is not None else np.zeros(3))
     depths = np.linalg.norm(valid - origin, axis=1)
+    lo, hi = np.percentile(depths, 10), np.percentile(depths, 90)
+    keep = (depths >= lo) & (depths <= hi)
+    if int(keep.sum()) >= int(min_points):
+        valid, depths = valid[keep], depths[keep]
     return {
         "found": True,
         "point": np.median(valid, axis=0),

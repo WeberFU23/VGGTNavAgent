@@ -291,6 +291,14 @@ VLM 必须输出一个 JSON 对象：
 
 动作语义要点：
 
+- **执行到底（coding-agent 式动作）**：`GOTO_FRONTIER`/`GOTO_INSTANCE`
+  选定后由 harness 沿预计算路径静默执行到底，途中**不再定期咨询 VLM**
+  （旧 en_route 轮询与 `CONTINUE_NAVIGATION` 已删除）。路径走完、走丢或
+  碰撞恢复后立即触发一次 `world_state_updated` 决策交还 VLM；唯一的
+  中途打断是 caption 命中中断——follower 活跃期间每
+  `NAV_CAPTION_HIT_INTERVAL`（默认 5）步检查新关键帧 caption 与目标
+  短语的 BGE 相关度，top 命中为新帧且 score ≥ `NAV_CAPTION_HIT_MIN_SCORE`
+  （默认 0.6）时打断当前路径并立即决策。每个新帧只参与一次命中判定；
 - `GOTO_INSTANCE`：到达目标的方式就是"先实例化再导航"——对只存在于
   图像中的目标盲目走 frontier 是无效的；
 - `REPORT_FOUND`：报告**已走到附近**的 active canonical instance，并创建

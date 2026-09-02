@@ -15,7 +15,7 @@ import time
 
 from decision.prompts import build_decision_prompt, build_final_decision_prompt
 
-ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER", "CONTINUE_NAVIGATION",
+ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER",
            "REPORT_FOUND", "SCAN", "EXPLORE", "FINISH", "START_ADJUST",
            "END_ADJUST", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT",
            "LOOK_UP", "LOOK_DOWN")
@@ -46,11 +46,6 @@ EVENT_ACTIONS = {
     # VLM 换目标/探索/局部调整；REPORT_FOUND 仅在能直接确认时使用。
     "nav_failed": {"GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
                    "SCAN", "FINISH", "START_ADJUST"},
-    # 途中决策：CONTINUE_NAVIGATION 只在此事件放行；选其他动作即放弃
-    # 当前导航规划，按正常流程执行（导航目标在图上是橙色 ACTIVE 星，
-    # 可能已从 fN 候选表消失——见 prompts.py en_route 说明）。
-    "en_route": {"CONTINUE_NAVIGATION", "GOTO_INSTANCE", "GOTO_FRONTIER",
-                 "REPORT_FOUND", "SCAN", "FINISH", "START_ADJUST"},
     "finish_check": {"GOTO_INSTANCE", "GOTO_FRONTIER", "FINISH"},
     "adjustment": {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "LOOK_UP",
                    "LOOK_DOWN", "END_ADJUST"},

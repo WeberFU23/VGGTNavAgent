@@ -355,9 +355,13 @@ def test_instantiate_points_geometry_rejection_when_depth_invalid():
     out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert out["instances"] == []
     assert "pending_confirmation" not in out
-    assert out["geometry_rejections"] == [{
-        "candidate_id": "c5", "frame_id": 5,
-        "pixel": [637.1, 359.1], "reason": "no valid depth"}]
+    rej = out["geometry_rejections"]
+    assert len(rej) == 1
+    assert rej[0]["candidate_id"] == "c5" and rej[0]["frame_id"] == 5
+    assert rej[0]["pixel"] == [637.1, 359.1]
+    # 诊断信息：reason 带有效采样点数
+    assert rej[0]["reason"].startswith("no valid depth")
+    assert "valid_points=" in rej[0]["reason"]
     assert agent.memory.nodes == []
 
 
@@ -424,8 +428,9 @@ def test_geometry_rejection_records_revisit_target():
     entry = agent._revisit_targets[5]
     assert entry["attempts"] == 1
     assert np.allclose(entry["point"], [1.0, 2.0, 0.5])
-    # 同一帧不接受被拒记忆（geometry 失败≠语义否定）
-    assert (5, 637, 359) not in agent._rejected_spots
+    # 几何拒绝的像素也进被拒记忆：阻止对同一帧同一位置反复 commit
+    # 空转；走近重拍发生在新帧上，不受此拦截。
+    assert (5, 637, 359) in agent._rejected_spots
 
 
 def test_revisit_attempts_capped_at_max():

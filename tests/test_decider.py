@@ -358,16 +358,13 @@ def test_scan_complete_reselects_globally_instead_of_reporting():
     assert result.action == "REPORT_FOUND"
 
 
-def test_continue_navigation_is_en_route_only():
+def test_continue_navigation_removed_from_contract():
+    # CONTINUE_NAVIGATION 已随 en_route 轮询一起删除：任何事件都拒绝。
     state = _state()
     state["navigation"]["active_target"] = {
         "type": "frontier", "id": "active_frontier"}
-    result = DecisionLoop(_ScriptedChat([
-        {"action": "CONTINUE_NAVIGATION"}])).decide("en_route", state)
-    assert result.action == "CONTINUE_NAVIGATION"
-    assert result.target_id is None
-    # 其他事件拒绝 CONTINUE_NAVIGATION → 校验失败重试
-    for event in ("world_state_updated", "arrival", "scan_complete"):
+    for event in ("world_state_updated", "arrival", "scan_complete",
+                  "nav_failed", "finish_check"):
         chat = _ScriptedChat([
             {"action": "CONTINUE_NAVIGATION"},
             {"action": "GOTO_FRONTIER", "target_id": "f0"},
@@ -376,28 +373,12 @@ def test_continue_navigation_is_en_route_only():
         assert result.action == "GOTO_FRONTIER"
 
 
-def test_en_route_can_abandon_path_for_new_target():
-    for action, target_id in (("GOTO_INSTANCE", "1"),
-                              ("GOTO_FRONTIER", "f0")):
-        result = DecisionLoop(_ScriptedChat([{
-            "action": action, "target_id": target_id
-        }])).decide("en_route", _state())
-        assert result.action == action and result.target_id == target_id
-
-
-def test_prompt_documents_continue_navigation_and_en_route_guidance():
+def test_prompt_documents_run_to_completion_navigation():
     prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
-        "en_route", _state())
-    assert "CONTINUE_NAVIGATION" in prompt
-    assert "orange" in prompt and "ACTIVE star" in prompt
-    assert "abandons the current path" in prompt
-    assert "mid-navigation" in prompt
-    # world_state_updated 的普通决策也知晓该动作（契约部分），
-    # 但 en_route 引导只出现在 en_route 事件。
-    plain = DecisionLoop(_ScriptedChat([]))._build_prompt(
         "world_state_updated", _state())
-    assert "CONTINUE_NAVIGATION" in plain
-    assert "mid-navigation" not in plain
+    assert "CONTINUE_NAVIGATION" not in prompt
+    assert "executes the whole path" in prompt
+    assert "interrupts the leg early" in prompt
 
 
 def test_report_found_requires_active_canonical_instance_id():
@@ -720,84 +701,100 @@ def _make_agent():
     return agent
 
 
-def test_en_route_decision_throttles_by_interval():
+def test_caption_hit_decision_throttles_by_interval():
     agent = _make_agent()
     agent.decision_loop = SimpleNamespace()
     agent._explore_follower = object()
+    agent._last_caption_check_step = 10
+    assert agent._caption_hit_decision(
+        SimpleNamespace(step_count=13)) is None  # 间隔内不检查
+
+
+def _caption_hit_agent(captioned_ids, hits):
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_follower = object()
+    agent._active_frontier_key = (1, 2)
+    agent._active_branch_key = (3, 4)
+    agent.client = SimpleNamespace(
+        get_captioned_frame_ids=lambda: (True, captioned_ids),
+        retrieve_captions=lambda text, top_k=3: hits)
+    return agent
+
+
+def test_caption_hit_no_new_frames_keeps_following():
+    agent = _caption_hit_agent(captioned_ids=[3, 4], hits=[])
+    agent._caption_hit_max_seen = 4
+    assert agent._caption_hit_decision(
+        SimpleNamespace(step_count=20)) is None
+    assert agent._explore_follower is not None
+
+
+def test_caption_hit_below_score_keeps_following():
+    agent = _caption_hit_agent(
+        captioned_ids=[9],
+        hits=[{"frame_id": 9, "score": 0.4, "caption": "curtain"}])
+    assert agent._caption_hit_decision(
+        SimpleNamespace(step_count=20)) is None
+    assert agent._explore_follower is not None
+    assert agent._caption_hit_max_seen == 9  # 每帧只判定一次
+
+
+def test_caption_hit_old_frame_top1_keeps_following():
+    # 最高分是旧帧（之前已判定过）不算新命中。
+    agent = _caption_hit_agent(
+        captioned_ids=[9],
+        hits=[{"frame_id": 2, "score": 0.9, "caption": "chair"}])
+    assert agent._caption_hit_decision(
+        SimpleNamespace(step_count=20)) is None
+    assert agent._explore_follower is not None
+
+
+def test_caption_hit_interrupts_leg_and_consults_vlm():
+    agent = _caption_hit_agent(
+        captioned_ids=[9],
+        hits=[{"frame_id": 9, "score": 0.75, "caption": "wooden chair"}])
     calls = []
-    agent._decider_next = lambda obs, event: (
-        calls.append(event) or SimpleNamespace(
-            action="CONTINUE_NAVIGATION", target_id=None), None)
-    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
-    agent._last_en_route_step = 10
-    assert agent._en_route_decision(SimpleNamespace(step_count=13)) is None
-    assert calls == []  # 间隔内不触发
-    action = agent._en_route_decision(SimpleNamespace(step_count=15))
-    assert calls == ["en_route"]
+    agent._choose_high_level_target = lambda obs, event: (
+        calls.append(event) or int(Action.MOVE_FORWARD))
+    action = agent._caption_hit_decision(SimpleNamespace(step_count=20))
+    assert calls == ["world_state_updated"]
     assert action == int(Action.MOVE_FORWARD)
-
-
-def test_en_route_continue_keeps_follower():
-    agent = _make_agent()
-    agent.decision_loop = SimpleNamespace()
-    agent._explore_follower = object()
-    agent._active_frontier_key = (1, 2)
-    agent._last_en_route_step = 0
-    agent._decider_next = lambda obs, event: (
-        SimpleNamespace(action="CONTINUE_NAVIGATION", target_id=None), None)
-    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
-    action = agent._en_route_decision(SimpleNamespace(step_count=5))
-    assert action == int(Action.MOVE_FORWARD)
-    assert agent._explore_follower is not None  # continue 不清 follower
-    assert agent._active_frontier_key == (1, 2)
-
-
-def test_en_route_goto_frontier_keeps_new_follower():
-    # GOTO_FRONTIER 由 _decider_next 内部重建 follower；en_route 不能再清。
-    agent = _make_agent()
-    agent.decision_loop = SimpleNamespace()
-    agent._explore_follower = object()
-    agent._active_frontier_key = (1, 2)
-    agent._last_en_route_step = 0
-    agent._decider_next = lambda obs, event: (
-        SimpleNamespace(action="GOTO_FRONTIER", target_id="f0"),
-        int(Action.MOVE_FORWARD))
-    agent._explore_follow = lambda obs: int(Action.MOVE_FORWARD)
-    obs = SimpleNamespace(step_count=5)
-    action = agent._en_route_decision(obs)
-    assert action == int(Action.MOVE_FORWARD)
-    assert agent._explore_follower is not None  # 新 follower 保留
-    assert agent._active_frontier_key == (1, 2)
-    assert agent._last_explore_plan == 5
-
-
-def test_en_route_scan_abandons_path_and_starts_spin():
-    agent = _make_agent()
-    agent.decision_loop = SimpleNamespace()
-    agent._explore_follower = object()
-    agent._active_frontier_key = (1, 2)
-    agent._last_en_route_step = 0
-    agent._decider_next = lambda obs, event: (
-        SimpleNamespace(action="SCAN", target_id=None), None)
-    action = agent._en_route_decision(SimpleNamespace(step_count=5))
-    assert action == int(Action.TURN_LEFT)
-    assert agent._explore_follower is None
+    assert agent._explore_follower is None      # 打断当前路径
     assert agent._active_frontier_key is None
-    assert agent._scanning is True
+    assert agent._active_branch_key is None
 
 
-def test_en_route_decision_failure_keeps_following():
+def test_caption_hit_rpc_failure_keeps_following():
     agent = _make_agent()
     agent.decision_loop = SimpleNamespace()
     agent._explore_follower = object()
-    agent._last_en_route_step = 0
 
-    def boom(obs, event):
-        raise RuntimeError("model unavailable")
+    def boom(*a, **k):
+        raise RuntimeError("server unavailable")
 
-    agent._decider_next = boom
-    assert agent._en_route_decision(
-        SimpleNamespace(step_count=5)) is None
+    agent.client = SimpleNamespace(get_captioned_frame_ids=boom)
+    assert agent._caption_hit_decision(
+        SimpleNamespace(step_count=20)) is None
+
+
+def test_follower_leg_end_forces_immediate_decision_with_vlm():
+    # 路径执行到底后：有决策层时立即触发 world_state_updated 决策，
+    # 而不是再等 explore_replan_interval 步。
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    follower = SimpleNamespace(
+        anchor_frame=2, dead_reckon=lambda a: None,
+        next_action=lambda: (None, True))
+    agent._explore_follower = follower
+    calls = []
+    agent._choose_high_level_target = lambda obs, event: (
+        calls.append(event) or int(Action.MOVE_FORWARD))
+    action = agent._explore_action(SimpleNamespace(
+        step_count=50, previous_action=int(Action.MOVE_FORWARD)))
+    assert calls == ["world_state_updated"]
+    assert action == int(Action.MOVE_FORWARD)
+    assert agent._explore_follower is None
 
 
 def test_world_state_contains_text_evidence_and_no_anchor_table():

@@ -239,18 +239,15 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   the task. This is how you reach a target: use instantiate_points
   first, then GOTO_INSTANCE. Approaching a seen-but-not-
   instantiated object through
-  frontiers or adjustment does not work.
+  frontiers or adjustment does not work. The harness follows the whole
+  path by itself and returns control to you on arrival or failure.
 - GOTO_FRONTIER id: follow the precomputed path to an exploration frontier.
-  New frames are collected along the way and listed in new_keyframes at
-  the next decision. Prefer a frontier in an untried branch rather than
+  The harness executes the whole path by itself — you are NOT consulted
+  again until the path completes, fails, or a passing keyframe caption
+  strongly matches the task (which interrupts the leg early). New frames
+  collected along the way are listed in new_keyframes at that next
+  decision. Prefer a frontier in an untried branch rather than
   repeatedly selecting the first marker in a stalled branch.
-- CONTINUE_NAVIGATION (en_route only): keep following the precomputed path
-  to the current navigation goal — the orange ACTIVE star on the topdown
-  map. That frontier may no longer appear as an fN diamond in the fresh
-  candidate table: it is still your current destination, keep moving
-  toward it. Prefer CONTINUE_NAVIGATION while navigating unless the
-  current view or map shows a clearly better option; choosing any other
-  action abandons the current path.
 - SCAN: spin 360 degrees in place (12 left turns, four sampled views).
   It only shows what is visible from your current position — it cannot
   reveal other sides of an object, so it cannot verify a candidate. Use
@@ -305,7 +302,7 @@ observations have been collected, so retrieval tools will return nothing.
 SCAN to look around, or pick a frontier to move to first.
 
 Finally reply with exactly one JSON object and nothing else:
-  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|CONTINUE_NAVIGATION|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
+  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|FINISH|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
     "target_id": "<instance id for GOTO_INSTANCE/REPORT_FOUND, frontier id for GOTO_FRONTIER, otherwise null>",
     "steps": <integer 1..max_forward_steps; required for MOVE_FORWARD, omit otherwise>,
     "reason": "short reason (log only)"}}"""
@@ -360,19 +357,6 @@ EVENT_GUIDANCE = {
         "GOTO_INSTANCE, GOTO_FRONTIER, or START_ADJUST when a short "
         "local active-exploration movement would reveal useful nearby "
         "space or correct the current camera pose."),
-    "en_route": (
-        "\nYou are mid-navigation toward the goal marked by the orange "
-        "ACTIVE star on the topdown map (navigation.active_target); the map "
-        "and frontier table are fresh, but the star's frontier may have "
-        "vanished from the fN diamonds — it is still your current "
-        "destination. New keyframes/captions reflect scenes you passed "
-        "along the way: check them for the target. Prefer "
-        "CONTINUE_NAVIGATION to keep the current path. Choose a different "
-        "action only when the current view or refreshed map shows a clearly "
-        "better option — e.g. the target visible ahead (then instantiate or "
-        "START_ADJUST for a closer look), a promising instance, or a "
-        "frontier leading into a new region. Choosing any other action "
-        "abandons the current path and restarts planning."),
     "finish_check": (
         "\nFINISH is irreversible. Inspect instance memory and task progress "
         "before deciding."),

@@ -176,25 +176,26 @@ def test_sample_median_point():
     conf = np.ones(pts.shape[:2], dtype=bool)
     out = sample_point_depth(pts, conf, pixel=(10, 10), patch=11)
     assert out["found"] is True
-    assert out["num_points"] == 121
+    # 121 个 patch 点经 10-90 分位深度修剪后约剩 80%
+    assert out["num_points"] == 98
     np.testing.assert_allclose(out["point"], [10, 10, 2.0], atol=0.6)
 
 
-def test_sample_filters_low_confidence():
+def test_sample_ignores_confidence():
+    # conf 不再做硬过滤（远处弱纹理目标会被固定阈值系统性误杀）：
+    # 全部为低 conf 时仍按有限值采样。
     pts = _grid()
-    conf = np.ones(pts.shape[:2], dtype=bool)
-    conf[:, :] = False
-    conf[10, 10] = True
-    out = sample_point_depth(pts, conf, pixel=(10, 10), patch=11,
-                             min_points=1)
+    conf = np.zeros(pts.shape[:2], dtype=bool)
+    out = sample_point_depth(pts, conf, pixel=(10, 10), patch=11)
     assert out["found"] is True
-    assert out["num_points"] == 1
-    np.testing.assert_allclose(out["point"], [10, 10, 2.0])
+    np.testing.assert_allclose(out["point"], [10, 10, 2.0], atol=0.6)
 
 
 def test_sample_too_few_points():
+    # 只有非有限值（NaN）才会让采样失败。
     pts = _grid()
-    conf = np.zeros(pts.shape[:2], dtype=bool)
+    pts[:, :] = np.nan
+    conf = np.ones(pts.shape[:2], dtype=bool)
     out = sample_point_depth(pts, conf, pixel=(5, 5), patch=11)
     assert out["found"] is False
     assert out["point"] is None

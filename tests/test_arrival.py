@@ -441,4 +441,69 @@ if __name__ == "__main__":
     test_scan_is_general_panorama_without_target_grounding()
     test_adjustment_move_forward_repeats_steps_without_vlm()
     test_adjustment_forward_repeat_aborts_on_collision()
+    test_arrival_api_failure_retries_inline()
+    test_arrival_persistent_failure_keeps_target_then_abandons()
+    test_explore_collision_recovery_hands_back_to_vlm()
     print("arrival tests passed")
+
+
+def test_arrival_api_failure_retries_inline():
+    """arrival 决策 API transient 故障：事件内就地重试，不丢报告。"""
+    agent = _make_agent()
+    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    agent.target_instance_id = node.iid
+    agent.client = _MockClient()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
+    agent._build_decider_input = lambda obs: ({"instances": [], "task": {}}, None)
+    calls = []
+
+    def decide(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            return None  # 前两次 API 故障
+        return DecisionResult("REPORT_FOUND", str(node.iid))
+
+    agent.decision_loop = SimpleNamespace(decide=decide)
+    result, _ = agent._arrival_vlm_decision(_obs())
+    assert result.action == "REPORT_FOUND"
+    assert len(calls) == 3  # 1 次原始 + 2 次重试
+
+
+def test_arrival_persistent_failure_keeps_target_then_abandons():
+    """连续失败：保持目标逐步重触发；达到上限才放弃并回探索。"""
+    agent = _make_agent()
+    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    agent.target_instance_id = node.iid
+    agent.target_point = np.array([1.0, 2.0, 0.0])
+    agent.mode = "nav"
+    agent.client = _MockClient()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"jpeg")
+    agent._build_decider_input = lambda obs: ({"instances": [], "task": {}}, None)
+    agent.decision_loop = SimpleNamespace(decide=lambda *a, **k: None)
+    agent._explore_action = lambda obs: int(Action.TURN_RIGHT)
+    agent.arrival_retries = 0  # 隔离测试跨步保持逻辑
+    agent.arrival_max_failures = 3
+    for _ in range(2):
+        action = agent._handle_arrival_transition(_obs())
+        assert action == int(Action.TURN_LEFT)
+        assert agent.mode == "nav" and agent.target_instance_id == node.iid
+    action = agent._handle_arrival_transition(_obs())
+    assert action == int(Action.TURN_RIGHT)
+    assert agent.mode == "explore" and agent.target_instance_id is None
+
+
+def test_explore_collision_recovery_hands_back_to_vlm():
+    """脱困转向完成后交还决策层（world_state_updated），不再确定性自选
+    frontier 绕过 VLM。"""
+    agent = _make_agent()
+    agent.decision_loop = SimpleNamespace()
+    agent._explore_recovery_stage = 1
+    agent._explore_follower = None
+    agent._last_explore_plan = 90
+    calls = []
+    agent._choose_high_level_target = lambda obs, event: (
+        calls.append(event) or int(Action.MOVE_FORWARD))
+    action = agent._explore_action(
+        _obs(step=100, previous_action=int(Action.TURN_LEFT)))
+    assert calls == ["world_state_updated"]
+    assert action == int(Action.MOVE_FORWARD)

@@ -47,7 +47,7 @@ class NavAgent(MappingAgent):
         self.nav_block_radius_m = max(0.1, float(os.environ.get(
             "NAV_NAV_BLOCK_RADIUS_M", "0.35")))
         self.nav_block_ttl_steps = max(1, int(os.environ.get(
-            "NAV_NAV_BLOCK_TTL_STEPS", "80")))
+            "NAV_NAV_BLOCK_TTL_STEPS", "30")))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
         self.finish_patience = int(os.environ.get("NAV_FINISH_PATIENCE", "5"))
         self.finish_frontier_patience = int(os.environ.get(
@@ -819,13 +819,31 @@ class NavAgent(MappingAgent):
         current = snapshot.get("scale")
         if current is None:
             snapshot.update(scale=candidate, source=str(source), revision=1,
-                            pending=None, pending_count=0)
+                            pending=None, pending_count=0, far_count=0)
             return candidate
         relative = abs(candidate - current) / max(abs(current), 1e-6)
         if relative <= 0.12:
             snapshot.update(scale=candidate, source=str(source),
-                            pending=None, pending_count=0)
+                            pending=None, pending_count=0, far_count=0)
             return candidate
+        # 自愈逃生口：候选持续大幅偏离 current（>2x 或 <0.5x）说明 current
+        # 大概率是坏种子。候选彼此抖动凑不齐 3 连时（pending 机制失效），
+        # 累计 far_count 次大幅偏离后强制切换，避免错误尺度终身锁死。
+        if relative > 0.5:
+            far_count = int(snapshot.get("far_count", 0)) + 1
+            snapshot["far_count"] = far_count
+            if far_count >= 5:
+                snapshot.update(scale=candidate, source=str(source),
+                                revision=int(snapshot.get("revision", 0)) + 1,
+                                pending=None, pending_count=0, far_count=0)
+                self._invalidate_metric_navigation()
+                self._log_event(
+                    f"metric scale snapshot force-switched to "
+                    f"{candidate:.3f} ({source}); old={current:.3f} "
+                    f"persistently mismatched")
+                return float(snapshot["scale"])
+        else:
+            snapshot["far_count"] = 0
         pending = snapshot.get("pending")
         if pending is not None and abs(candidate - pending) / max(
                 abs(pending), 1e-6) <= 0.12:
@@ -836,7 +854,7 @@ class NavAgent(MappingAgent):
         if snapshot["pending_count"] >= 3:
             snapshot.update(scale=candidate, source=str(source),
                             revision=int(snapshot.get("revision", 0)) + 1,
-                            pending=None, pending_count=0)
+                            pending=None, pending_count=0, far_count=0)
             self._invalidate_metric_navigation()
             self._log_event(
                 f"metric scale snapshot switched to {candidate:.3f} ({source})")
@@ -2887,7 +2905,9 @@ class NavAgent(MappingAgent):
         if not self._nav_blocked_points:
             return
         radius_cells = max(1, int(math.ceil(
-            self.nav_block_radius_m / max(float(self.grid.res), 1e-6))))
+            self.nav_block_radius_m /
+            (self._metric_scale_value() or 1.0) /
+            max(float(self.grid.res), 1e-6))))
         height, width = self.grid.free.shape
         for point, _expiry in self._nav_blocked_points:
             row, col = self.grid.world_to_cell(point)

@@ -1017,3 +1017,58 @@ def test_activate_memory_target_skips_unreachable():
     assert agent._activate_memory_target(obs)
     assert agent.target_instance_id == 2
     assert agent.mode == "nav"
+
+
+def test_metric_snapshot_force_switch_after_persistent_far_mismatch():
+    """坏种子锁死自愈：候选持续 >2x 偏离 current 但彼此抖动凑不齐 3 连时，
+    累计 5 次大幅偏离后强制切换到最新候选。"""
+    agent = _make_agent()
+    assert agent._update_metric_snapshot(7.4, "grid") == 7.4  # 坏种子
+    # 候选彼此差 >12%（pending 机制凑不齐 3 连），但都 >0.5x 偏离 current
+    for value in (1.0, 3.0, 0.9, 3.3):
+        assert agent._update_metric_snapshot(value, "calib") == 7.4
+    assert agent._update_metric_snapshot(1.1, "calib") == 1.1
+    assert agent._metric_snapshot["far_count"] == 0
+    assert agent._metric_snapshot["revision"] == 2
+
+
+def test_metric_snapshot_far_count_resets_when_candidate_matches_current():
+    agent = _make_agent()
+    agent._update_metric_snapshot(7.4, "grid")
+    for value in (1.0, 3.0, 0.95):
+        agent._update_metric_snapshot(value, "calib")
+    assert agent._metric_snapshot["far_count"] == 3
+    assert agent._update_metric_snapshot(7.0, "calib") == 7.0  # 直接接受
+    assert agent._metric_snapshot["far_count"] == 0
+    agent._update_metric_snapshot(1.0, "calib")
+    assert agent._metric_snapshot["far_count"] == 1
+
+
+class _FakeGrid:
+    def __init__(self, res):
+        self.res = res
+        self.free = np.ones((101, 101), dtype=bool)
+        self.obstacle = np.zeros((101, 101), dtype=bool)
+
+    def world_to_cell(self, point):
+        return 50, 50
+
+
+def _blocked_cell_count(scale):
+    agent = _make_agent()
+    agent.grid = _FakeGrid(0.1)
+    agent._update_metric_snapshot(scale, "test")
+    agent._nav_blocked_points = [((0.0, 0.0), 999)]
+    agent._apply_nav_temporary_blocks(SimpleNamespace(step_count=0))
+    return int((~agent.grid.free).sum())
+
+
+def test_nav_block_radius_scaled_to_metric():
+    """封锁盘半径是米制 0.35m：尺度大时栅格半径必须按 1/scale 缩小，
+    否则错误尺度会把 agent 自己围死。"""
+    small = _blocked_cell_count(1.0)
+    large = _blocked_cell_count(7.4)
+    assert large < small
+    # scale=1: ceil(0.35/1/0.1)=4 格半径 -> 49 格; scale=7.4: 1 格 -> 5 格
+    assert small == 49
+    assert large == 5

@@ -20,6 +20,8 @@ from agents.nav_agent import NavAgent
 def _make_agent(scale=0.42):
     agent = NavAgent()
     agent.calibrator = SimpleNamespace(current_scale=lambda: scale)
+    agent._metric_snapshot.update(scale=scale, source="test", revision=1,
+                                  pending=None, pending_count=0, far_count=0)
     return agent
 
 
@@ -71,6 +73,7 @@ def test_not_ready_returns_empty():
     assert agent.get_target_pool() == []  # 无 SLAM 锚点
     agent._pool_slam_anchor = (0.0, 0.0, 0.0, 0.0)
     agent.calibrator = SimpleNamespace(current_scale=lambda: None)
+    agent._metric_snapshot["scale"] = None  # 尺度未播种
     assert agent.get_target_pool() == []  # 无尺度估计
 
 

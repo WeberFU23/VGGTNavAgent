@@ -240,6 +240,33 @@ class InstanceMemory:
         self._select_canonical_observation(node)
         return node
 
+    def merge_instances(self, keep_id, drop_id):
+        """把 drop 实例并入 keep：观测、证据与报告状态全部转移后删除 drop。
+
+        任一已报告则合并结果视为已报告（同一物理物体已被 claim），
+        drop 上的 report claim 重指到 keep。参数非法或相同返回 None。
+        """
+        keep = self.get(keep_id)
+        drop = self.get(drop_id)
+        if keep is None or drop is None or keep is drop:
+            return None
+        for oid in drop.observation_ids:
+            if oid not in keep.observation_ids:
+                keep.observation_ids.append(oid)
+            self._observation_to_instance[oid] = keep.iid
+        for item in drop.evidence:
+            keep.add_evidence(item)
+        for claim in self.report_claims:
+            if claim.instance_id == drop.iid:
+                claim.instance_id = keep.iid
+        if drop.reported:
+            keep.reported = True
+            if keep.report_claim_id is None:
+                keep.report_claim_id = drop.report_claim_id
+        self.nodes.remove(drop)
+        self._select_canonical_observation(keep)
+        return keep
+
     def _select_canonical_observation(self, node):
         observations = [self.get_observation(oid)
                         for oid in node.observation_ids]

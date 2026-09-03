@@ -300,10 +300,13 @@ class MappingClient:
         })
         return resp.get("candidates", {})
 
-    def get_candidate_evidence(self, candidate_id):
-        """返回候选的紧凑 mask-overlay JPEG，供 VLM 复核。"""
+    def get_candidate_evidence(self, candidate_id, wide_only=False):
+        """返回候选的 mask-overlay JPEG，供 VLM 复核。
+        wide_only=True 时只给广角全帧 overlay（不再放大裁剪），
+        用于 duplicate review 场景，保留全局上下文供 VLM 判断重合。"""
         resp, payload = self._request(
-            {"cmd": "candidate_evidence", "candidate_id": candidate_id})
+            {"cmd": "candidate_evidence", "candidate_id": candidate_id,
+             "wide_only": bool(wide_only)})
         return resp, payload
 
     def evidence_for_point(self, frame_id, pixel, bbox=None):

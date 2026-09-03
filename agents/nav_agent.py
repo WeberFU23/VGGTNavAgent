@@ -49,6 +49,12 @@ class NavAgent(MappingAgent):
         self.nav_block_ttl_steps = max(1, int(os.environ.get(
             "NAV_NAV_BLOCK_TTL_STEPS", "30")))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
+        # 尺度候选的物理合理量程（米/地图单位）：室内场景不可能出界，
+        # 界外候选直接丢弃，防止极端噪声成为尺度种子。
+        self.scale_plausible_min = float(os.environ.get(
+            "NAV_SCALE_PLAUSIBLE_MIN", "0.3"))
+        self.scale_plausible_max = float(os.environ.get(
+            "NAV_SCALE_PLAUSIBLE_MAX", "3.0"))
         self.finish_patience = int(os.environ.get("NAV_FINISH_PATIENCE", "5"))
         self.finish_frontier_patience = int(os.environ.get(
             "NAV_FINISH_FRONTIER_PATIENCE", "3"))
@@ -110,6 +116,7 @@ class NavAgent(MappingAgent):
                            "instantiate_points": self._tool_instantiate_points,
                            "som_pick": self._tool_som_pick,
                            "resolve_duplicate": self._tool_resolve_duplicate,
+                           "merge_instances": self._tool_merge_instances,
                            "get_agent_status": self._tool_get_agent_status,
                            "set_notes": self._tool_set_notes,
                            "get_action_history": self._tool_get_action_history},
@@ -817,9 +824,27 @@ class NavAgent(MappingAgent):
             return self._metric_scale_value() or 1.0
         snapshot = self._metric_snapshot
         current = snapshot.get("scale")
+        in_range = (self.scale_plausible_min <= candidate <=
+                    self.scale_plausible_max)
+        if not in_range and current is not None and \
+                self.scale_plausible_min <= current <= self.scale_plausible_max:
+            # 软钳制：已有可信尺度时，拒绝把它换成离谱值。
+            # 但未播种（current None）或当前尺度本身出格时必须放行——
+            # 该估计器是自指的，接受错误种子后后续候选才会向真实值
+            # 回归（v15: 6.6→2.5→0.7）；一律硬拒会让尺度永远卡在 1.0。
+            self._log_event(
+                f"metric scale candidate rejected out of range "
+                f"{candidate:.3f} (source={source})")
+            return float(current)
         if current is None:
+            # 立即播种（v15 行为）：延迟播种（3 连才播）让开局几十步用
+            # 默认 1.0 白跑，且播了错种子照样要自愈，v16 实测反而退步。
+            # 错了由 far_count 逃生口自愈。
             snapshot.update(scale=candidate, source=str(source), revision=1,
                             pending=None, pending_count=0, far_count=0)
+            self._invalidate_metric_navigation()
+            self._log_event(
+                f"metric scale seeded {candidate:.3f} ({source})")
             return candidate
         relative = abs(candidate - current) / max(abs(current), 1e-6)
         if relative <= 0.12:
@@ -832,7 +857,13 @@ class NavAgent(MappingAgent):
         if relative > 0.5:
             far_count = int(snapshot.get("far_count", 0)) + 1
             snapshot["far_count"] = far_count
-            if far_count >= 5:
+            # 出格 current + 合理 candidate：收敛方向明确，降低门槛加速自愈
+            # （v16 mL8 中 7.5 的坏种子靠 far_count=5 收敛花了 190 步）。
+            threshold = 5
+            if in_range and not (self.scale_plausible_min <= current <=
+                                 self.scale_plausible_max):
+                threshold = 2
+            if far_count >= threshold:
                 snapshot.update(scale=candidate, source=str(source),
                                 revision=int(snapshot.get("revision", 0)) + 1,
                                 pending=None, pending_count=0, far_count=0)
@@ -882,14 +913,12 @@ class NavAgent(MappingAgent):
         self._metric_replan_required = True
 
     def _metric_scale_value(self):
+        # 未播种阶段不回退到 calibrator 的原始估计——那正是坏种子的来源；
+        # 调用方统一用 `or 1.0` 兜底，直到快照层确认估计可信。
         scale = self._metric_snapshot.get("scale")
         if scale is not None:
             return float(scale)
-        try:
-            scale = self.calibrator.current_scale()
-            return float(scale) if scale is not None else None
-        except Exception:
-            return None
+        return None
 
     def _summarize_frontier_branches(self, frontiers, start_xy, grid, scale,
                                      step):
@@ -1438,8 +1467,9 @@ class NavAgent(MappingAgent):
         rows.sort(key=lambda row: (-len(row["matched_keywords"]), row["id"]))
         return rows[:limit]
 
-    def _tool_view_instance(self, instance_id):
-        """返回实例最相关的证据图；优先pointing overlay，回退关键帧。"""
+    def _tool_view_instance(self, instance_id, wide_only=False):
+        """返回实例最相关的证据图；优先pointing overlay，回退关键帧。
+        wide_only=True 时 overlay 不放大裁剪（duplicate review 用）。"""
         node = self.memory.get(instance_id)
         if node is None:
             return None
@@ -1451,7 +1481,8 @@ class NavAgent(MappingAgent):
                 continue
             seen.add(candidate_id)
             try:
-                meta, payload = self.client.get_candidate_evidence(candidate_id)
+                meta, payload = self.client.get_candidate_evidence(
+                    candidate_id, wide_only=wide_only)
                 if meta.get("found") and payload:
                     return payload
             except Exception:
@@ -1569,15 +1600,17 @@ class NavAgent(MappingAgent):
                 round(float(pixel_norm[1]), 1))
 
     def _find_crosshair_key(self, frame_id, pixel_norm, source):
-        """查找同一证据点，容忍 VLM 对 0--1000 坐标的 ±2 四舍五入。"""
+        """查找同一证据点。容差默认 ±20/1000：VLM 重发坐标时普遍有
+        5-10 的漂移（v16 GLAQ 中 ±2 导致确认死循环烧光工具预算）。"""
+        tol = float(os.environ.get("NAV_CROSSHAIR_TOL_1000", "20"))
         try:
             fid = int(frame_id)
             x, y = float(pixel_norm[0]), float(pixel_norm[1])
         except (TypeError, ValueError, IndexError):
             return None
         for key in source:
-            if key[0] == fid and abs(key[1] - x) <= 2.0 and \
-                    abs(key[2] - y) <= 2.0:
+            if key[0] == fid and abs(key[1] - x) <= tol and \
+                    abs(key[2] - y) <= tol:
                 return key
         return None
 
@@ -1857,8 +1890,14 @@ class NavAgent(MappingAgent):
         if dup_rows:
             out["duplicate_review"] = dup_rows
             out["next"] = ("duplicate_review lists new observations near "
-                           "existing instances; compare the attached evidence "
-                           "images and call resolve_duplicate for each: "
+                           "existing instances. dist_m is the 3D distance "
+                           "between the two stored points; pointing 3D "
+                           "localization noise is roughly ±1m, so dist_m < 1 "
+                           "with the same object category most likely means "
+                           "one physical object seen twice. The attached "
+                           "images are wide full-frame views only — check "
+                           "whether both markers point at the same object. "
+                           "Then call resolve_duplicate for each: "
                            "DUPLICATE merges into the existing instance, "
                            "NEW creates a separate one")
             if dup_images:
@@ -3352,14 +3391,16 @@ class NavAgent(MappingAgent):
             cid = entry.get("candidate_id")
             if cid:
                 try:
-                    meta, payload = self.client.get_candidate_evidence(cid)
+                    meta, payload = self.client.get_candidate_evidence(
+                        cid, wide_only=True)
                 except Exception:
                     meta, payload = {"found": False}, b""
                 if meta.get("found") and payload:
                     images.append(
                         (f"dup_new_obs{entry['observation_id']}", payload))
             for neighbor in entry.get("neighbors", [])[:2]:
-                payload = self._tool_view_instance(neighbor["instance_id"])
+                payload = self._tool_view_instance(
+                    neighbor["instance_id"], wide_only=True)
                 if payload:
                     images.append(
                         (f"dup_existing_{neighbor['instance_id']}", payload))
@@ -3396,6 +3437,31 @@ class NavAgent(MappingAgent):
             f"-> instance {node.iid}")
         return {"instance_id": node.iid, "observation_id": observation.oid,
                 "resolved": resolved, "reported": bool(node.reported)}
+
+    def _tool_merge_instances(self, instance_id, other_instance_id, text=""):
+        """随时合并两个实例为同一物理物体：other 并入 instance。"""
+        keep = self.memory.get(instance_id)
+        drop = self.memory.get(other_instance_id)
+        if keep is None:
+            return {"error": f"instance {instance_id!r} not found"}
+        if drop is None:
+            return {"error": f"instance {other_instance_id!r} not found"}
+        if keep.iid == drop.iid:
+            return {"error": "cannot merge an instance into itself"}
+        self.memory.merge_instances(keep, drop)
+        if text:
+            keep.text = str(text)
+        # 清理 agent 侧对 drop 的引用
+        self._unreachable_instance_ids.discard(drop.iid)
+        if self.target_instance_id == drop.iid:
+            self.target_instance_id = None
+            self.target_point = None
+            self.target_candidate_id = None
+            self._selected_evidence = None
+        self._log_event(
+            f"instance {drop.iid} merged into {keep.iid}")
+        return {"merged": drop.iid, "into": keep.iid,
+                "reported": bool(keep.reported)}
 
     # 规划
     def _refresh_anchor(self, poses, frame_ids):

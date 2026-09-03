@@ -97,6 +97,14 @@ observation. If its 3D point lies near existing instances it is NOT turned
 into an instance directly:
 you receive a duplicate_review entry with evidence images and must judge
 identity yourself with resolve_duplicate (DUPLICATE merges, NEW creates).
+The evidence images are wide full-frame views (no zoomed crops) so you keep
+the global context; dist_m is the 3D distance between the two stored points,
+and pointing localization noise is roughly ±1m — dist_m < 1 with the same
+object category, or both markers pointing at the same object in the wide
+views, usually means one physical object seen twice.
+Whenever you later realize two existing instances are actually the same
+physical object (from images, texts, or map positions), call merge_instances
+right away — you do not have to wait for a duplicate_review.
 observation_count tells how
 many views support an instance. reported_instances and report_claims are
 already claimed and cannot be navigated to or reported again. The instance
@@ -162,15 +170,22 @@ re-propose from the new viewpoint instead of repeating from afar.
   new view.
   An ACCEPTED candidate whose 3D point lies near existing instances is NOT
   created immediately: it appears under duplicate_review with its observation_id
-  and the neighbors' ids/distances, with evidence images attached
-  (dup_new_obs<N> for the new observation, dup_existing_<id> for neighbors).
+  and the neighbors' ids/distances, with wide full-frame evidence images
+  attached (dup_new_obs<N> for the new observation, dup_existing_<id> for
+  neighbors).
 - resolve_duplicate(observation_id, decision, duplicate_of=null, text="") ->
   {{instance_id, resolved}}: verdict for each duplicate_review entry.
   DUPLICATE merges the observation into the existing instance duplicate_of
-  (same physical object — compare evidence images and map positions;
+  (same physical object — compare the wide evidence images and map positions;
   near-identical map locations usually mean the same object even when texts
   differ); NEW creates a separate instance. Until resolved, the observation
   is not navigable and not an instance.
+- merge_instances(instance_id, other_instance_id, text="") ->
+  {{merged, into, reported}}: merge two EXISTING instances you have judged
+  to be the same physical object. other_instance_id is absorbed into
+  instance_id (observations, evidence and reported state are kept; optional
+  text replaces the surviving instance's text). Use it any time — e.g. after
+  comparing view_instance images or noticing two ids at the same map spot.
 - review_crosshair(frame_id, pixel_1000, verdict, reason) ->
   {{frame_id, pixel, verdict, instantiation_allowed}}: this is the REQUIRED
   semantic gate for every pixel. First inspect its attached crosshair image,

@@ -89,7 +89,7 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     assert "the refreshed world state is" in flat
     # 已删除的工具不得再出现
     assert "look_at" not in prompt
-    assert "merge_instances" not in prompt
+    assert "merge_instances(" in prompt  # 随时合并既有实例的工具
     assert "undo_merge" not in prompt
     assert "ground_target" not in prompt
     assert "point_frame(" not in prompt
@@ -1160,7 +1160,7 @@ def test_navagent_view_instance_prefers_candidate_overlay():
     node, _ = agent.memory.remember(
         [1, 2, 0], "red cup", frame_id=7, candidate_id="c7")
     agent.client = SimpleNamespace(
-        get_candidate_evidence=lambda candidate_id:
+        get_candidate_evidence=lambda candidate_id, wide_only=False:
             ({"found": True}, b"overlay"),
         get_frame_image=lambda frame_id: ({"found": True}, b"frame"))
     assert agent._tool_view_instance(node.iid) == b"overlay"

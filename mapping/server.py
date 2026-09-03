@@ -1411,8 +1411,13 @@ class MappingServer:
                 }
         return {"candidates": rows}
 
-    def candidate_evidence(self, candidate_id):
-        """生成紧凑的候选 crop + mask overlay JPEG。"""
+    def candidate_evidence(self, candidate_id, wide_only=False):
+        """生成候选证据 JPEG：默认左全帧+右放大裁剪；wide_only 只给全帧。
+
+        wide_only 用于实例去重裁决：放大裁剪会主导 VLM 判断（同一物体
+        不同角度/光照的局部差异被放大），而全帧里"标记在同一位置"的
+        线索更可靠。
+        """
         cand = self._ground_candidates.get(str(candidate_id))
         if cand is None:
             return {"found": False, "error": "unknown candidate"}, b""
@@ -1430,15 +1435,22 @@ class MappingServer:
         # translucent patch alone.
         px, py = (int(round(value)) for value in cand["pixel"])
         self._draw_crosshair(overlay, px, py)
-        x0, y0, x1, y1 = np.asarray(cand["bbox"], dtype=int)
-        h, w = overlay.shape[:2]
-        margin = max(8, int(0.1 * max(x1 - x0, y1 - y0)))
-        x0, y0 = max(0, x0 - margin), max(0, y0 - margin)
-        x1, y1 = min(w, x1 + margin), min(h, y1 + margin)
-        crop = overlay[y0:y1, x0:x1]
-        if crop.size == 0:
-            crop = overlay
-        panel = self._evidence_panel(overlay, crop)
+        if wide_only:
+            h, w = overlay.shape[:2]
+            height = 320
+            panel = cv2.resize(
+                overlay, (max(1, int(round(w * height / max(h, 1)))), height),
+                interpolation=cv2.INTER_AREA)
+        else:
+            x0, y0, x1, y1 = np.asarray(cand["bbox"], dtype=int)
+            h, w = overlay.shape[:2]
+            margin = max(8, int(0.1 * max(x1 - x0, y1 - y0)))
+            x0, y0 = max(0, x0 - margin), max(0, y0 - margin)
+            x1, y1 = min(w, x1 + margin), min(h, y1 + margin)
+            crop = overlay[y0:y1, x0:x1]
+            if crop.size == 0:
+                crop = overlay
+            panel = self._evidence_panel(overlay, crop)
         ok, encoded = cv2.imencode(
             ".jpg", cv2.cvtColor(panel, cv2.COLOR_RGB2BGR),
             [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1644,7 +1656,8 @@ class MappingServer:
             return {"ok": True, **self.resolve_candidates(
                 header.get("candidate_ids", []))}, b""
         if cmd == "candidate_evidence":
-            resp, evidence = self.candidate_evidence(header["candidate_id"])
+            resp, evidence = self.candidate_evidence(
+                header["candidate_id"], bool(header.get("wide_only")))
             return {"ok": True, **resp}, evidence
         if cmd == "evidence_for_point":
             resp, evidence = self.evidence_for_point(

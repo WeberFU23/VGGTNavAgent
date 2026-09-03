@@ -270,6 +270,24 @@ def test_instantiate_points_accept_review_then_ingests():
     assert agent.memory.nodes[0].text == "basket"
 
 
+def test_instantiate_points_tolerates_vlm_coordinate_drift():
+    """VLM 重发坐标普遍漂移 5-10/1000；±20 容差内仍视为同一证据点。"""
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent.client = _two_stage_client()
+    first = agent._tool_instantiate_points(5, [[774.3, 314.7]], "speaker")
+    assert first["pending_confirmation"]
+    review = agent._tool_review_crosshair(
+        5, [768.7, 328.3], "ACCEPT", "crosshair is on the speaker")
+    assert review["instantiation_allowed"] is True
+    second = agent._tool_instantiate_points(5, [[768.7, 328.3]], "speaker")
+    assert "pending_confirmation" not in second
+    assert len(agent.memory.nodes) == 1
+    # 超出 ±20 容差的坐标仍是新像素，需要重新确认
+    third = agent._tool_instantiate_points(5, [[700.0, 328.3]], "speaker")
+    assert third["pending_confirmation"]
+
+
 def test_candidate_transaction_only_commits_explicit_accepts():
     """SAM 分割→som_pick 候选不可导航；仅 ACCEPT 才进入 canonical memory。"""
     agent = _make_agent()
@@ -849,6 +867,8 @@ def _nav_action_agent():
     agent._last_plan_step = 0
     agent._last_motion_failed = False
     agent._refresh_anchor = lambda poses, frame_ids: None
+    agent._metric_snapshot.update(scale=1.0, source="test", revision=1,
+                                  pending=None, pending_count=0, far_count=0)
     return agent
 
 
@@ -945,10 +965,12 @@ def test_nav_stuck_recovery_fallback_to_explore_when_decider_unavailable():
 
 def test_metric_snapshot_defers_one_off_scale_jump():
     agent = _make_agent()
-    assert agent._update_metric_snapshot(2.0, "grid") == 2.0
-    assert agent._update_metric_snapshot(3.0, "grid") == 2.0
-    assert agent._update_metric_snapshot(3.02, "grid") == 2.0
-    assert agent._update_metric_snapshot(2.98, "grid") == 2.98
+    assert agent._update_metric_snapshot(2.0, "grid") == 2.0  # 立即播种（v15 行为）
+    assert agent._metric_snapshot["scale"] == 2.0
+    # 播种后的跳变仍需 3 连一致才切换
+    assert agent._update_metric_snapshot(2.9, "grid") == 2.0
+    assert agent._update_metric_snapshot(2.92, "grid") == 2.0
+    assert agent._update_metric_snapshot(2.88, "grid") == 2.88
     assert agent._metric_snapshot["revision"] == 2
 
 
@@ -1023,22 +1045,25 @@ def test_metric_snapshot_force_switch_after_persistent_far_mismatch():
     """坏种子锁死自愈：候选持续 >2x 偏离 current 但彼此抖动凑不齐 3 连时，
     累计 5 次大幅偏离后强制切换到最新候选。"""
     agent = _make_agent()
-    assert agent._update_metric_snapshot(7.4, "grid") == 7.4  # 坏种子
+    for _ in range(3):
+        agent._update_metric_snapshot(2.8, "grid")  # 播种（量程内的坏种子）
+    assert agent._metric_scale_value() == 2.8
     # 候选彼此差 >12%（pending 机制凑不齐 3 连），但都 >0.5x 偏离 current
-    for value in (1.0, 3.0, 0.9, 3.3):
-        assert agent._update_metric_snapshot(value, "calib") == 7.4
-    assert agent._update_metric_snapshot(1.1, "calib") == 1.1
+    for value in (1.0, 0.5, 1.1, 0.55):
+        assert agent._update_metric_snapshot(value, "calib") == 2.8
+    assert agent._update_metric_snapshot(1.05, "calib") == 1.05
     assert agent._metric_snapshot["far_count"] == 0
     assert agent._metric_snapshot["revision"] == 2
 
 
 def test_metric_snapshot_far_count_resets_when_candidate_matches_current():
     agent = _make_agent()
-    agent._update_metric_snapshot(7.4, "grid")
-    for value in (1.0, 3.0, 0.95):
+    for _ in range(3):
+        agent._update_metric_snapshot(2.8, "grid")
+    for value in (1.0, 0.5, 0.95):
         agent._update_metric_snapshot(value, "calib")
     assert agent._metric_snapshot["far_count"] == 3
-    assert agent._update_metric_snapshot(7.0, "calib") == 7.0  # 直接接受
+    assert agent._update_metric_snapshot(2.6, "calib") == 2.6  # 直接接受
     assert agent._metric_snapshot["far_count"] == 0
     agent._update_metric_snapshot(1.0, "calib")
     assert agent._metric_snapshot["far_count"] == 1
@@ -1056,8 +1081,9 @@ class _FakeGrid:
 
 def _blocked_cell_count(scale):
     agent = _make_agent()
-    agent.grid = _FakeGrid(0.1)
-    agent._update_metric_snapshot(scale, "test")
+    for _ in range(3):
+        agent._update_metric_snapshot(scale, "test")  # 3 连一致才播种
+    agent.grid = _FakeGrid(0.1)  # 播种会作废栅格，先播种再挂 grid
     agent._nav_blocked_points = [((0.0, 0.0), 999)]
     agent._apply_nav_temporary_blocks(SimpleNamespace(step_count=0))
     return int((~agent.grid.free).sum())
@@ -1067,8 +1093,35 @@ def test_nav_block_radius_scaled_to_metric():
     """封锁盘半径是米制 0.35m：尺度大时栅格半径必须按 1/scale 缩小，
     否则错误尺度会把 agent 自己围死。"""
     small = _blocked_cell_count(1.0)
-    large = _blocked_cell_count(7.4)
+    large = _blocked_cell_count(3.0)
     assert large < small
-    # scale=1: ceil(0.35/1/0.1)=4 格半径 -> 49 格; scale=7.4: 1 格 -> 5 格
+    # scale=1: ceil(0.35/1/0.1)=4 格半径 -> 49 格; scale=3: 2 格 -> 13 格
     assert small == 49
-    assert large == 5
+    assert large == 13
+
+
+def test_metric_snapshot_rejects_out_of_range_candidate():
+    """软量程钳制：未播种时立即播种（v15 行为，错了靠自愈纠正），
+    已有合理尺度时拒绝离谱切换。"""
+    agent = _make_agent()
+    # 未播种：第一个候选立即播种
+    agent._update_metric_snapshot(7.4, "grid")
+    assert agent._metric_snapshot["scale"] == 7.4
+    # 出格种子允许向合理值自愈（逃生口）
+    for _ in range(5):
+        agent._update_metric_snapshot(1.0, "grid")
+    assert agent._metric_snapshot["scale"] == 1.0
+    # 已有可信尺度后，离谱候选被硬拒
+    assert agent._update_metric_snapshot(7.4, "grid") == 1.0
+    assert agent._metric_snapshot["scale"] == 1.0
+
+
+def test_metric_snapshot_fast_converge_from_out_of_range_seed():
+    """出格种子 + 合理候选：far_count 门槛降为 2，快速自愈。"""
+    agent = _make_agent()
+    agent._update_metric_snapshot(7.4, "grid")
+    assert agent._metric_snapshot["scale"] == 7.4
+    agent._update_metric_snapshot(1.5, "grid")   # 合理候选第 1 次
+    assert agent._metric_snapshot["scale"] == 7.4
+    agent._update_metric_snapshot(1.5, "grid")   # 第 2 次即切换
+    assert agent._metric_snapshot["scale"] == 1.5

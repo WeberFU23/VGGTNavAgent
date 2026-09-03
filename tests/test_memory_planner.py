@@ -96,6 +96,38 @@ def test_planner_uses_all_unreported_instances():
     assert {node.iid for node in ordered} == {1, 2, 3}
 
 
+def test_merge_instances_transfers_observations_evidence_and_claims():
+    mem = InstanceMemory()
+    obs_a = mem.new_observation([0, 0, 0], "sofa front", frame_id=1,
+                                candidate_id="c1")
+    keep = mem.create_instance(obs_a)
+    obs_b = mem.new_observation([0.5, 0, 0], "sofa back", frame_id=2,
+                                candidate_id="c2")
+    drop = mem.create_instance(obs_b)
+    claim = mem.claim(drop, step=5)
+    assert drop.reported and not keep.reported
+
+    merged = mem.merge_instances(keep.iid, drop.iid)
+    assert merged is keep
+    assert drop not in mem.nodes and len(mem.nodes) == 1
+    # 观测转移并重指
+    assert set(keep.observation_ids) == {obs_a.oid, obs_b.oid}
+    assert mem.instance_for_observation(obs_b.oid) is keep
+    # 报告状态与 claim 重指
+    assert keep.reported
+    assert keep.report_claim_id == claim.claim_id
+    assert claim.instance_id == keep.iid
+
+
+def test_merge_instances_rejects_invalid_or_same():
+    mem = InstanceMemory()
+    obs = mem.new_observation([0, 0, 0], "chair")
+    node = mem.create_instance(obs)
+    assert mem.merge_instances(node.iid, node.iid) is None
+    assert mem.merge_instances(node.iid, 999) is None
+    assert len(mem.nodes) == 1
+
+
 if __name__ == "__main__":
     test_each_candidate_becomes_instance_without_proximity_merge()
     test_stable_candidate_updates_same_instance_and_evidence()
@@ -103,4 +135,6 @@ if __name__ == "__main__":
     test_replaying_old_view_keeps_its_observation_and_canonical_point()
     test_reported_instances_are_not_available()
     test_planner_uses_all_unreported_instances()
+    test_merge_instances_transfers_observations_evidence_and_claims()
+    test_merge_instances_rejects_invalid_or_same()
     print("memory/planner tests passed")

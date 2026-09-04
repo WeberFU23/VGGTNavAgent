@@ -665,13 +665,18 @@ class NavAgent(MappingAgent):
         latest_fid = int(frame_ids[order][-1])
         latest_pose = poses64[order][-1]
         cur = latest_pose[:3, 3] @ self.align_R.T
-        # 尺度：栅格尺规（相机离地 1.5m）比在线动作标定更直接，也必须
-        # 与当前鸟瞰图使用同一份尺度。
+        # 尺度：栅格尺规（相机离地 1.5m）与在线动作标定（0.25m/步）
+        # 双源独立喂入，播种时交叉验证（见 _update_metric_snapshot）。
         raw_scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
-        self._frontier_scale = self._update_metric_snapshot(
-            raw_scale or self.calibrator.current_scale() or 1.0,
-            source="grid" if raw_scale else "calibrator")
-        scale = self._frontier_scale
+        if raw_scale:
+            self._frontier_scale = self._update_metric_snapshot(
+                raw_scale, source="grid")
+        cal_scale = self.calibrator.current_scale()
+        if cal_scale:
+            self._frontier_scale = self._update_metric_snapshot(
+                cal_scale, source="calibrator")
+        scale = self._metric_scale_value() or 1.0
+        self._frontier_scale = scale
         slam_x, slam_y, slam_yaw = nav.pose_to_yaw_2d(
             latest_pose, self.align_R)
         self._frontier_slam_pose = (slam_x, slam_y, slam_yaw)
@@ -824,6 +829,15 @@ class NavAgent(MappingAgent):
             return self._metric_scale_value() or 1.0
         snapshot = self._metric_snapshot
         current = snapshot.get("scale")
+        src = str(source)
+        # 各来源的候选与连续一致计数（±12%），供播种时交叉验证
+        by_src = snapshot.setdefault("by_source", {})
+        last = by_src.get(src)
+        if last is not None and abs(candidate - last[0]) / max(
+                abs(last[0]), 1e-6) <= 0.12:
+            by_src[src] = (candidate, last[1] + 1)
+        else:
+            by_src[src] = (candidate, 1)
         in_range = (self.scale_plausible_min <= candidate <=
                     self.scale_plausible_max)
         if not in_range and current is not None and \
@@ -837,15 +851,36 @@ class NavAgent(MappingAgent):
                 f"{candidate:.3f} (source={source})")
             return float(current)
         if current is None:
-            # 立即播种（v15 行为）：延迟播种（3 连才播）让开局几十步用
-            # 默认 1.0 白跑，且播了错种子照样要自愈，v16 实测反而退步。
-            # 错了由 far_count 逃生口自愈。
-            snapshot.update(scale=candidate, source=str(source), revision=1,
-                            pending=None, pending_count=0, far_count=0)
-            self._invalidate_metric_navigation()
+            # 双源交叉验证播种：grid 尺规（地板+相机高 1.5m）和动作标定
+            # （0.25m/步真实位移）独立估计，一致才采信；grid 的地板峰
+            # 找错会产出 2.3-8.8 的垃圾值（rand10 轮实测），单源不可信。
+            g, c = by_src.get("grid"), by_src.get("calibrator")
+            seed = None
+            note = ""
+            if g and c:
+                rel = abs(g[0] - c[0]) / max(abs(c[0]), 1e-6)
+                if rel <= 0.30:
+                    seed, note = c[0], "cross-validated"  # 真实位移源优先
+                elif g[1] >= 3 and c[1] >= 3:
+                    # 两源各自稳定但持续不一致：尺规的错误模式（地板峰
+                    # 找错）不会自愈，真实位移源更可信，采 calibrator。
+                    seed, note = c[0], f"calibrator overrides grid={g[0]:.3f}"
+            else:
+                # 单源兜底：该源 3 连一致且没有其他源出现过
+                rec = by_src.get(src)
+                if rec is not None and rec[1] >= 3 and len(by_src) == 1:
+                    seed, note = rec[0], f"single-source {src}"
+            if seed is not None:
+                snapshot.update(scale=seed, source=src, revision=1,
+                                pending=None, pending_count=0, far_count=0)
+                self._invalidate_metric_navigation()
+                self._log_event(
+                    f"metric scale seeded {seed:.3f} ({note})")
+                return seed
             self._log_event(
-                f"metric scale seeded {candidate:.3f} ({source})")
-            return candidate
+                f"metric scale seed awaiting cross-validation "
+                f"(grid={g[0] if g else None}, calibrator={c[0] if c else None})")
+            return 1.0
         relative = abs(candidate - current) / max(abs(current), 1e-6)
         if relative <= 0.12:
             snapshot.update(scale=candidate, source=str(source),
@@ -3531,9 +3566,14 @@ class NavAgent(MappingAgent):
                 return False
             raw_scale = (1.0 / grid.unit_per_m
                          if grid.unit_per_m > 0 else None)
-            scale = self._update_metric_snapshot(
-                raw_scale or scale,
-                source="grid" if raw_scale else "calibrator")
+            if raw_scale:
+                scale = self._update_metric_snapshot(
+                    raw_scale, source="grid")
+            cal_scale = self.calibrator.current_scale()
+            if cal_scale:
+                scale = self._update_metric_snapshot(
+                    cal_scale, source="calibrator")
+            scale = self._metric_scale_value() or 1.0
             self.grid = grid
             self._refresh_anchor(poses, frame_ids)
         except Exception as e:

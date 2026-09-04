@@ -965,13 +965,33 @@ def test_nav_stuck_recovery_fallback_to_explore_when_decider_unavailable():
 
 def test_metric_snapshot_defers_one_off_scale_jump():
     agent = _make_agent()
-    assert agent._update_metric_snapshot(2.0, "grid") == 2.0  # 立即播种（v15 行为）
-    assert agent._metric_snapshot["scale"] == 2.0
+    assert agent._update_metric_snapshot(2.0, "grid") == 1.0  # 单源 3 连才兜底播种
+    assert agent._update_metric_snapshot(2.0, "grid") == 1.0
+    assert agent._update_metric_snapshot(2.0, "grid") == 2.0
     # 播种后的跳变仍需 3 连一致才切换
     assert agent._update_metric_snapshot(2.9, "grid") == 2.0
     assert agent._update_metric_snapshot(2.92, "grid") == 2.0
     assert agent._update_metric_snapshot(2.88, "grid") == 2.88
     assert agent._metric_snapshot["revision"] == 2
+
+
+def test_metric_snapshot_cross_validation_seeds_on_agreement():
+    """双源一致（±30%）立即播种，采 calibrator 值。"""
+    agent = _make_agent()
+    agent._update_metric_snapshot(1.3, "grid")
+    assert agent._metric_snapshot["scale"] is None
+    agent._update_metric_snapshot(1.1, "calibrator")
+    assert agent._metric_snapshot["scale"] == 1.1  # 一致 → 立即播种
+
+
+def test_metric_snapshot_calibrator_overrides_stable_bad_grid():
+    """两源各自稳定但持续不一致：采信真实位移源，挡住尺规垃圾值。"""
+    agent = _make_agent()
+    for _ in range(3):
+        agent._update_metric_snapshot(8.8, "grid")
+        assert agent._metric_snapshot["scale"] is None
+        agent._update_metric_snapshot(1.1, "calibrator")
+    assert agent._metric_snapshot["scale"] == 1.1
 
 
 def test_unreachable_instance_excluded_from_world_state():
@@ -1101,11 +1121,12 @@ def test_nav_block_radius_scaled_to_metric():
 
 
 def test_metric_snapshot_rejects_out_of_range_candidate():
-    """软量程钳制：未播种时立即播种（v15 行为，错了靠自愈纠正），
+    """软量程钳制：未播种时单源 3 连兜底播种（错了靠自愈纠正），
     已有合理尺度时拒绝离谱切换。"""
     agent = _make_agent()
-    # 未播种：第一个候选立即播种
-    agent._update_metric_snapshot(7.4, "grid")
+    # 未播种：单源 3 连一致兜底播种
+    for _ in range(3):
+        agent._update_metric_snapshot(7.4, "grid")
     assert agent._metric_snapshot["scale"] == 7.4
     # 出格种子允许向合理值自愈（逃生口）
     for _ in range(5):
@@ -1119,7 +1140,8 @@ def test_metric_snapshot_rejects_out_of_range_candidate():
 def test_metric_snapshot_fast_converge_from_out_of_range_seed():
     """出格种子 + 合理候选：far_count 门槛降为 2，快速自愈。"""
     agent = _make_agent()
-    agent._update_metric_snapshot(7.4, "grid")
+    for _ in range(3):
+        agent._update_metric_snapshot(7.4, "grid")  # 单源 3 连兜底播种
     assert agent._metric_snapshot["scale"] == 7.4
     agent._update_metric_snapshot(1.5, "grid")   # 合理候选第 1 次
     assert agent._metric_snapshot["scale"] == 7.4

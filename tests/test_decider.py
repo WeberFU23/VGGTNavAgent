@@ -57,8 +57,8 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     flat = " ".join(prompt.split())
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
                  "propose_candidates(frame_id, query)",
-                 "som_pick(frame_id, mask_ids, query)",
-                 "instantiate_points(frame_id, pixels_1000, label)",
+                 "som_pick(frame_id, mask_ids, query, goal_index=null)",
+                 "instantiate_points(frame_id, pixels_1000, label, goal_index=null)",
                  "review_crosshair(frame_id, pixel_1000, verdict, reason)",
                  "search_instances(",
                  "get_instance(instance_id)",
@@ -82,8 +82,8 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
     # 工具调用 JSON 格式必须写进 prompt（VLM 才能正确发起调用）
     assert '"tool_call":' in prompt
     assert '"name": "<tool_name>"' in prompt
-    # 报告按距离判定（走到目标附近即可，不要求目标在视野内）+ takeover 禁工具
-    assert "Success is judged by DISTANCE, not by vision" in flat
+    # 报告按近距离判定（贴近目标 viewpoint ~0.25m）+ takeover 禁工具
+    assert "Success is judged by DISTANCE with a tight radius" in flat
     assert "tools are disabled" in flat
     # 写工具后状态刷新说明
     assert "the refreshed world state is" in flat

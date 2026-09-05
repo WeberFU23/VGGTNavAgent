@@ -125,6 +125,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
             row["unreachable"] = True
         if nd.iid in nearby_map:
             row["nearby"] = nearby_map[nd.iid]
+        goal_index = getattr(agent, "_instance_goal_index", {}).get(nd.iid)
+        if goal_index is not None:
+            row["goal_index"] = int(goal_index)
         instances.append(row)
     omitted_ids = [nd.iid for nd in unreported if nd.iid not in selected_ids]
 
@@ -176,14 +179,26 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
                                           else float("inf")))
     revisit_targets = revisit_targets[:5]
 
+    task = {
+        "goal": goal_text,
+        "mode": agent._target_mode,
+        "found": agent._reported_count,
+        "expected": (int(agent._target_count)
+                     if agent._target_count is not None else None),
+    }
+    # image-goal 模式：目标以照片下发，附冷启动描述与未找到清单。
+    if getattr(agent, "_image_goal_mode", False):
+        goal_images = getattr(agent, "_goal_images", [])
+        found_idx = sorted(getattr(agent, "_goal_found", set()))
+        task["goal_type"] = "image"
+        task["goal_descriptions"] = list(
+            getattr(agent, "_goal_descriptions", []))
+        task["goals_total"] = len(goal_images)
+        task["goals_unfound"] = [i for i in range(len(goal_images))
+                                 if i not in found_idx]
+
     return {
-        "task": {
-            "goal": goal_text,
-            "mode": agent._target_mode,
-            "found": agent._reported_count,
-            "expected": (int(agent._target_count)
-                         if agent._target_count is not None else None),
-        },
+        "task": task,
         "step": int(observation.step_count),
         "max_steps": int(observation.max_steps),
         "steps_remaining": max(

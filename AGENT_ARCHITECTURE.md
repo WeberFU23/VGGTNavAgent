@@ -352,11 +352,14 @@ A* 的局部路径前缀分组为短期 branch，记录该 branch 的碰撞、�
 新关键帧和最近尝试时间；重复且无新观察的 branch 自动降权。实例导航和
 frontier 跟随共享“转向脱困 → 临时封路 → 重规划”的运动恢复语义。
 
-所有米制消费者使用同一版本化 `MetricTransformSnapshot`。新尺度与当前值
-差异超过 12% 时须连续三次一致才切换；切换才提升 revision，避免单次
-VGGT 尺度漂移同时污染去重、路径代价、冷却半径和 target pool。revision
-切换会废弃 follower、临时障碍和 frontier 路径，并从同一服务端 frame snapshot
-重规划；目标导航不得混用独立 pose RPC 与点云 RPC。
+所有米制消费者使用同一版本化 `MetricTransformSnapshot`。尺度只来自多帧
+地面到已知相机高度（1.5m）的尺规；动作回归仅保留为诊断信号，不得播种
+或切换导航尺度。候选连续三次稳定后锁定，锁定范围内的 ±12% 地面噪声
+不更新尺度；超过范围的稳定变化才提升 revision。每次规划先用地面尺规
+估计，再用锁定尺度二次构建 occupancy，使地板带、体素、障碍膨胀、路径
+代价、冷却半径和 target pool 使用同一尺度。revision 切换会废弃 follower、
+临时障碍和 frontier 路径，并从同一服务端 frame snapshot 重规划；目标导航
+不得混用独立 pose RPC 与点云 RPC。
 
 前进受阻先由连续两帧 RGB 静止确认（`MAPPING_STUCK_CONFIRM_STEPS=2`），避免
 低纹理墙面把单次正常前进误判为碰撞。adjust 的 `END_ADJUST` 也不是自由退出：
@@ -439,8 +442,9 @@ instance（`self.memory.nodes`，含已上报的，`reported` 标志区分）；
   关键帧的位姿 `(x, y, z, yaw)`（`_update_pool_slam_anchor`，在
   `_plan_exploration` / `_refresh_anchor` 用已有位姿快照每次重规划
   刷新，跟随回环对历史位姿的改写）；
-- 尺度 s：`calibrator.current_scale()`（m/unit），缺失时回退
-  `_frontier_grid.unit_per_m` 的倒数，两者皆无则返回 `[]`；
+- 尺度 s：已锁定的相机高度 `MetricTransformSnapshot`（m/unit），缺失时
+  回退 `_frontier_grid.unit_per_m` 的倒数；动作 calibrator 不参与，二者皆无
+  则返回 `[]`；
 - 符号约定假设：compass 是绕世界 +Y 的右手 yaw，`compass=0` 时 agent
   面向世界 −Z，forward = (−sin c, 0, −cos c)（与 benchmark
   `evaluator._agent_compass` 的四元数转 yaw 一致）；对齐 SLAM 系为
@@ -456,7 +460,7 @@ instance（`self.memory.nodes`，含已上报的，`reported` 标志区分）；
   ```
 
 **近似误差来源**：SLAM 漂移随时间累积（晚实例化的点误差更大，锚点只
-在重规划时刷新）；尺度来自在线动作标定（撞墙/回环会污染）；首帧
+在重规划时刷新）；尺度来自多帧地面—相机高度尺规（地面峰误判会污染）；首帧
 SLAM 位姿对应 step-0 观测、`pose_to_yaw_2d` 的相机 +Z 为朝向等假设
 若被服务端改动会破坏对齐；若发现系统性镜像/固定角度偏差，首要检查
 compass 符号约定。该接口只服务评测统计，不进入导航主路径。

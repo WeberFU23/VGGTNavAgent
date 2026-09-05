@@ -41,6 +41,7 @@ class MappingAgent:
         self._last_visual = None
         self._last_motion_failed = False
         self._visual_stall_count = 0
+        self._stall_first_idx = None
         self.stuck_steps = 0
         self._server_busy = False
         self._last_feed_info = {}
@@ -72,6 +73,7 @@ class MappingAgent:
         self._last_visual = None
         self._last_motion_failed = False
         self._visual_stall_count = 0
+        self._stall_first_idx = None
         self.stuck_steps = 0
         self._server_busy = False
         self._last_feed_info = {}
@@ -127,20 +129,32 @@ class MappingAgent:
             # RGB alone is weak evidence in textureless corridors. Require two
             # consecutive static forward observations before discarding a path.
             if delta < threshold:
+                if self._visual_stall_count == 0:
+                    # 记下第一次疑似卡住的动作下标：确认卡住时它也要被
+                    # 回溯标记，否则每段碰撞都会漏标第一步，污染尺度标定。
+                    self._stall_first_idx = len(self.calibrator.actions) - 1
                 self._visual_stall_count += 1
             else:
                 self._visual_stall_count = 0
+                self._stall_first_idx = None
             confirm_steps = max(1, int(os.environ.get(
                 "MAPPING_STUCK_CONFIRM_STEPS", "2")))
             self._last_motion_failed = \
                 self._visual_stall_count >= confirm_steps
-            if self._last_motion_failed and self.calibrator.actions and \
-                    self.calibrator.actions[-1] == int(Action.MOVE_FORWARD):
-                # 上一步命令未产生视觉运动，不把它当作尺度样本或航位
-                # 推算中的真实前进。-1 是内部 no-op，不会发给 benchmark。
-                self.calibrator.actions[-1] = -1
+            if self._last_motion_failed and self.calibrator.actions:
+                # 卡住的命令未产生视觉运动，不把它当作尺度样本或航位
+                # 推算中的真实前进：标记最近一步和首次卡住的那一步。
+                # -1 是内部 no-op，不会发给 benchmark。
+                for idx in {len(self.calibrator.actions) - 1,
+                            self._stall_first_idx}:
+                    if idx is not None and \
+                            0 <= idx < len(self.calibrator.actions) and \
+                            self.calibrator.actions[idx] == \
+                            int(Action.MOVE_FORWARD):
+                        self.calibrator.actions[idx] = -1
         else:
             self._visual_stall_count = 0
+            self._stall_first_idx = None
         self._last_visual = visual
         # 实验：喂给 SLAM 前中心裁剪，把 hfov 从 90° 收窄到 VGGT
         # 训练分布内的范围（0.5 -> 约 53°）。只影响 SLAM 输入，

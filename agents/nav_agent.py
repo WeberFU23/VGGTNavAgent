@@ -175,6 +175,14 @@ class NavAgent(MappingAgent):
         self._no_hit_queries = 0
         self._target_mode = "any"
         self._target_count = None
+        # 图像目标（image-goal）模式：benchmark 下发描边目标照片而非文字。
+        # _goal_images[i] = (label, jpeg_bytes)；_goal_found 记录已报告目标
+        # 的索引，决策时只附未找到的目标照片。description 模式全部为空。
+        self._image_goal_mode = False
+        self._goal_images = []
+        self._goal_descriptions = []
+        self._goal_found = set()
+        self._instance_goal_index = {}
         self._selected_evidence = None
         self._arrival_transition_active = False
         # 到达决策 API 故障计数：transient 失败时保持目标并逐步重试，
@@ -363,7 +371,11 @@ class NavAgent(MappingAgent):
                 [pose_by_frame[int(fid)] for fid in frame_ids])
             align_R = nav.gravity_alignment(
                 poses64, cam_up=nav.mount_compensated_cam_up())
-        grid = nav.OccupancyGrid.from_frame_points(frames, align_R)
+        locked_scale = self._metric_scale_value()
+        grid = nav.OccupancyGrid.from_frame_points(
+            frames, align_R,
+            unit_per_m=(None if locked_scale is None
+                        else 1.0 / max(locked_scale, 1e-9)))
         if grid is None:
             return
         trajectory = list(self._frontier_trajectory)
@@ -604,9 +616,8 @@ class NavAgent(MappingAgent):
                 self.align_R = nav.gravity_alignment(
                     poses64, cam_up=nav.mount_compensated_cam_up())
             self._update_pool_slam_anchor(poses64[0])
-            grid = nav.OccupancyGrid.from_frame_points(
-                frames, self.align_R)
-            if grid is None:
+            grid, scale = self._build_metric_grid(frames, self.align_R)
+            if grid is None or scale is None:
                 return False
             # Deduplicate overlap frames exactly as OccupancyGrid does, then
             # retain a bounded, color-aligned point snapshot for VLM rendering.
@@ -665,17 +676,9 @@ class NavAgent(MappingAgent):
         latest_fid = int(frame_ids[order][-1])
         latest_pose = poses64[order][-1]
         cur = latest_pose[:3, 3] @ self.align_R.T
-        # 尺度：栅格尺规（相机离地 1.5m）与在线动作标定（0.25m/步）
-        # 双源独立喂入，播种时交叉验证（见 _update_metric_snapshot）。
-        raw_scale = 1.0 / grid.unit_per_m if grid.unit_per_m > 0 else None
-        if raw_scale:
-            self._frontier_scale = self._update_metric_snapshot(
-                raw_scale, source="grid")
-        cal_scale = self.calibrator.current_scale()
-        if cal_scale:
-            self._frontier_scale = self._update_metric_snapshot(
-                cal_scale, source="calibrator")
-        scale = self._metric_scale_value() or 1.0
+        # ``_build_metric_grid`` guarantees that occupancy and all downstream
+        # consumers share this camera-height-normalized scale.  The action
+        # calibrator is deliberately excluded from navigation.
         self._frontier_scale = scale
         slam_x, slam_y, slam_yaw = nav.pose_to_yaw_2d(
             latest_pose, self.align_R)
@@ -820,115 +823,95 @@ class NavAgent(MappingAgent):
         return (int(round(x_m / bucket_m)), int(round(y_m / bucket_m)))
 
     def _update_metric_snapshot(self, candidate, source):
-        """Accept only stable metric-scale changes for all nav consumers."""
-        try:
-            candidate = float(candidate)
-        except (TypeError, ValueError):
-            return self._metric_scale_value() or 1.0
-        if not math.isfinite(candidate) or candidate <= 0:
-            return self._metric_scale_value() or 1.0
+        """Track one stable camera-height scale for all navigation consumers.
+
+        Absolute scale is not observable from monocular motion alone.  The
+        navigation contract therefore accepts only the multi-frame floor /
+        known-camera-height ruler produced by ``OccupancyGrid``.  The action
+        calibrator remains a diagnostic signal in ``MappingAgent`` but can no
+        longer seed, switch or otherwise perturb navigation geometry.
+        """
         snapshot = self._metric_snapshot
         current = snapshot.get("scale")
         src = str(source)
-        # 各来源的候选与连续一致计数（±12%），供播种时交叉验证
-        by_src = snapshot.setdefault("by_source", {})
-        last = by_src.get(src)
+        try:
+            candidate = float(candidate)
+        except (TypeError, ValueError):
+            return float(current) if current is not None else 1.0
+        if not math.isfinite(candidate) or candidate <= 0:
+            return float(current) if current is not None else 1.0
+
+        if src == "calibrator":
+            # Keep the value for post-run diagnosis, never for navigation.
+            snapshot["action_scale_diagnostic"] = candidate
+            if not snapshot.get("action_scale_ignored_reported"):
+                self._log_event(
+                    "action-derived scale ignored by navigation; "
+                    "camera-height normalization is authoritative")
+                snapshot["action_scale_ignored_reported"] = True
+            return float(current) if current is not None else 1.0
+
+        if not self.scale_plausible_min <= candidate <= \
+                self.scale_plausible_max:
+            self._log_event(
+                f"camera-height scale rejected out of range "
+                f"{candidate:.3f} (source={src})")
+            return float(current) if current is not None else 1.0
+
+        stable_needed = max(2, int(os.environ.get(
+            "NAV_GRID_SCALE_STABLE_COUNT", "3")))
+        tolerance = float(os.environ.get(
+            "NAV_GRID_SCALE_STABLE_REL", "0.12"))
+        last = snapshot.get("grid_observation")
         if last is not None and abs(candidate - last[0]) / max(
-                abs(last[0]), 1e-6) <= 0.12:
-            by_src[src] = (candidate, last[1] + 1)
+                abs(last[0]), 1e-6) <= tolerance:
+            observation = (candidate, int(last[1]) + 1)
         else:
-            by_src[src] = (candidate, 1)
-        in_range = (self.scale_plausible_min <= candidate <=
-                    self.scale_plausible_max)
-        if not in_range and current is not None and \
-                self.scale_plausible_min <= current <= self.scale_plausible_max:
-            # 软钳制：已有可信尺度时，拒绝把它换成离谱值。
-            # 但未播种（current None）或当前尺度本身出格时必须放行——
-            # 该估计器是自指的，接受错误种子后后续候选才会向真实值
-            # 回归（v15: 6.6→2.5→0.7）；一律硬拒会让尺度永远卡在 1.0。
-            self._log_event(
-                f"metric scale candidate rejected out of range "
-                f"{candidate:.3f} (source={source})")
-            return float(current)
+            observation = (candidate, 1)
+        snapshot["grid_observation"] = observation
+
         if current is None:
-            # 双源交叉验证播种：grid 尺规（地板+相机高 1.5m）和动作标定
-            # （0.25m/步真实位移）独立估计，一致才采信；grid 的地板峰
-            # 找错会产出 2.3-8.8 的垃圾值（rand10 轮实测），单源不可信。
-            g, c = by_src.get("grid"), by_src.get("calibrator")
-            seed = None
-            note = ""
-            if g and c:
-                rel = abs(g[0] - c[0]) / max(abs(c[0]), 1e-6)
-                if rel <= 0.30:
-                    seed, note = c[0], "cross-validated"  # 真实位移源优先
-                elif g[1] >= 3 and c[1] >= 3:
-                    # 两源各自稳定但持续不一致：尺规的错误模式（地板峰
-                    # 找错）不会自愈，真实位移源更可信，采 calibrator。
-                    seed, note = c[0], f"calibrator overrides grid={g[0]:.3f}"
-            else:
-                # 单源兜底：该源 3 连一致且没有其他源出现过
-                rec = by_src.get(src)
-                if rec is not None and rec[1] >= 3 and len(by_src) == 1:
-                    seed, note = rec[0], f"single-source {src}"
-            if seed is not None:
-                snapshot.update(scale=seed, source=src, revision=1,
-                                pending=None, pending_count=0, far_count=0)
-                self._invalidate_metric_navigation()
+            if observation[1] < stable_needed:
                 self._log_event(
-                    f"metric scale seeded {seed:.3f} ({note})")
-                return seed
-            self._log_event(
-                f"metric scale seed awaiting cross-validation "
-                f"(grid={g[0] if g else None}, calibrator={c[0] if c else None})")
-            return 1.0
-        relative = abs(candidate - current) / max(abs(current), 1e-6)
-        if relative <= 0.12:
-            snapshot.update(scale=candidate, source=str(source),
-                            pending=None, pending_count=0, far_count=0)
-            return candidate
-        # 自愈逃生口：候选持续大幅偏离 current（>2x 或 <0.5x）说明 current
-        # 大概率是坏种子。候选彼此抖动凑不齐 3 连时（pending 机制失效），
-        # 累计 far_count 次大幅偏离后强制切换，避免错误尺度终身锁死。
-        if relative > 0.5:
-            far_count = int(snapshot.get("far_count", 0)) + 1
-            snapshot["far_count"] = far_count
-            # 出格 current + 合理 candidate：收敛方向明确，降低门槛加速自愈
-            # （v16 mL8 中 7.5 的坏种子靠 far_count=5 收敛花了 190 步）。
-            threshold = 5
-            if in_range and not (self.scale_plausible_min <= current <=
-                                 self.scale_plausible_max):
-                threshold = 2
-            if far_count >= threshold:
-                snapshot.update(scale=candidate, source=str(source),
-                                revision=int(snapshot.get("revision", 0)) + 1,
-                                pending=None, pending_count=0, far_count=0)
-                self._invalidate_metric_navigation()
-                self._log_event(
-                    f"metric scale snapshot force-switched to "
-                    f"{candidate:.3f} ({source}); old={current:.3f} "
-                    f"persistently mismatched")
-                return float(snapshot["scale"])
-        else:
-            snapshot["far_count"] = 0
-        pending = snapshot.get("pending")
-        if pending is not None and abs(candidate - pending) / max(
-                abs(pending), 1e-6) <= 0.12:
-            snapshot["pending_count"] = int(snapshot.get("pending_count", 0)) + 1
-        else:
-            snapshot["pending"] = candidate
-            snapshot["pending_count"] = 1
-        if snapshot["pending_count"] >= 3:
-            snapshot.update(scale=candidate, source=str(source),
-                            revision=int(snapshot.get("revision", 0)) + 1,
-                            pending=None, pending_count=0, far_count=0)
+                    f"camera-height scale awaiting stability "
+                    f"{candidate:.3f} ({observation[1]}/{stable_needed})")
+                return 1.0
+            snapshot.update(scale=candidate, source="camera_height",
+                            revision=1, pending=None, pending_count=0)
             self._invalidate_metric_navigation()
             self._log_event(
-                f"metric scale snapshot switched to {candidate:.3f} ({source})")
+                f"camera-height scale locked at {candidate:.3f}")
+            return candidate
+
+        relative = abs(candidate - current) / max(abs(current), 1e-6)
+        if relative <= tolerance:
+            # Lock within the tolerance band.  Updating every planning cycle
+            # made obstacle radii and arrival thresholds breathe with floor
+            # noise even though the SLAM coordinate frame had not rescaled.
+            snapshot.update(pending=None, pending_count=0)
+            return float(current)
+
+        pending = snapshot.get("pending")
+        if pending is not None and abs(candidate - pending) / max(
+                abs(pending), 1e-6) <= tolerance:
+            pending_count = int(snapshot.get("pending_count", 0)) + 1
         else:
+            pending, pending_count = candidate, 1
+        snapshot.update(pending=pending, pending_count=pending_count)
+        if pending_count >= stable_needed:
+            old = float(current)
+            snapshot.update(scale=candidate, source="camera_height",
+                            revision=int(snapshot.get("revision", 0)) + 1,
+                            pending=None, pending_count=0)
+            self._invalidate_metric_navigation()
             self._log_event(
-                f"metric scale candidate deferred {candidate:.3f}; "
-                f"current={current:.3f}")
-        return float(snapshot["scale"])
+                f"camera-height scale relocked at {candidate:.3f}; "
+                f"old={old:.3f}")
+            return candidate
+        self._log_event(
+            f"camera-height scale change deferred {candidate:.3f}; "
+            f"current={current:.3f} ({pending_count}/{stable_needed})")
+        return float(current)
 
     def _invalidate_metric_navigation(self):
         """Discard geometry whose metres-per-unit contract just changed."""
@@ -948,12 +931,46 @@ class NavAgent(MappingAgent):
         self._metric_replan_required = True
 
     def _metric_scale_value(self):
-        # 未播种阶段不回退到 calibrator 的原始估计——那正是坏种子的来源；
-        # 调用方统一用 `or 1.0` 兜底，直到快照层确认估计可信。
+        # 动作标定仅用于诊断，绝不作为导航尺度回退值。
         scale = self._metric_snapshot.get("scale")
         if scale is not None:
             return float(scale)
         return None
+
+    def _build_metric_grid(self, frames, align_R):
+        """Build occupancy in one camera-height-normalized metric contract.
+
+        The first pass estimates metres-per-SLAM-unit from the robust
+        multi-frame floor-to-camera ruler.  Once a temporally stable scale is
+        locked, the second pass rebuilds every metric layer (floor bands,
+        voxel size, robot inflation and ray ranges) with that exact scale.
+        This prevents A* from using a grid built with one ruler while path
+        costs and reach thresholds use another.
+
+        Returns ``(grid, scale)``.  Before temporal lock, this snapshot's own
+        floor ruler is used consistently for the current planning cycle.
+        """
+        provisional = nav.OccupancyGrid.from_frame_points(frames, align_R)
+        if provisional is None:
+            return None, None
+        raw_scale = (1.0 / provisional.unit_per_m
+                     if provisional.unit_per_m > 0 else None)
+        if raw_scale is None or not math.isfinite(raw_scale):
+            return None, None
+        self._update_metric_snapshot(raw_scale, source="grid")
+        scale = self._metric_scale_value() or raw_scale
+        unit_per_m = 1.0 / max(float(scale), 1e-9)
+        if math.isclose(float(provisional.unit_per_m), unit_per_m,
+                        rel_tol=1e-6, abs_tol=1e-9):
+            return provisional, float(scale)
+        rebuilt = nav.OccupancyGrid.from_frame_points(
+            frames, align_R, unit_per_m=unit_per_m)
+        if rebuilt is None:
+            self._log_event(
+                "metric grid rebuild failed under locked camera-height scale; "
+                "navigation deferred")
+            return None, None
+        return rebuilt, float(scale)
 
     def _summarize_frontier_branches(self, frontiers, start_xy, grid, scale,
                                      step):
@@ -1057,6 +1074,83 @@ class NavAgent(MappingAgent):
             f"utility={cluster.get('utility')}")
         return True
 
+    def _capture_goal_images(self, observation):
+        """首个 act 观测时检测 image-goal 模式并收下描边目标照片。
+
+        判定：observation.goal_type == "image" 且 goal_images 非空。收图后
+        若尚未生成冷启动描述，用决策 VLM 做一次确定性的 chat_text 调用
+        （不进决策循环）：为每张照片中描边标出的物体写检索友好描述。
+        description 模式完全不进入此分支。
+        """
+        if self._image_goal_mode or self._goal_images:
+            return
+        if str(getattr(observation, "goal_type", "") or "").lower() != "image":
+            return
+        raw = getattr(observation, "goal_images", None) or []
+        encoded = []
+        for rgb in raw:
+            if rgb is None:
+                continue
+            try:
+                encoded.append(self.vlm.encode_rgb(np.asarray(rgb)))
+            except Exception:
+                continue
+        if not encoded:
+            return
+        self._image_goal_mode = True
+        self._goal_images = encoded
+        self._goal_descriptions = [""] * len(encoded)
+        self._goal_found = set()
+        self._log_event(
+            f"image-goal mode: captured {len(encoded)} goal image(s)")
+        self._ensure_goal_descriptions()
+
+    def _ensure_goal_descriptions(self):
+        """冷启动：为每张目标照片生成检索友好描述（只调一次，失败回退）。"""
+        if not self._image_goal_mode or not self._goal_images:
+            return
+        if any(self._goal_descriptions):
+            return
+        images = [(f"goal_image_{i}", payload)
+                  for i, payload in enumerate(self._goal_images)]
+        prompt = (
+            "Each attached image shows one target object outlined by a "
+            "bright border. For every image, write one retrieval-friendly "
+            "description of the outlined object only: its category and "
+            "intrinsic appearance (color, material, shape, size, pattern, "
+            "distinguishing details). Do NOT describe where it sits in the "
+            "photo, the room around it, or any other object. Reply with "
+            "exactly one line per image, prefixed by its label, e.g. "
+            "'goal_image_0: a red folding chair with metal legs'.")
+        try:
+            text = self.vlm.chat_text(prompt, images=images,
+                                      max_tokens=800)
+        except Exception:
+            text = None
+        descs = [""] * len(self._goal_images)
+        if text:
+            for line in str(text).splitlines():
+                line = line.strip()
+                match = re.match(r"goal_image_(\d+)\s*[:：]\s*(.+)", line)
+                if match:
+                    idx = int(match.group(1))
+                    if 0 <= idx < len(descs) and not descs[idx]:
+                        descs[idx] = match.group(2).strip()[:300]
+        # 回退：解析不到的索引用原 goal_text 占位，保证字段不为空。
+        fallback = str(getattr(self._last_observation, "goal_text", "") or
+                       "the outlined target object")
+        self._goal_descriptions = [d or fallback for d in descs]
+        self._log_event(
+            f"goal descriptions ready: {self._goal_descriptions}")
+
+    def _goal_images_payload(self):
+        """未找到目标的照片附件，随每次决策 prompt 一起发给 VLM。"""
+        if not self._image_goal_mode:
+            return []
+        return [(f"goal_image_{i}", self._goal_images[i])
+                for i in range(len(self._goal_images))
+                if i not in self._goal_found and self._goal_images[i]]
+
     def act(self, observation):
         self._feed_frame(observation)
         self._last_observation = observation
@@ -1079,6 +1173,7 @@ class NavAgent(MappingAgent):
                 goal_text=str(observation.goal_text or ""))
         self._target_mode = str(observation.target_mode or "any").lower()
         self._target_count = observation.target_count
+        self._capture_goal_images(observation)
         self._capture_pool_world_anchor(observation)
         if self._last_motion_failed and \
                 observation.previous_action == int(Action.MOVE_FORWARD):
@@ -1419,6 +1514,14 @@ class NavAgent(MappingAgent):
             return int(Action.TURN_LEFT)
         self._reported_count += 1
         self._no_hit_queries = 0
+        # image-goal 记账：该实例绑定了目标照片索引则标记此目标已找到，
+        # 之后决策不再附对应 goal_image。
+        goal_index = self._instance_goal_index.get(node.iid)
+        if goal_index is not None:
+            self._goal_found.add(int(goal_index))
+            self._log_event(
+                f"goal_image_{int(goal_index)} marked found via instance "
+                f"{node.iid}")
         self._log_event(
             f"ReportClaim {claim.claim_id}: instance {node.iid} -> "
             f"TARGET_FOUND (total {self._reported_count})")
@@ -1453,10 +1556,24 @@ class NavAgent(MappingAgent):
             results = self.client.retrieve_captions(query, top_k=limit)
         except Exception as exc:
             return {"error": str(exc)[:200]}
-        return [{"frame_id": r.get("frame_id"),
-                 "score": round(float(r.get("score", 0.0)), 3),
-                 "caption": str(r.get("caption", ""))[:300]}
-                for r in results]
+        rows = []
+        skipped_empty = 0
+        for r in results:
+            caption = str(r.get("caption", "")).strip()
+            if not caption:
+                # caption 尚未生成的帧不配作为检索结果：空文本的"高分"
+                # 只会误导决策。记数并在结果里说明。
+                skipped_empty += 1
+                continue
+            rows.append({"frame_id": r.get("frame_id"),
+                         "score": round(float(r.get("score", 0.0)), 3),
+                         "caption": caption[:300]})
+        if not rows and skipped_empty:
+            return {"results": [], "note":
+                    f"{skipped_empty} matched frame(s) still lack captions; "
+                    "captioning lags behind mapping — explore more and retry "
+                    "later"}
+        return rows
 
     def _tool_search_instances(self, query, reported=None, top_k=10):
         """按VLM给出的关键词直接检索实例text；OR匹配，命中数排序。"""
@@ -1796,12 +1913,28 @@ class NavAgent(MappingAgent):
                            "closer, then propose from the new viewpoint")
         return out
 
-    def _tool_som_pick(self, frame_id, mask_ids, query=""):
+    def _validate_goal_index(self, goal_index):
+        """image-goal 目标索引校验：非 image 模式或非法值一律归 None。"""
+        if goal_index is None:
+            return None
+        if not self._image_goal_mode:
+            return None
+        try:
+            idx = int(goal_index)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= idx < len(self._goal_images):
+            return idx
+        return None
+
+    def _tool_som_pick(self, frame_id, mask_ids, query="", goal_index=None):
         """把 SoM 选中的 mask 注册为待审核候选（复用 commit 流程）。
 
         每个 mask 的质心成为候选像素、mask 本体用于深度采样与证据图。
         返回后需照常检查证据面板并用 commit_candidates 提交裁决。
+        goal_index（可选 int）：image-goal 模式下该候选对应的目标照片索引。
         """
+        goal_index = self._validate_goal_index(goal_index)
         if not isinstance(mask_ids, (list, tuple)) or not mask_ids:
             return {"error": "mask_ids must be a non-empty list of ints"}
         try:
@@ -1822,6 +1955,7 @@ class NavAgent(MappingAgent):
                 "pixel_norm": list(pixel), "bbox": candidate.get("bbox"),
                 "query": str(query)[:300]
                          or f"som mask {candidate.get('mask_id')}",
+                "goal_index": goal_index,
                 "step": int(
                     getattr(self._last_observation, "step_count", 0)),
                 "status": "pending",
@@ -1914,6 +2048,7 @@ class NavAgent(MappingAgent):
                                "candidate_id": cid,
                                "pixel": proposal["pixel_norm"],
                                "bbox": proposal.get("bbox"),
+                               "goal_index": proposal.get("goal_index"),
                                "text": str(label or proposal["query"])})
         changed = self._ingest_semantic_hits(
             self._last_observation, valid_hits, select=False) or []
@@ -1939,14 +2074,17 @@ class NavAgent(MappingAgent):
                 out["_tool_images"] = dup_images
         return out
 
-    def _tool_instantiate_points(self, frame_id, pixels_1000, label=""):
+    def _tool_instantiate_points(self, frame_id, pixels_1000, label="",
+                                 goal_index=None):
         """按像素坐标实例化 3D 目标（0-1000 归一化坐标）。
 
         两段式确认：像素必须先经过"十字证据图给 VLM 看过"（本工具第一次
         调用渲染返回并登记）。VLM 看图后原样重发
         同坐标即确认，跳过语义审核直接做 3D 几何验证；未确认的坐标返回
         pending_confirmation + 十字图，不注册任何实例。
+        goal_index（可选 int）：image-goal 模式下该候选对应的目标照片索引。
         """
+        goal_index = self._validate_goal_index(goal_index)
         if self._last_observation is None:
             return {"error": "no observation yet"}
         if not isinstance(pixels_1000, (list, tuple)) or not pixels_1000:
@@ -1972,6 +2110,7 @@ class NavAgent(MappingAgent):
                      "candidate_id": row.get("candidate_id"),
                      "bbox": row.get("bbox"),
                      "point_score": row.get("point_score", 1.0),
+                     "goal_index": goal_index,
                      "text": desc}
                     for row in candidates]
             pending, accepted, semantic_rejections = [], [], []
@@ -2478,6 +2617,11 @@ class NavAgent(MappingAgent):
                              for label, _payload in images):
                 images.insert(0, (
                     "current_observation", self.vlm.encode_rgb(observation.rgb)))
+            # image-goal 模式：每次决策附上尚未找到的目标照片（含 adjustment），
+            # VLM 自己也是发现目标的力量；审核链的下一轮 prompt 自动带图。
+            for label, payload in self._goal_images_payload():
+                if not any(l == label for l, _ in images):
+                    images.append((label, payload))
             state_fn = state_fn or (lambda: self._build_decider_input(observation))
             state, map_png = state_fn()
             result = self.decision_loop.decide(
@@ -3317,6 +3461,9 @@ class NavAgent(MappingAgent):
                 "bbox": h.get("bbox"),
                 "depth_std": h.get("depth_std"),
             }
+            hit_goal_index = self._validate_goal_index(h.get("goal_index"))
+            if hit_goal_index is not None:
+                evidence["goal_index"] = hit_goal_index
             replay_observation = self.memory.find_replay_observation(
                 candidate_id=h.get("candidate_id"),
                 frame_id=h.get("frame_id"), pixel=h.get("pixel"),
@@ -3395,6 +3542,9 @@ class NavAgent(MappingAgent):
                 "frame_id": h.get("frame_id"),
                 "confidence": round(float(h.get("point_score", 0.0)), 3),
             })
+            if hit_goal_index is not None and \
+                    node.iid not in self._instance_goal_index:
+                self._instance_goal_index[node.iid] = hit_goal_index
         if not changed and not dup_reviews:
             self._no_hit_queries += 1
             return None if select else []
@@ -3464,6 +3614,10 @@ class NavAgent(MappingAgent):
             resolved = "duplicate"
         else:
             return {"error": "decision must be NEW or DUPLICATE"}
+        # image-goal 记账：观测证据上带着目标索引时挂到最终实例上。
+        obs_goal = (observation.evidence or {}).get("goal_index")
+        if obs_goal is not None and node.iid not in self._instance_goal_index:
+            self._instance_goal_index[node.iid] = int(obs_goal)
         for proposal in self._proposals.values():
             if proposal.get("observation_id") == observation.oid:
                 proposal["status"] = f"resolved_{resolved}"
@@ -3486,6 +3640,10 @@ class NavAgent(MappingAgent):
         self.memory.merge_instances(keep, drop)
         if text:
             keep.text = str(text)
+        # image-goal 记账：drop 带目标索引而 keep 没有时迁移过去。
+        drop_goal = self._instance_goal_index.pop(drop.iid, None)
+        if drop_goal is not None and keep.iid not in self._instance_goal_index:
+            self._instance_goal_index[keep.iid] = drop_goal
         # 清理 agent 侧对 drop 的引用
         self._unreachable_instance_ids.discard(drop.iid)
         if self.target_instance_id == drop.iid:
@@ -3561,19 +3719,9 @@ class NavAgent(MappingAgent):
             if self.align_R is None:
                 self.align_R = nav.gravity_alignment(
                     poses, cam_up=nav.mount_compensated_cam_up())
-            grid = nav.OccupancyGrid.from_frame_points(frames, self.align_R)
-            if grid is None:
+            grid, scale = self._build_metric_grid(frames, self.align_R)
+            if grid is None or scale is None:
                 return False
-            raw_scale = (1.0 / grid.unit_per_m
-                         if grid.unit_per_m > 0 else None)
-            if raw_scale:
-                scale = self._update_metric_snapshot(
-                    raw_scale, source="grid")
-            cal_scale = self.calibrator.current_scale()
-            if cal_scale:
-                scale = self._update_metric_snapshot(
-                    cal_scale, source="calibrator")
-            scale = self._metric_scale_value() or 1.0
             self.grid = grid
             self._refresh_anchor(poses, frame_ids)
         except Exception as e:

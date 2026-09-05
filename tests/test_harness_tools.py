@@ -975,23 +975,29 @@ def test_metric_snapshot_defers_one_off_scale_jump():
     assert agent._metric_snapshot["revision"] == 2
 
 
-def test_metric_snapshot_cross_validation_seeds_on_agreement():
-    """双源一致（±30%）立即播种，采 calibrator 值。"""
+def test_metric_snapshot_action_calibrator_is_diagnostic_only():
+    """动作标定无论是否合理都不能播种或切换导航尺度。"""
     agent = _make_agent()
     agent._update_metric_snapshot(1.3, "grid")
     assert agent._metric_snapshot["scale"] is None
-    agent._update_metric_snapshot(1.1, "calibrator")
-    assert agent._metric_snapshot["scale"] == 1.1  # 一致 → 立即播种
+    assert agent._update_metric_snapshot(1.1, "calibrator") == 1.0
+    assert agent._metric_snapshot["scale"] is None
+    assert agent._metric_snapshot["action_scale_diagnostic"] == 1.1
+    agent._update_metric_snapshot(1.3, "grid")
+    agent._update_metric_snapshot(1.3, "grid")
+    assert agent._metric_snapshot["scale"] == 1.3
+    assert agent._update_metric_snapshot(2.5, "calibrator") == 1.3
+    assert agent._metric_snapshot["scale"] == 1.3
 
 
-def test_metric_snapshot_calibrator_overrides_stable_bad_grid():
-    """两源各自稳定但持续不一致：采信真实位移源，挡住尺规垃圾值。"""
+def test_metric_snapshot_out_of_range_grid_never_seeds():
+    """相机高度尺规越界时保持未播种，不接受动作尺度救场。"""
     agent = _make_agent()
     for _ in range(3):
         agent._update_metric_snapshot(8.8, "grid")
         assert agent._metric_snapshot["scale"] is None
         agent._update_metric_snapshot(1.1, "calibrator")
-    assert agent._metric_snapshot["scale"] == 1.1
+    assert agent._metric_snapshot["scale"] is None
 
 
 def test_unreachable_instance_excluded_from_world_state():
@@ -1061,32 +1067,51 @@ def test_activate_memory_target_skips_unreachable():
     assert agent.mode == "nav"
 
 
-def test_metric_snapshot_force_switch_after_persistent_far_mismatch():
-    """坏种子锁死自愈：候选持续 >2x 偏离 current 但彼此抖动凑不齐 3 连时，
-    累计 5 次大幅偏离后强制切换到最新候选。"""
+def test_metric_snapshot_relocks_after_stable_camera_height_change():
+    """SLAM 整体重缩放后，稳定的相机高度尺规三连才切换。"""
     agent = _make_agent()
     for _ in range(3):
-        agent._update_metric_snapshot(2.8, "grid")  # 播种（量程内的坏种子）
-    assert agent._metric_scale_value() == 2.8
-    # 候选彼此差 >12%（pending 机制凑不齐 3 连），但都 >0.5x 偏离 current
-    for value in (1.0, 0.5, 1.1, 0.55):
-        assert agent._update_metric_snapshot(value, "calib") == 2.8
-    assert agent._update_metric_snapshot(1.05, "calib") == 1.05
-    assert agent._metric_snapshot["far_count"] == 0
+        agent._update_metric_snapshot(2.0, "grid")
+    assert agent._metric_scale_value() == 2.0
+    assert agent._update_metric_snapshot(1.0, "grid") == 2.0
+    assert agent._update_metric_snapshot(1.02, "grid") == 2.0
+    assert agent._update_metric_snapshot(0.98, "grid") == 0.98
     assert agent._metric_snapshot["revision"] == 2
 
 
-def test_metric_snapshot_far_count_resets_when_candidate_matches_current():
+def test_metric_snapshot_locks_small_floor_ruler_jitter():
+    """锁定后的 ±12% 地面噪声不改变导航尺度或 revision。"""
     agent = _make_agent()
     for _ in range(3):
-        agent._update_metric_snapshot(2.8, "grid")
-    for value in (1.0, 0.5, 0.95):
-        agent._update_metric_snapshot(value, "calib")
-    assert agent._metric_snapshot["far_count"] == 3
-    assert agent._update_metric_snapshot(2.6, "calib") == 2.6  # 直接接受
-    assert agent._metric_snapshot["far_count"] == 0
-    agent._update_metric_snapshot(1.0, "calib")
-    assert agent._metric_snapshot["far_count"] == 1
+        agent._update_metric_snapshot(2.0, "grid")
+    for value in (2.1, 1.9, 2.18, 1.82):
+        assert agent._update_metric_snapshot(value, "grid") == 2.0
+    assert agent._metric_snapshot["revision"] == 1
+
+
+def test_metric_grid_rebuild_uses_locked_camera_height_scale(monkeypatch):
+    """正式 occupancy 的所有米制层必须使用已锁定的同一个尺度。"""
+    agent = _make_agent()
+    agent._metric_snapshot.update(scale=2.0, source="camera_height",
+                                  revision=1)
+    calls = []
+
+    class _Grid:
+        def __init__(self, unit_per_m):
+            self.unit_per_m = unit_per_m
+
+    def fake_from_frame_points(frames, align_R, unit_per_m=None):
+        calls.append(unit_per_m)
+        # 临时地面尺规给出 scale=2.5；正式重建应坚持 locked scale=2.0。
+        return _Grid(0.4 if unit_per_m is None else unit_per_m)
+
+    monkeypatch.setattr(
+        nav.OccupancyGrid, "from_frame_points",
+        staticmethod(fake_from_frame_points))
+    grid, scale = agent._build_metric_grid([{"frame_id": 1}], np.eye(3))
+    assert scale == 2.0
+    assert grid.unit_per_m == 0.5
+    assert calls == [None, 0.5]
 
 
 class _FakeGrid:
@@ -1121,15 +1146,17 @@ def test_nav_block_radius_scaled_to_metric():
 
 
 def test_metric_snapshot_rejects_out_of_range_candidate():
-    """软量程钳制：未播种时单源 3 连兜底播种（错了靠自愈纠正），
-    已有合理尺度时拒绝离谱切换。"""
+    """量程钳制：出格值永不可播种（v21：calibrator 稳定报 13.1 被
+    "calibrator overrides" 直接采信导致终身锁死）；已有合理尺度时
+    离谱候选被硬拒。"""
     agent = _make_agent()
-    # 未播种：单源 3 连一致兜底播种
+    # 未播种：出格候选单源 3 连也不播种，保持 1.0 等待
     for _ in range(3):
         agent._update_metric_snapshot(7.4, "grid")
-    assert agent._metric_snapshot["scale"] == 7.4
-    # 出格种子允许向合理值自愈（逃生口）
-    for _ in range(5):
+    assert agent._metric_snapshot["scale"] is None
+    assert agent._metric_scale_value() is None
+    # 量程内的候选正常播种
+    for _ in range(3):
         agent._update_metric_snapshot(1.0, "grid")
     assert agent._metric_snapshot["scale"] == 1.0
     # 已有可信尺度后，离谱候选被硬拒
@@ -1138,12 +1165,14 @@ def test_metric_snapshot_rejects_out_of_range_candidate():
 
 
 def test_metric_snapshot_fast_converge_from_out_of_range_seed():
-    """出格种子 + 合理候选：far_count 门槛降为 2，快速自愈。"""
+    """历史遗留的出格尺度只能被稳定相机高度尺规替换。"""
     agent = _make_agent()
-    for _ in range(3):
-        agent._update_metric_snapshot(7.4, "grid")  # 单源 3 连兜底播种
-    assert agent._metric_snapshot["scale"] == 7.4
-    agent._update_metric_snapshot(1.5, "grid")   # 合理候选第 1 次
-    assert agent._metric_snapshot["scale"] == 7.4
-    agent._update_metric_snapshot(1.5, "grid")   # 第 2 次即切换
-    assert agent._metric_snapshot["scale"] == 1.5
+    agent._metric_snapshot.update(scale=13.1, source="calibrator",
+                                  revision=1)
+    agent._update_metric_snapshot(1.15, "grid")
+    agent._update_metric_snapshot(16.6, "calibrator")
+    assert agent._metric_snapshot["scale"] == 13.1
+    agent._update_metric_snapshot(1.15, "grid")
+    assert agent._metric_snapshot["scale"] == 13.1
+    agent._update_metric_snapshot(1.15, "grid")
+    assert agent._metric_snapshot["scale"] == 1.15

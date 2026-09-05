@@ -4,14 +4,16 @@ VGGT-SLAM 输出的位姿/点云只有 Sim(3) 意义下的相对尺度。
 本模块利用 benchmark 已知的离散动作步长（MOVE_FORWARD = 0.25m）
 在线回归"地图单位 -> 米"的尺度因子：
 
-    样本: 相邻关键帧的地图位移 ‖Δp‖ 与其间前进动作数 n_fwd
+    样本: 相邻关键帧间不含转向的纯直行片段及地图位移 ‖Δp‖
     比率: r = 0.25 * n_fwd / ‖Δp‖   （即尺度的一个观测）
     估计: 滑动窗口内的中位数，MAD 剔除异常值
 
-撞墙卡住时真位移≈0 而 n_fwd>0，比率会异常偏大，被中位数和 MAD
-自然抑制；转向动作只改变朝向，不影响位置样本。
+撞墙卡住时真位移≈0 而 n_fwd>0，比率会异常偏大：调用方（mapping_agent）
+会把视觉确认卡住的步回溯标记为 -1（no-op），本模块再把前进数少于
+min_fwd 的段剔除（转向漂移主导），剩余异常由中位数和 MAD 抑制。
 回环优化会全局改写历史位姿、子图间尺度也会缓慢漂移，因此使用
-滑动窗口跟踪尺度，而不是全局累积平均。
+滑动窗口跟踪尺度，而不是全局累积平均。该估计只作诊断；正式导航
+使用多帧地面到相机高度的归一化尺规。
 
 用法::
 
@@ -29,11 +31,15 @@ MOVE_FORWARD = 1
 
 class ScaleCalibrator:
     def __init__(self, forward_step=0.25, window=50, min_samples=5,
-                 mad_k=3.0):
+                 mad_k=3.0, min_fwd=2, plausible_min=0.3,
+                 plausible_max=3.0):
         self.forward_step = forward_step
         self.window = window
         self.min_samples = min_samples
         self.mad_k = mad_k
+        self.min_fwd = min_fwd
+        self.plausible_min = plausible_min
+        self.plausible_max = plausible_max
         self.actions = []        # 每步执行的动作 id
         self.scale_history = []  # (num_actions_seen, scale) 调试记录
         self._starve = 0         # 连续"门控后样本不足"次数（坏 ref 自愈）
@@ -80,12 +86,27 @@ class ScaleCalibrator:
             lo, hi = f_a - 1, f_b - 1
             if lo < 0 or hi > len(self.actions) or hi <= lo:
                 continue
-            n_fwd = sum(1 for a in self.actions[lo:hi] if a == MOVE_FORWARD)
-            if n_fwd == 0:
-                continue  # 纯转向段不含位移信息
+            segment = self.actions[lo:hi]
+            # 端点距离只能代表净位移。若片段中包含转向，累计前进路程
+            # 可能远大于端点弦长（折返时甚至接近 0），用 n_fwd*0.25
+            # 作分子会系统性放大尺度。动作尺度现在只保留纯直行片段；
+            # -1 是调用方确认的碰撞/no-op，可以安全忽略。
+            if any(a not in (MOVE_FORWARD, -1) for a in segment):
+                continue
+            n_fwd = sum(1 for a in segment if a == MOVE_FORWARD)
+            if n_fwd < self.min_fwd:
+                # 前进太少的段由转向时的 SLAM 漂移主导（漂移也产生位移），
+                # 指令位移占不到主导，比率噪声极大，不作样本。
+                continue
             dist = float(np.linalg.norm(positions[i] - positions[i - 1]))
             if dist < 1e-6:
                 continue  # 卡住段，无信息（避免除零）
+            ratio = self.forward_step * n_fwd / dist
+            # 物理量程必须在自指 ref 门控之前执行。否则首个碰撞片段可能
+            # 产生 10x 坏种子，后续门控会围绕坏种子自洽并永久锁死。
+            if not self.plausible_min <= ratio <= self.plausible_max:
+                n_reject += 1
+                continue
             if ref is not None:
                 # 门控：实际位移应与指令位移（0.25*n_fwd 换算成地图单位）
                 # 大致一致。撞墙卡住时 dist 远小于指令位移，比率会爆炸；
@@ -94,7 +115,7 @@ class ScaleCalibrator:
                 if dist < 0.4 * expected or dist > 2.5 * expected:
                     n_reject += 1
                     continue
-            ratios.append(self.forward_step * n_fwd / dist)
+            ratios.append(ratio)
 
         if len(ratios) < self.min_samples:
             if ref is not None:
@@ -113,8 +134,9 @@ class ScaleCalibrator:
 
         self.scale_history.append((len(self.actions), med))
         if n_reject:
+            ref_text = "None" if ref is None else f"{ref:.3f}"
             print(f"[ScaleCalibrator] 门控剔除 {n_reject} 个异常段 "
-                  f"(ref={ref:.3f})")
+                  f"(ref={ref_text})")
         return med
 
     def current_scale(self):

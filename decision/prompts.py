@@ -273,16 +273,9 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   it to survey your surroundings when the map and captions suggest
   nothing useful; to see an object from another angle, move around it
   instead (GOTO_INSTANCE / START_ADJUST).
-- START_ADJUST (takeover): short local movement under your direct
-  control. Legitimate uses: approaching or re-centering a target you can
-  already see; recovering a view blocked at point-blank range; or a
-  BOUNDED local probe (a few steps through a doorway or past an occluder)
-  when no frontier leads where you need. Before entering, decide what
-  this session should reveal. Accountability: if your last adjustment
-  session revealed nothing new (no new keyframe, frontier, or target),
-  do NOT start another one — choose GOTO_FRONTIER or SCAN instead.
-  Repeated zero-progress adjustments waste your step budget and are the
-  most common failure mode. During takeover tools
+- START_ADJUST (takeover): short local adjustment when the camera pose
+  needs refinement, or a small turn/step would reveal unseen space. Prefer
+  it when no frontier or instance looks promising. During takeover tools
   are disabled: reply with exactly one action per turn — MOVE_FORWARD,
   TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN, or END_ADJUST; the action
   executes, then you receive a fresh RGB image. MOVE_FORWARD requires a
@@ -310,20 +303,17 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   END_ADJUST the newest view is navigation.current_frame_id: propose on it
   (propose_candidates) and pick the matching mask with som_pick.
 - REPORT_FOUND instance_id: report the active canonical instance you are
-  standing right next to. target_id is REQUIRED and must equal
+  standing next to. target_id is REQUIRED and must equal
   navigation.active_target.id (or an instance whose dist_m shows you are
-  within ~0.5m of it).
-  Success is judged by DISTANCE with a tight radius: the benchmark
-  accepts a report only from a valid close viewing position of the
-  target — practically, get as close to the object as you reasonably
-  can while keeping it in view. The stored 3D point is approximate, so
-  GOTO_INSTANCE arrival alone is often NOT close enough: after arrival,
-  check the current view; if the target is visible a few steps away,
-  close in with START_ADJUST small steps until it is right in front of
-  you, then report. Report only when you can see the target now or just
-  saw it at arm's length during this approach. If no plausible target
-  is near the arrival point, leave the instance unresolved and move on.
-  In "many"/"all" modes, never report the same physical instance twice.
+  within ~1m of it).
+  Success is judged by DISTANCE, not by vision: the benchmark counts a
+  report when your position is near the target's viewpoint, regardless of
+  what the camera can see. You do NOT need to see the object — when you
+  are very close, it is normal for it to fall outside the frame. If you
+  have arrived at the instance (GOTO_INSTANCE completed, or dist_m is
+  small), REPORT_FOUND even when the object is not visible; never report
+  an instance you have not approached. In "many"/"all" modes, never
+  report the same physical instance twice.
 - FINISH: end the episode (see task modes above).
 
 Cold start: if new_keyframes and relevant_frames are absent and there are no instances yet, no
@@ -356,42 +346,42 @@ EVENT_GUIDANCE = {
         "frontier that advances into a new region or unexplored direction; "
         "if the nearest frontiers cluster around you or retrace areas you "
         "already visited, pick one that leads elsewhere instead. When no "
-        "frontier or instance looks promising, prefer SCAN or relocate to "
-        "the least-bad frontier; START_ADJUST only if your previous "
-        "adjustment session made measurable progress (a new keyframe, "
-        "frontier, or target) and a few more local steps would clearly "
-        "finish what it started."),
+        "frontier or instance looks promising, prefer START_ADJUST: short "
+        "local turns/steps actively reveal nearby space and often expose "
+        "new frontiers or targets. Use START_ADJUST also when a better "
+        "viewing angle would help before making a global choice."),
     "arrival": (
-        "\nYou have arrived at the selected candidate. The current RGB is "
-        "attached and historical candidate evidence may follow. The stored "
-        "3D point is approximate and reports are only accepted from close "
-        "viewing positions of the target, so check the "
-        "current view first: if the target is visible a few steps away, "
-        "START_ADJUST and close in until it is right in front of you, then "
-        "REPORT_FOUND. If no plausible target is near the arrival point, "
-        "leave the instance unresolved and choose another instance or "
-        "frontier. If this arrival is a geometry "
-        "revisit (revisit_targets shows the frame), you are close to the "
-        "target's viewpoint: view the current frame and propose/instantiate "
-        "it from this near distance."),
+        "\nYou have arrived at the selected candidate; the current RGB is "
+        "attached and historical candidate evidence may follow. Arrival at "
+        "the instance position is itself the confirmation the benchmark "
+        "expects: reports are scored by distance to the target viewpoint, "
+        "so use REPORT_FOUND with the active instance id now — even if "
+        "the object is not in view (too close or out of frame is normal, "
+        "not a miss). Only when you doubt the instance's 3D point itself "
+        "should you use START_ADJUST to look around; SCAN is a general "
+        "panorama from this spot, not a way to inspect the candidate. "
+        "When the current candidate is clearly not the target, leave it "
+        "unresolved and choose another instance or frontier. If this "
+        "arrival is a geometry revisit (revisit_targets shows the frame), "
+        "you are close to the target's viewpoint: view the current frame "
+        "and propose/instantiate it from this near distance."),
     "nav_failed": (
         "\nNavigation to the active target failed: repeated collisions "
         "blocked the path, so that instance was marked unreachable and "
         "removed from the instances table (blocked_target in navigation "
         "records it). The current RGB is attached. Choose a different "
-        "instance, a frontier, or SCAN to reconsider the "
-        "scene (START_ADJUST only if your previous adjustment session made "
-        "measurable progress). REPORT_FOUND remains valid if you are still near that "
-        "instance (dist_m within ~0.5m): reports are scored by distance, not "
+        "instance, a frontier, or SCAN/START_ADJUST to reconsider the "
+        "scene. REPORT_FOUND remains valid if you are still near that "
+        "instance (dist_m within ~1m): reports are scored by distance, not "
         "by what you can see."),
     "scan_complete": (
         "\nA general panoramic scan is complete. The images show the "
         "surrounding environment rather than a target verification "
         "sequence; new_keyframes lists the frames collected since your last "
         "decision. Reconsider all refreshed instances and frontiers; choose "
-        "GOTO_INSTANCE or GOTO_FRONTIER; START_ADJUST only if your previous "
-        "adjustment session made measurable progress and a short local "
-        "movement would clearly finish what it started."),
+        "GOTO_INSTANCE, GOTO_FRONTIER, or START_ADJUST when a short "
+        "local active-exploration movement would reveal useful nearby "
+        "space or correct the current camera pose."),
     "finish_check": (
         "\nFINISH is irreversible. Inspect instance memory and task progress "
         "before deciding."),
@@ -423,11 +413,7 @@ EVENT_GUIDANCE = {
         "per reply; never combine moving and turning in one decision. "
         "Use LOOK_UP/LOOK_DOWN for vertical framing, not as a "
         "substitute for changing viewpoint; stay within the pitch limit in "
-        "world_state.adjustment. If this session is revealing nothing new "
-        "(no new keyframe, frontier, or target), END_ADJUST now rather "
-        "than cruising — and do not start another adjustment session "
-        "afterwards; pick a frontier or SCAN instead. Choose END_ADJUST "
-        "immediately when the "
+        "world_state.adjustment. Choose END_ADJUST immediately when the "
         "view/position is sufficient or further adjustment is unsafe or unhelpful."),
 }
 
@@ -497,11 +483,10 @@ REPORT_FOUND it is required and must equal the active canonical instance id.
 Other actions use null. MOVE_FORWARD additionally requires "steps": an
 integer 1..world_state.adjustment.max_forward_steps (0.25m each, executed
 one by one until done or a collision stops them). REPORT_FOUND is scored by
-DISTANCE with a tight radius (you must stand at a close viewing position
-of the target): arrival at the stored point is usually not close enough —
-if you are a few steps away, close in first and report only when the
-target is right in front of you. Do not report purely from
-historical/tool images. FINISH
+DISTANCE, not vision: the
+harness accepts it when you are within ~1m of the instance or it is the
+active target — a target that left your view because you are very close is
+still reportable. Do not report purely from historical/tool images. FINISH
 is irreversible.
 
 Event: {event}

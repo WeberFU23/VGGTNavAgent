@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 
 import numpy as np
 from PIL import Image
@@ -54,6 +55,7 @@ class VLMDecisionClient:
         self._trace_context = {}
         self._trace_warned = False
         self._trace_seq = 0
+        self._trace_session = uuid.uuid4().hex
         self._last_error = None
 
     def set_trace_path(self, path):
@@ -147,6 +149,8 @@ class VLMDecisionClient:
                 image_meta = self._snapshot_images(
                     kind, images, self._trace_seq)
                 record = {
+                    "schema_version": 2,
+                    "call_id": f"{self._trace_session}:{self._trace_seq}",
                     "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "kind": kind,
                     "model": self.model,
@@ -196,7 +200,7 @@ class VLMDecisionClient:
             if self.image_dir and data:
                 extension = ".png" if mime == "image/png" else ".jpg"
                 filename = (
-                    f"{episode}_step-{step}_call-{sequence:06d}_"
+                    f"{self._trace_session}_{episode}_step-{step}_call-{sequence:06d}_"
                     f"{call_kind}_{index:02d}-{self._safe_name(label)}"
                     f"{extension}")
                 path = os.path.join(self.image_dir, filename)

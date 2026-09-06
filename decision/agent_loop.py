@@ -12,8 +12,10 @@ import json
 import os
 import threading
 import time
+import uuid
 
 from decision.prompts import build_decision_prompt, build_final_decision_prompt
+from decision.trace import snapshot
 
 ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER",
            "REPORT_FOUND", "SCAN", "EXPLORE", "FINISH", "START_ADJUST",
@@ -107,14 +109,32 @@ class DecisionLoop:
         self.logger = logger
         self.max_tool_rounds = min(
             DEFAULT_MAX_TOOL_ROUNDS, max(0, int(max_tool_rounds)))
+        self._trace_session = uuid.uuid4().hex
+        self._trace_sequence = 0
+        self._trace_record = None
+        self._trace_snapshot_fn = None
+        self._trace_sink = None
+        self._trace_call_context = None
+        self._trace_warning = False
 
     def decide(self, event, world_state, map_png=None, images=None,
-               state_fn=None):
+               state_fn=None, trace_context=None, trace_snapshot_fn=None,
+               trace_sink=None, trace_call_context=None):
         """一次事件驱动决策。返回 DecisionResult；最终非法/模型不可用
         返回 None（调用方回退确定性规则）。
 
         state_fn: 可选无参回调，在写工具成功后调用。可返回重新生成的
         world-state dict，或 (world-state, map_png)；后者会同时替换旧地图。"""
+        self._trace_sequence += 1
+        self._trace_record = {
+            "schema_version": 2,
+            "decision_id": f"{self._trace_session}:{self._trace_sequence}",
+            "context": snapshot(trace_context or {}),
+            "model_outputs": [], "tools": [], "capture_errors": [],
+        }
+        self._trace_snapshot_fn = trace_snapshot_fn
+        self._trace_sink = trace_sink
+        self._trace_call_context = trace_call_context
         state = world_state
         prompt = self._build_prompt(event, state)
         images = list(images or [])
@@ -347,10 +367,23 @@ class DecisionLoop:
             event, world_state, max_tool_rounds=self.max_tool_rounds)
 
     def _chat(self, prompt, images):
+        record = self._trace_record
+        call_index = len(record["model_outputs"]) + 1 if record else None
+        if record and self._trace_call_context is not None:
+            try:
+                self._trace_call_context(record["decision_id"], call_index)
+            except Exception as exc:
+                self._trace_warn(exc)
         try:
             data = self.chat_fn(prompt, images)
         except Exception:
-            return None
+            data = None
+        if record is not None:
+            try:
+                record["model_outputs"].append({
+                    "call_index": call_index, "output": snapshot(data)})
+            except Exception as exc:
+                self._trace_warn(exc)
         return data if isinstance(data, dict) else None
 
     @staticmethod
@@ -386,6 +419,31 @@ class DecisionLoop:
         return f"tool_{kind}_{safe or 'unknown'}"
 
     def _run_tool(self, tool_call):
+        # Preserve the complete structured result before prompt truncation.
+        self._trace_tool_payload = None
+        result = self._execute_tool(tool_call)
+        if self._trace_record is not None:
+            try:
+                self._trace_record["tools"].append({
+                    "call_index": len(self._trace_record["model_outputs"]),
+                    "request": snapshot(tool_call),
+                    "response": (self._trace_tool_payload
+                                 if self._trace_tool_payload is not None
+                                 else snapshot(json.loads(result[0]))),
+                    "image_labels": [item[0] for item in (result[1] or [])],
+                })
+            except Exception as exc:
+                self._trace_warn(exc)
+        return result
+
+    def _trace_feedback(self, payload):
+        try:
+            self._trace_tool_payload = snapshot(payload)
+        except Exception as exc:
+            self._trace_warn(exc)
+        return self._serialize_tool_feedback(payload)
+
+    def _execute_tool(self, tool_call):
         """执行工具，返回 (统一 JSON, [(label, bytes)]|None, ok)。
 
         工具返回 dict 中的 "_tool_images"（[[label, bytes], ...] 拒绝证据图）
@@ -408,7 +466,7 @@ class DecisionLoop:
                     "ok": True, "tool": name, "state_changed": False,
                     "result": {"instance_id": iid, "image_ref": label},
                 }
-                return (self._serialize_tool_feedback(payload),
+                return (self._trace_feedback(payload),
                         [(label, out)], True)
             if name == "view_frame":
                 out = fn(tool_call.get("frame_id"))
@@ -421,7 +479,7 @@ class DecisionLoop:
                     "ok": True, "tool": name, "state_changed": False,
                     "result": {"frame_id": fid, "image_ref": label},
                 }
-                return (self._serialize_tool_feedback(payload),
+                return (self._trace_feedback(payload),
                         [(label, out)], True)
             out = fn(**{k: v for k, v in tool_call.items() if k != "name"})
             if isinstance(out, dict) and "error" in out:
@@ -440,7 +498,7 @@ class DecisionLoop:
                 "state_changed": name in WRITE_TOOLS,
                 "result": out,
             }
-            return (self._serialize_tool_feedback(payload),
+            return (self._trace_feedback(payload),
                     tool_images, True)
         except Exception as exc:
             return self._tool_error(name, "TOOL_EXCEPTION", exc)
@@ -562,17 +620,48 @@ class DecisionLoop:
             tool_calls=result.tool_calls)
 
     def _log(self, event, world_state, output, validation, tool_calls):
-        if self.logger is None:
-            return
-        self.logger.log({
+        record = {
+            **(self._trace_record or {}),
             "step": world_state.get("step"),
             "event": str(event),
             "input_summary": {
                 "instances": len(world_state.get("instances", [])),
+                # U_t 统计用这个：上面的 instances 是有界表（top-K）行数，
+                # 池子大时会低估。
+                "unreported_instances": int(
+                    world_state.get("instances_total") or 0) - len(
+                    world_state.get("reported_instance_ids") or []),
                 "frontiers": len(world_state.get("frontiers", [])),
                 "task": world_state.get("task"),
             },
             "output": output,
             "validation": validation,
             "tool_calls": tool_calls,
-        })
+        }
+        try:
+            record["world_state"] = snapshot(world_state)
+            record["output"] = snapshot(output)
+            record["decision_origin"] = (
+                "fallback" if output is None else
+                "harness" if validation != "ok" else "vlm")
+            if self._trace_snapshot_fn is not None:
+                try:
+                    record["agent_snapshot"] = snapshot(self._trace_snapshot_fn())
+                except Exception as exc:
+                    record["snapshot_error"] = str(exc)
+            record = snapshot(record)
+            if self._trace_sink is not None:
+                self._trace_sink(record)
+            if self.logger is not None:
+                self.logger.log(record)
+        except Exception as exc:
+            # An unavailable/full log disk must never turn a valid action
+            # into the caller's navigation fallback.
+            self._trace_warn(exc)
+
+    def _trace_warn(self, exc):
+        if self._trace_record is not None:
+            self._trace_record.setdefault("capture_errors", []).append(str(exc))
+        if not self._trace_warning:
+            self._trace_warning = True
+            print(f"[DecisionLoop] diagnostic capture failed: {exc}", flush=True)

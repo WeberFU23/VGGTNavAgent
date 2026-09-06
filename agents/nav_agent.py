@@ -34,6 +34,7 @@ from agents.memory import InstanceMemory
 from decision import (DecisionLoop, DecisionResult, DecisionTraceLogger,
                       VLMDecisionClient)
 from runtime_paths import env_debug_path
+from decision.trace import snapshot as trace_snapshot
 
 class NavAgent(MappingAgent):
     def __init__(self):
@@ -133,6 +134,11 @@ class NavAgent(MappingAgent):
         self._nav_reset_state()
 
     def _nav_reset_state(self):
+        self._paper_decisions = []
+        self._paper_steps = []
+        self._paper_steering = []
+        self._paper_warning = False
+        self._paper_errors = []
         self.mode = "explore"           # explore / nav / reported
         self.target_text = None
         self.target_point = None        # 地图坐标（未缩放单位），(3,)
@@ -1232,6 +1238,18 @@ class NavAgent(MappingAgent):
             # Adjustment bypasses _explore_follow(), so keep its pose estimate
             # synchronized with the atomic action executed by the VLM.
             self._explore_follower.dead_reckon(action)
+        try:
+            self._paper_steps.append(trace_snapshot({
+                "step": observation.step_count, "action": int(action),
+                "mode_after": self.mode,
+                "active_instance_id": self.target_instance_id,
+                "previous_motion_failed": self._last_motion_failed,
+                "adjusting": self._adjusting, "scanning": self._scanning,
+                "reported_count": self._reported_count,
+                "metric_revision": self._metric_snapshot.get("revision"),
+            }))
+        except Exception as exc:
+            self._paper_warn(exc)
         return action
 
     def _clear_current_target(self):
@@ -1390,7 +1408,7 @@ class NavAgent(MappingAgent):
             return 1.0 / unit_per_m
         return None
 
-    def get_target_pool(self):
+    def get_target_pool(self, include_ids=False):
         """评测采集接口：当前 episode 全部 canonical instance 的世界坐标。
 
         契约（与 benchmark 评测器约定）：list[dict]，每项
@@ -1439,9 +1457,111 @@ class NavAgent(MappingAgent):
                     "reported": bool(node.reported),
                     "label": str(node.text or "")[:100],
                 })
+                if include_ids:
+                    pool[-1]["instance_id"] = node.iid
             return pool
         except Exception:
             return []
+
+    def _paper_warn(self, exc):
+        self._paper_errors.append(str(exc))
+        if not self._paper_warning:
+            self._paper_warning = True
+            print(f"[NavAgent] diagnostic capture failed: {exc}", flush=True)
+
+    def _paper_snapshot(self):
+        """Read existing memory only: no RPC, A*, refresh or model-visible write."""
+        return {
+            "coordinate_system": "gravity_aligned_slam_z_up_unscaled",
+            "metric_transform": self._metric_snapshot,
+            "world_anchor": self._pool_world_anchor,
+            "slam_anchor": self._pool_slam_anchor,
+            "world_pool": self.get_target_pool(include_ids=True),
+            "world_pool_status": ("available" if self._pool_world_anchor is not None
+                                  and self._pool_slam_anchor is not None
+                                  and self._pool_metric_scale() is not None
+                                  else "transform_unavailable"),
+            "instances": [{
+                "instance_id": nd.iid, "point": nd.point, "text": nd.text,
+                "reported": nd.reported, "report_claim_id": nd.report_claim_id,
+                "observation_ids": nd.observation_ids,
+                "candidate_id": nd.candidate_id, "frame_id": nd.frame_id,
+                "created_step": nd.step,
+                "unreachable": nd.iid in self._unreachable_instance_ids,
+                "goal_index": self._instance_goal_index.get(nd.iid),
+            } for nd in self.memory.nodes],
+            "report_claims": [c.as_dict() for c in self.memory.report_claims],
+        }
+
+    def _paper_trace_kwargs(self, observation, event):
+        # Legacy/custom decision-loop implementations keep their old signature.
+        if not isinstance(self.decision_loop, DecisionLoop):
+            return {}
+        context = {
+            "run_id": os.environ.get("NAV_RUN_ID", "current"),
+            "episode": str(getattr(observation, "episode_id", "")),
+            "scene_id": str(getattr(observation, "scene_id", "")),
+            "step": int(observation.step_count), "event": str(event),
+            "goal_text": str(getattr(observation, "goal_text", "") or ""),
+        }
+
+        def call_context(decision_id, call_index):
+            if hasattr(self.vlm, "set_trace_context"):
+                self.vlm.set_trace_context(
+                    **context, decision_id=decision_id,
+                    decision_call_index=call_index)
+
+        return {
+            "trace_context": context,
+            "trace_snapshot_fn": self._paper_snapshot,
+            "trace_sink": self._paper_decisions.append,
+            "trace_call_context": call_context,
+        }
+
+    def get_paper_trace(self):
+        """Optional evaluator side channel, read only after episode execution.
+
+        Decision snapshots were detached at decision time, before steering or
+        reporting. This method cannot put ground truth into a model prompt.
+        """
+        try:
+            final_memory = self._paper_snapshot()
+        except Exception as exc:
+            final_memory = {"error": str(exc)}
+        return trace_snapshot({
+            "schema_version": 1,
+            "decisions": self._paper_decisions, "steps": self._paper_steps,
+            "steering_events": self._paper_steering,
+            "final_memory": final_memory,
+            "capture_errors": self._paper_errors,
+            "file_warnings": {
+                "decision_trace": bool(getattr(
+                    getattr(self.decision_loop, "logger", None), "_warned", False)),
+                "vlm_trace": bool(getattr(self.vlm, "_trace_warned", False)),
+            },
+            "observations": [o.as_dict() for o in self.memory.observations.values()],
+            "action_history": self._action_log,
+            "artifacts": {
+                "decision_trace": getattr(getattr(self.decision_loop, "logger", None),
+                                          "path", None),
+                "vlm_calls": getattr(self.vlm, "trace_path", None),
+                "vlm_images": getattr(self.vlm, "image_dir", None),
+            },
+            "decision_model": getattr(self.vlm, "model", None),
+            "effective_configuration": {
+                name: getattr(self, name, None) for name in (
+                    "decider_mode", "query_interval", "explore_replan_interval",
+                    "finish_patience", "finish_frontier_patience",
+                    "finish_map_stable_steps", "adjust_max_steps",
+                    "adjust_max_forward_steps", "adjust_max_sessions_per_target",
+                    "adjust_max_total_steps_per_target", "adjust_max_turns_per_target",
+                    "relevant_frame_top_k", "nav_collision_limit",
+                    "arrival_max_failures", "map_max_instances",
+                    "decision_map_max_points",
+                )
+            },
+            "max_tool_rounds": getattr(self.decision_loop, "max_tool_rounds", None),
+        })
 
     def _refresh_memory_candidates(self, instance_ids=None):
         """回环后刷新 Observation 坐标，再重选 canonical 导航点。"""
@@ -2496,6 +2616,21 @@ class NavAgent(MappingAgent):
         return state, map_png
 
     def _apply_decider_steering(self, observation, result):
+        applied = self._apply_decider_steering_impl(observation, result)
+        try:
+            trace = getattr(self.decision_loop, "_trace_record", None) or {}
+            self._paper_steering.append(trace_snapshot({
+                "step": observation.step_count,
+                "decision_id": trace.get("decision_id"),
+                "requested": result.as_dict(), "applied": bool(applied),
+                "mode_after": self.mode,
+                "active_instance_id_after": self.target_instance_id,
+            }))
+        except Exception as exc:
+            self._paper_warn(exc)
+        return applied
+
+    def _apply_decider_steering_impl(self, observation, result):
         """把决策结果映射到现有状态机动作（GOTO_INSTANCE/GOTO_FRONTIER）。
         底层跟随/避障/重规划仍由确定性模块执行。"""
         if result.action == "GOTO_INSTANCE" and result.target_id is not None:
@@ -2591,7 +2726,8 @@ class NavAgent(MappingAgent):
         state, map_png = self._build_decider_input(observation)
         result = self.decision_loop.decide(
             "finish_check", state, map_png,
-            state_fn=lambda: self._build_decider_input(observation))
+            state_fn=lambda: self._build_decider_input(observation),
+            **self._paper_trace_kwargs(observation, "finish_check"))
         if result is None:
             return None                       # 回退规则
         self._record_action(result.action, result.target_id)
@@ -2626,7 +2762,8 @@ class NavAgent(MappingAgent):
             state, map_png = state_fn()
             result = self.decision_loop.decide(
                 event, state, map_png, images=images,
-                state_fn=state_fn)
+                state_fn=state_fn,
+                **self._paper_trace_kwargs(observation, event))
         except Exception as exc:
             print(f"[NavAgent] 决策层调用失败，回退规则: {exc}")
             return None, None

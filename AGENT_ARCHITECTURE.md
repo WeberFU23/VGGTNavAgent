@@ -1,5 +1,7 @@
 # VGGT-Nav Agent 架构文档
 
+论文诊断日志已补充结构化候选快照、决策/模型调用关联、原始提议与处理后动作，以及只读 `get_paper_trace()` 接口。字段、分析口径和非干扰边界见 [PAPER_LOGGING.md](PAPER_LOGGING.md)；该旁路不进入模型输入。
+
 ## 1. 概述：harness 设计思想
 
 本系统是一个面向多目标具身导航的 VLM harness，仿照 coding agent 的组织

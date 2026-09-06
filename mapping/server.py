@@ -306,6 +306,10 @@ class MappingServer:
             print(f"[server] WARNING: pointing grounder 未就绪（{exc}），"
                   "point_pixels 将返回 POINTING_BACKEND_UNAVAILABLE",
                   flush=True)
+            # 后端不可用时置 None：propose/point_pixels 走既有的
+            # "pointer is None" 分支立即返回结构化错误，不再每次调用
+            # 都走网关重试浪费数秒。
+            self.pointer = None
 
     # ------------------------------------------------------------------
     # 帧输入与子图处理

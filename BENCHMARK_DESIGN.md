@@ -104,23 +104,24 @@ $S_i$ 为是否成功；$l_i^{optimal}$ 为全部合法目标实例上"最优子
 | $g^{agent\text{-}order}$ | 按 agent 实际上报顺序逐段 geodesic 求和 |
 | $p^{transit}$ | 到最后一次成功发现为止的实际路径长度 |
 
-四个因子：
+乘法链上四个因子，另有一个旁路诊断（搜索覆盖）。命名原则：分母是 agent 实际付出的路径代价者称"效率"，比较"所选/所排方案与最优方案的假设路线"者称"质量"。代码键保持 `pool_coverage`/`pool_quality`/`tse`/`oe`/`le` 不变，此处仅统一呈现名与缩写：
 
-- **池质量** $= l^{optimal} / l^{pool\text{-}optimal}$：搜索/感知发现的候选池够不够好（纯搜索维度）。
-- **TSE（目标选择效率）** $= l^{pool\text{-}optimal} / l^{agent\text{-}subset}$：在 agent 已知候选里选的子集是不是最优（纯选择判断，不会因没搜到藏得深的实例被冤枉扣分）。
-- **OE（访问顺序效率）** $= l^{agent\text{-}subset} / g^{agent\text{-}order}$：选好的目标，访问顺序排得好不好。
-- **LE（移动执行效率）** $= g^{agent\text{-}order} / p^{transit}$：按定好的顺序走得直不直。
+- **搜索覆盖 SC（Search Coverage，旁路诊断，不进乘法链）** $= \min(1,\ |\text{匹配池目标数}| / \text{需求数})$：发现的候选够不够用，有池接口时恒输出，与路线质量解耦。
+- **搜索质量 SQ（Search Quality）** $= l^{optimal} / l^{pool\text{-}optimal}$：搜索/感知发现的候选够不够好（纯搜索维度）。**仅在搜索覆盖满需求数时计算**——欠覆盖时池路线访问的目标更少，比值会单纯因此大于 1，失去可比性，此时 SQ 记 null，由 SC 承载该信号。
+- **目标选择质量 TSQ（Target Selection Quality）** $= l^{pool\text{-}optimal} / l^{agent\text{-}subset}$：在 agent 已知候选里选的子集是不是最优（纯选择判断，不会因没搜到藏得深的实例被冤枉扣分）。
+- **访问排序质量 OQ（Ordering Quality）** $= l^{agent\text{-}subset} / g^{agent\text{-}order}$：选好的目标，访问顺序排得好不好。
+- **路径效率 PE（Path Efficiency，含探索开销）** $= g^{agent\text{-}order} / p^{transit}$：真实路径与"按既定顺序测地直达"之比，是货真价实的代价之比。注意 $p^{transit}$ 只截断在最后一次成功报告处，首次发现前的全部搜索与目标间的探索游走都计入其中，因此 PE 低主要意味着"路径花在探索上"，**不能直接解读为低层移动能力差**；探索/识别层面的归因用 3.7 的 OSR 分解。
 
 **适用性规则**（不适用输出 null、聚合时跳过）：
 
-- 池质量与 TSE 需要 agent 实现发现池接口 `get_target_pool()`（见 3.6），否则为 null，**不会静默退化为全集**（那会恒等于 1）。
-- MOC 无子集选择（需求数 == 候选全集），TSE 恒不适用；MOS 变体 B/C 中需求数等于候选数时同理。
-- 目标类别在环境中只有唯一实例时池质量不适用；单目标 episode 无"顺序"，OE 不适用；$found=0$ 时四因子全部不适用。
-- 池覆盖不足需求数量时用池内全部实例求解并记录 `pool_covers_required=false`，此时池质量可能大于 1，保留该信号不截断。
+- SQ 与 TSQ 需要 agent 实现发现池接口 `get_target_pool()`（见 3.6），否则为 null，**不会静默退化为全集**（那会恒等于 1）。
+- MOC 无子集选择（需求数 == 候选全集），TSQ 恒不适用；MOS 变体 B/C 中需求数等于候选数时同理。
+- 目标类别在环境中只有唯一实例时 SQ 不适用；单目标 episode 无"顺序"，OQ 不适用；$found=0$ 时四因子全部不适用（SC 仍可输出）。
+- 池覆盖不足需求数量时记录 `pool_covers_required=false` 并以 SC 单列该信号；此时 **SQ 为 null**（欠覆盖池的路线访问更少目标，比值会单纯因此虚高大于 1，不再输出），$l^{pool\text{-}optimal}$ 仍用池内全部实例求解以支撑 TSQ。
 
 **乘积校验**：四因子相乘在数学上恒等于 $l^{optimal}/p^{transit}$（telescoping），聚合时自动校验，但只在四因子齐全且所有中间量均为精确 TSP 解的 episode 上严格验证。子集 TSP 在目标数 $\le 12$ 时用 Held-Karp 精确求解，超过时用贪心近似，逐量以 `*_exact` 字段标注。数据集中预计算的 `shortest_path_distance` 仅作无 navmesh 时的兜底，不参与正式计算。
 
-**呈现口径**：四因子可按能力归组为搜索侧（池质量 $\times$ LE，发现候选与探索移动开销）与规划侧（TSE $\times$ OE，子集选择与访问排序）；SPL-multi $= S \times$ 四因子乘积，其中 $S$ 承担完成度。跨 episode 聚合用几何均值；需要比较各环节损失占比时取 log 转为加性分解。
+**呈现口径**：四因子可按能力归组为搜索侧（SQ $\times$ PE，发现候选与探索移动开销）与规划侧（TSQ $\times$ OQ，子集选择与访问排序）；SPL-multi $= S \times$ 四因子乘积，其中 $S$ 承担完成度。跨 episode 聚合用几何均值；需要比较各环节损失占比时取 log 转为加性分解。
 
 ### 3.3 诊断层之二：目标记忆（RTSR）
 
@@ -148,8 +149,8 @@ token 数（分输入/输出、分角色）、模型调用轮数、美元成本*
 
 对实现了可选接口 `get_target_pool()` 的 agent（如我们的 VGGTNavAgent），评测器每步采集 agent 已实例化的候选实例（位置 + 是否已上报，agent 侧自行转到世界坐标）：
 
-- **$U_t$**：每个决策时刻已实例化但未上报的实例数——即 agent 自认候选集合的大小，**不要求与 ground truth 几何匹配**（agent 的实例化本身就计为一次"发现"）。逐步记录序列并汇总均值。它是**数据集质量/诊断指标**——用来判断场景是否真的构成"选择"——不参与模型排名。作为候选真实性的并行诊断，仍按位置与 ground truth 合法实例做最近邻匹配（阈值默认 2.0m，可调）得到 $U_t^{legal}$（匹配且未上报的合法目标数），以 `u_t_legal_*` 单列输出；池质量/TSE 的池匹配口径不变，仍使用该几何匹配。
-- **发现池并集**：即 3.2 中 $l^{pool\text{-}optimal}$ 的输入，支撑池质量与新 TSE。
+- **$U_t$**：每个决策时刻已实例化但未上报的实例数——即 agent 自认候选集合的大小，**不要求与 ground truth 几何匹配**（agent 的实例化本身就计为一次"发现"）。逐步记录序列并汇总均值。它是**数据集质量/诊断指标**——用来判断场景是否真的构成"选择"——不参与模型排名。作为候选真实性的并行诊断，仍按位置与 ground truth 合法实例做最近邻匹配（阈值默认 2.0m，可调）得到 $U_t^{legal}$（匹配且未上报的合法目标数），以 `u_t_legal_*` 单列输出；SQ/TSQ 的池匹配口径不变，仍使用该几何匹配。
+- **发现池并集**：即 3.2 中 $l^{pool\text{-}optimal}$ 的输入，支撑 SQ 与 TSQ。
 
 $U_t>1$ 只证明"目标选择"这一处的决策空间存在。对保留了完整决策与工具
 trace 的 agent，还可离线计算三项同性质的选择证据，共同回答"benchmark
@@ -171,20 +172,34 @@ trace 的 agent，还可离线计算三项同性质的选择证据，共同回�
 侧的决策/工具 trace（我们的 VGGTNavAgent 全程留痕，见
 AGENT_ARCHITECTURE.md 第 9 节），不改动评测器主流程。
 
-第三方黑箱 agent 没有此接口与 trace 时，$U_t$、池质量、TSE 及上述选择
+第三方黑箱 agent 没有此接口与 trace 时，$U_t$、SQ、TSQ 及上述选择
 证据均为 null，其余指标不受影响。
 
-### 3.7 离线分析：规模伸缩曲线（Scaling Curve）
+### 3.7 诊断层之六：OSR 与 NE（到达-识别分解，纯轨迹、agent 无关）
+
+经典 ObjectNav 诊断（Anderson et al., 2018）在多目标协议下的推广。与 $U_t$/发现池不同，这两项只依赖 trajectory 与 GT viewpoint，**任何被测 agent 都能算**，不要求 `get_target_pool()` 接口。
+
+- **路过（approached）**：trajectory 任意一步（含最后一个动作执行后的位姿）处于某合法目标任一 viewpoint 的 $0.25\text{m}$ 测地距离内——与报告成功判定严格同源（无 viewpoint 的实例退化为到质心的欧氏距离，与报告判定的 fallback 一致）。因此已报告集合恒为路过集合的子集。
+- **OSR（episode 级）**：把成功判定中的"已报告集合"替换为"路过集合"重放——any 要求路过 ≥1，many/all 要求路过数 ≥ required；不要求 FINISH、不因超时被否。语义："若停止与识别是完美的，这个 agent 本可以拿多少分"。
+- **osr_target_rate**：路过目标数 / 合法目标总数。与 found_fraction、report_conversion（= 已报告数 / 路过数）构成乘法分解：
+  $$\text{found\_fraction} = \text{osr\_target\_rate} \times \text{report\_conversion}$$
+  低 OSR → 瓶颈在物理到达（探索/导航）；高 OSR 低 conversion → 瓶颈在识别与报告决策。这是"任务难度来自语义决策而非低层导航"的直接证据。
+- **NE（report NE）**：每次报告时 agent 位置到最近合法目标 viewpoint 的测地距离（TP 恒 ≤0.25m）。输出逐报告值与均值，并对 FP 单独给均值 `fp_report_ne_mean`——区分"差十几厘米的 near-miss"与"离题万里的误报"，两类 FP 的性质完全不同。
+- **missed_target_min_distance_mean**：对每个未找到的合法目标，取全轨迹到其 viewpoint 的最小测地距离后求均值——"没找到的目标到底差多远"；同时输出逐目标 `target_min_distances` 供分布分析。
+
+聚合口径与主指标一致：宏平均、many/all 模式（OSR 另给 `osr_any` 与 `osr_overall`）；无报告/无遗漏/无合法目标产生的 null 跳过不稀释。
+
+### 3.8 离线分析：规模伸缩曲线（Scaling Curve）
 
 独立脚本（`evaluation/main/analysis/`）对评测结果 JSON 做二次分析：把 SR 与 SPL-multi 分别作为目标数量 $k$/$N$ 和场景面积（一次性从 navmesh 离线推导并缓存）的函数，输出分桶均值、回归斜率、多元回归（剥离面积混淆）、分段回归检测"崩坏点"（含 bootstrap 置信区间），并对样本量不足的桶明确标注低置信。
 
-### 3.8 聚合方式
+### 3.9 聚合方式
 
 所有指标先逐 episode 计算，再聚合：
 
 - **宏平均**（默认）：逐 episode 取算术平均，每个 episode 权重相等。不适用（null）或缺失字段的 episode 一律跳过；某指标在聚合范围内完全无数据时输出 null（终端显示 N/A），与真实 0 严格区分。
 - **微平均**（P/R/F1 与 RTSR 同时报告）：先跨 episode 汇总计数再算比率，目标多的 episode 权重更大。
-- **按模式拆分**：`any` 只报 SR 和 SPL；`many`/`all` 分别报告全套指标。
+- **按模式拆分**：`any` 只报 SR、SPL 与 OSR；`many`/`all` 分别报告全套指标。
 - **主榜单**（SR、F1、SPL-multi）只聚合 `many`/`all` episode；`any` 的结果单独列出，不混入总指标。
 - **结果文件**：完整结果保存在单个 JSON（`{"metrics": 聚合指标, "episodes": 逐 episode 全字段记录}`），终端只打印进度与汇总。
 
@@ -200,5 +215,5 @@ MultiON/GOAT 本质是线性序列执行问题，决策空间随目标数量线�
 - **测评状态追踪能力**：模型需要同时记录"去过哪里"和"找到过哪些目标"，对 working memory 有更高要求
 - **更贴近真实任务**：现实中的导航指令（"找到所有的杯子"）天然是无序的
 - **设计有效性可被实证检验**：诊断层指标（$U_t$、四因子、RTSR、Stopping
-  Regret 与 3.6 的选择证据）各自对应一类在参考 agent 上真实观测到的失败
+  Regret、OSR/NE 到达-识别分解与 3.6 的选择证据）各自对应一类在参考 agent 上真实观测到的失败
   或决策行为，指标设计有据可依，而非纯理论构造

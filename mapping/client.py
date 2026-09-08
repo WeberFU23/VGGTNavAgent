@@ -330,10 +330,10 @@ class MappingClient:
             header["max_masks"] = int(max_masks)
         return self._request(header)
 
-    def som_pick(self, frame_id, mask_ids):
+    def pick_segment(self, frame_id, mask_ids):
         """按 mask_id 注册候选（质心 + 实例 mask）；返回 {candidates: [...]}。"""
         resp, _ = self._request({
-            "cmd": "som_pick", "frame_id": int(frame_id),
+            "cmd": "pick_segment", "frame_id": int(frame_id),
             "mask_ids": [int(v) for v in (mask_ids or [])]})
         return resp
 

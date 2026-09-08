@@ -19,6 +19,7 @@ from agents.decision_state import _path_cost_m, build_world_state
 from agents.map_render import render_pointcloud_topdown, render_topdown
 from agents.nav_agent import NavAgent
 from decision import DecisionLoop, DecisionTraceLogger
+from decision.prompts import build_decider_system
 
 
 def _state(mode="all", found=1, expected=None, instances=None, frontiers=None):
@@ -46,25 +47,26 @@ class _ScriptedChat:
         self.replies = list(replies)
         self.calls = []
 
-    def __call__(self, prompt, images):
+    def __call__(self, prompt, images, system_prompt=None):
         self.calls.append((prompt, images))
         return self.replies.pop(0) if self.replies else None
 
 
 def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
-    prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
-        "arrival", _state())
+    loop = DecisionLoop(_ScriptedChat([]))
+    prompt = build_decider_system(
+        loop.max_tool_rounds) + loop._build_prompt("arrival", _state())
     flat = " ".join(prompt.split())
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
                  "propose_candidates(frame_id, query)",
-                 "som_pick(frame_id, mask_ids, query, goal_index=null)",
+                 "pick_segment(frame_id, mask_ids, query, goal_index=null)",
                  "instantiate_points(frame_id, pixels_1000, label, goal_index=null)",
                  "review_crosshair(frame_id, pixel_1000, verdict, reason)",
                  "search_instances(",
                  "get_instance(instance_id)",
                  "view_instance(instance_id)",
                  "update_instance(instance_id, text)",
-                 "get_agent_status()", "set_notes(text)",
+                 "get_agent_status()", "update_notes(text)",
                  "get_action_history(before_step, limit)"):
         assert tool in prompt
     for action in ("GOTO_INSTANCE", "GOTO_FRONTIER", "REPORT_FOUND",
@@ -111,8 +113,8 @@ def test_default_tool_limit_is_fifteen_and_prompt_discloses_hard_limit():
     assert loop.max_tool_rounds == 15
     assert DecisionLoop(
         _ScriptedChat([]), max_tool_rounds=99).max_tool_rounds == 15
-    prompt = " ".join(loop._build_prompt(
-        "world_state_updated", _state()).split())
+    prompt = " ".join(
+        build_decider_system(loop.max_tool_rounds).split())
     assert "most 15 calls per decision" in prompt
     assert "HARD per-decision limit" in prompt
 
@@ -374,7 +376,9 @@ def test_continue_navigation_removed_from_contract():
 
 
 def test_prompt_documents_run_to_completion_navigation():
-    prompt = DecisionLoop(_ScriptedChat([]))._build_prompt(
+    loop = DecisionLoop(_ScriptedChat([]))
+    prompt = build_decider_system(
+        loop.max_tool_rounds) + loop._build_prompt(
         "world_state_updated", _state())
     assert "CONTINUE_NAVIGATION" not in prompt
     assert "executes the whole path" in prompt
@@ -437,7 +441,8 @@ def test_write_tool_refreshes_world_state_before_validation():
     assert result.action == "GOTO_INSTANCE" and result.target_id == "2"
     assert result.tool_calls == 1
     retry_prompt = chat.calls[1][0]
-    assert "World state after your write" in retry_prompt
+    # 重渲染后 world_state 只有最新一份（写后刷新走标准节，不再追加副本）
+    assert retry_prompt.count("World state:") == 1
     assert "resolved red cup" in retry_prompt
 
 
@@ -799,7 +804,7 @@ def test_follower_leg_end_forces_immediate_decision_with_vlm():
 
 def test_world_state_contains_text_evidence_and_no_anchor_table():
     agent = _make_agent()
-    node, _ = agent.memory.remember(
+    node, _ = agent.instance_store.remember(
         [3, 4, 0], "possible woven basket",
         evidence=[{"frame_id": 7}], candidate_id="c7")
     obs = SimpleNamespace(step_count=50, max_steps=500,
@@ -825,7 +830,7 @@ def test_world_state_contains_text_evidence_and_no_anchor_table():
 
 def test_world_state_uses_explicit_map_snapshot_pose():
     agent = _make_agent()
-    agent.memory.add([3.0, 4.0, 0.0], "basket")
+    agent.instance_store.add([3.0, 4.0, 0.0], "basket")
     agent._current_aligned_xy = lambda: (_ for _ in ()).throw(
         AssertionError("live pose must not replace snapshot pose"))
     agent._frontier_stats = {"raw_clusters": 3, "selectable": 1}
@@ -845,10 +850,10 @@ def _build_state(agent, step=50):
 def test_world_state_summarizes_instances_beyond_k():
     agent = _make_agent()
     for i in range(35):
-        agent.memory.add([float(i + 1), 0, 0], f"instance number {i}",
+        agent.instance_store.add([float(i + 1), 0, 0], f"instance number {i}",
                          step=i)
-    reported = agent.memory.add([100, 0, 0], "already reported")
-    agent.memory.mark_reported(reported)
+    reported = agent.instance_store.add([100, 0, 0], "already reported")
+    agent.instance_store.mark_reported(reported)
     state = _build_state(agent)
     assert len(state["instances"]) == 30          # K=30 硬上限
     assert state["instances_total"] == 36
@@ -873,11 +878,11 @@ def test_world_state_summarizes_instances_beyond_k():
 
 def test_world_state_summary_prefers_nearest_newest_relevant():
     agent = _make_agent()                          # target_text="basket"
-    nearest = agent.memory.add([1, 0, 0], "wooden chair", step=1)
-    newest = agent.memory.add([9, 0, 0], "small table", step=100)
-    relevant = agent.memory.add([5, 0, 0], "woven basket with handle",
+    nearest = agent.instance_store.add([1, 0, 0], "wooden chair", step=1)
+    newest = agent.instance_store.add([9, 0, 0], "small table", step=100)
+    relevant = agent.instance_store.add([5, 0, 0], "woven basket with handle",
                                 step=2)
-    other = agent.memory.add([2, 0, 0], "desk lamp", step=3)
+    other = agent.instance_store.add([2, 0, 0], "desk lamp", step=3)
     os.environ["NAV_STATE_MAX_INSTANCES"] = "3"    # K=3 -> 每路取 1
     try:
         state = _build_state(agent)
@@ -893,7 +898,7 @@ def test_world_state_summary_prefers_nearest_newest_relevant():
 
 def test_world_state_truncates_instance_text():
     agent = _make_agent()
-    agent.memory.add([1, 0, 0], "x" * 300)
+    agent.instance_store.add([1, 0, 0], "x" * 300)
     row = _build_state(agent)["instances"][0]
     assert len(row["text"]) == 120
     assert row["text"].endswith("...")
@@ -909,15 +914,15 @@ def test_omitted_instance_is_valid_goto_target():
 
 def test_navagent_memory_tool_updates_canonical_instance():
     agent = _make_agent()
-    a = agent.memory.add([0, 0, 0], "view A")
+    a = agent.instance_store.add([0, 0, 0], "view A")
     updated = agent._tool_update_instance(a.iid, "same basket, front view")
     assert updated["text"] == "same basket, front view"
 
 
 def test_report_found_does_not_emit_duplicate_target_found():
     agent = _make_agent()
-    node = agent.memory.add([0, 0, 0], "basket")
-    agent.memory.mark_reported(node)
+    node = agent.instance_store.add([0, 0, 0], "basket")
+    agent.instance_store.mark_reported(node)
     agent.target_instance_id = node.iid
     agent.target_point = np.asarray(node.point)
     before = agent._reported_count
@@ -929,25 +934,25 @@ def test_report_found_does_not_emit_duplicate_target_found():
 
 def test_report_claim_records_supporting_observations_once():
     agent = _make_agent()
-    node = agent.memory.add([0, 0, 0], "basket", candidate_id="c1")
-    claim = agent.memory.claim(node, step=42)
+    node = agent.instance_store.add([0, 0, 0], "basket", candidate_id="c1")
+    claim = agent.instance_store.claim(node, step=42)
     assert claim.instance_id == node.iid
     assert claim.observation_ids == tuple(node.observation_ids)
     assert node.reported and node.report_claim_id == claim.claim_id
-    assert agent.memory.claim(node, step=43) is None
-    assert len(agent.memory.report_claims) == 1
+    assert agent.instance_store.claim(node, step=43) is None
+    assert len(agent.instance_store.report_claims) == 1
 
 
 def test_loop_closure_refreshes_observations_then_reselects_canonical_point():
     agent = _make_agent()
-    first = agent.memory.new_observation(
+    first = agent.instance_store.new_observation(
         [0, 0, 0], "chair front", evidence={"point_score": 0.2},
         frame_id=1, candidate_id="c1")
-    node = agent.memory.create_instance(first)
-    second = agent.memory.new_observation(
+    node = agent.instance_store.create_instance(first)
+    second = agent.instance_store.new_observation(
         [1, 0, 0], "chair side", evidence={"point_score": 0.9},
         frame_id=2, candidate_id="c2")
-    agent.memory.attach_observation(node, second)
+    agent.instance_store.attach_observation(node, second)
     seen = []
 
     def resolve_candidates(candidate_ids):
@@ -1003,7 +1008,7 @@ def test_ingest_generates_instance_level_text():
         get_frame_image=lambda fid: ({"found": True}, _jpeg_bytes()))
     obs = SimpleNamespace(step_count=50)
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
-    node = agent.memory.nodes[0]
+    node = agent.instance_store.nodes[0]
     assert node.text == "a kitchen counter with several objects on it"
     assert agent.vlm.calls == []  # 实例化路径不调 VLM
 
@@ -1012,7 +1017,7 @@ def test_ingest_keeps_caption_text_when_vlm_unavailable():
     obs = SimpleNamespace(step_count=50)
     agent = _make_agent()               # 默认 VLM disabled
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
-    assert agent.memory.nodes[0].text == \
+    assert agent.instance_store.nodes[0].text == \
         "a kitchen counter with several objects on it"
     # VLM 可用但调用失败：同样保留 caption 文本
     agent2 = _make_agent()
@@ -1021,7 +1026,7 @@ def test_ingest_keeps_caption_text_when_vlm_unavailable():
         get_candidate_evidence=lambda cid: ({"found": True}, b"x"),
         get_frame_image=lambda fid: ({"found": False}, b""))
     agent2._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
-    assert agent2.memory.nodes[0].text == \
+    assert agent2.instance_store.nodes[0].text == \
         "a kitchen counter with several objects on it"
 
 
@@ -1037,7 +1042,7 @@ def test_ingest_does_not_redescribe_existing_instance():
     obs = SimpleNamespace(step_count=50)
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
     agent._ingest_semantic_hits(obs, [_ingest_hit()], select=False)
-    assert len(agent.memory.nodes) == 1      # 同 candidate_id 只更新
+    assert len(agent.instance_store.nodes) == 1      # 同 candidate_id 只更新
     assert len(agent.vlm.calls) == 0         # 实例化路径不调 VLM
 
 
@@ -1050,14 +1055,14 @@ def test_ingest_duplicate_review_attaches_cross_frame_observation():
                   point=[1.05, 2.02, 0.0], pixel=[14, 14])
     agent._ingest_semantic_hits(obs, [first], select=False)
     agent._ingest_semantic_hits(obs, [second], select=False)
-    assert len(agent.memory.nodes) == 1  # 复核挂起，未新建
+    assert len(agent.instance_store.nodes) == 1  # 复核挂起，未新建
     review = agent._last_dup_reviews[0]
     assert review["neighbors"][0]["instance_id"] == 1
     out = agent._tool_resolve_duplicate(
         review["observation_id"], "DUPLICATE", duplicate_of=1,
         text="dark wooden chair, two views")
     assert out["resolved"] == "duplicate"
-    node = agent.memory.nodes[0]
+    node = agent.instance_store.nodes[0]
     assert len(node.observation_ids) == 2
     assert node.text == "dark wooden chair, two views"
 
@@ -1065,7 +1070,7 @@ def test_ingest_duplicate_review_attaches_cross_frame_observation():
 def test_ingest_suspends_nearby_candidate_without_vlm():
     """3m 内已有实例：挂起 duplicate_review，不调任何 VLM。"""
     agent = _make_agent()
-    agent.memory.add(
+    agent.instance_store.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
         candidate_id="c4")
     agent.vlm = _FakeResolverVLM(None)
@@ -1073,33 +1078,33 @@ def test_ingest_suspends_nearby_candidate_without_vlm():
                   point=[1.05, 2.02, 0.0])
     agent._ingest_semantic_hits(
         SimpleNamespace(step_count=50), [second], select=False)
-    assert len(agent.memory.nodes) == 1
-    assert agent._proposals["c6"]["status"] == "duplicate_review"
+    assert len(agent.instance_store.nodes) == 1
+    assert agent._proposal_queue["c6"]["status"] == "duplicate_review"
     assert agent.vlm.calls == []
 
 
 def test_ingest_duplicate_review_new_creates_instance():
     """复核裁决 NEW：挂起的 observation 建成独立实例。"""
     agent = _make_agent()
-    agent.memory.add(
+    agent.instance_store.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
         candidate_id="c4")
     second = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
                   point=[1.05, 2.02, 0.0])
     agent._ingest_semantic_hits(
         SimpleNamespace(step_count=50), [second], select=False)
-    assert len(agent.memory.nodes) == 1
-    assert agent._proposals["c6"]["status"] == "duplicate_review"
+    assert len(agent.instance_store.nodes) == 1
+    assert agent._proposal_queue["c6"]["status"] == "duplicate_review"
     oid = agent._last_dup_reviews[0]["observation_id"]
     out = agent._tool_resolve_duplicate(oid, "NEW")
     assert out["resolved"] == "new"
-    assert len(agent.memory.nodes) == 2
+    assert len(agent.instance_store.nodes) == 2
 
 
 def test_suspended_evidence_replay_does_not_create_another_observation():
     """同一挂起证据重放：不新建 observation，也不重复挂起复核。"""
     agent = _make_agent()
-    agent.memory.add(
+    agent.instance_store.add(
         [1.0, 2.0, 0.0], "nearby chair", frame_id=4,
         candidate_id="c4")
     hit = dict(_ingest_hit(), frame_id=6, candidate_id="c6",
@@ -1107,8 +1112,8 @@ def test_suspended_evidence_replay_does_not_create_another_observation():
     obs = SimpleNamespace(step_count=50)
     agent._ingest_semantic_hits(obs, [hit], select=False)
     agent._ingest_semantic_hits(obs, [hit], select=False)
-    assert len(agent.memory.nodes) == 1
-    assert len(agent.memory.observations) == 2
+    assert len(agent.instance_store.nodes) == 1
+    assert len(agent.instance_store.observations) == 2
 
 
 def test_wait_for_captions_logs_timeout_and_swallows_errors():
@@ -1141,12 +1146,12 @@ def test_scan_flushes_tail_map_before_waiting_without_auto_retrieving():
 
 def test_navagent_search_instances_uses_vlm_keywords():
     agent = _make_agent()
-    red_cup = agent.memory.add(
+    red_cup = agent.instance_store.add(
         [0, 0, 0], "small red ceramic cup beside sink",
         evidence=[{"frame_id": 7}])
-    agent.memory.add([1, 0, 0], "blue cup on table")
-    reported = agent.memory.add([2, 0, 0], "reported red cup")
-    agent.memory.mark_reported(reported)
+    agent.instance_store.add([1, 0, 0], "blue cup on table")
+    reported = agent.instance_store.add([2, 0, 0], "reported red cup")
+    agent.instance_store.mark_reported(reported)
     rows = agent._tool_search_instances(
         ["red", "cup"], reported=False, top_k=5)
     assert [row["id"] for row in rows] == [red_cup.iid, 2]
@@ -1157,7 +1162,7 @@ def test_navagent_search_instances_uses_vlm_keywords():
 
 def test_navagent_view_instance_prefers_candidate_overlay():
     agent = _make_agent()
-    node, _ = agent.memory.remember(
+    node, _ = agent.instance_store.remember(
         [1, 2, 0], "red cup", frame_id=7, candidate_id="c7")
     agent.client = SimpleNamespace(
         get_candidate_evidence=lambda candidate_id, wide_only=False:

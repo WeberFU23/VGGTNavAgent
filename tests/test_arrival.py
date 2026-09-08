@@ -45,7 +45,7 @@ def _make_agent():
 
 def test_arrival_decision_goes_directly_to_vlm_without_grounding():
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    node = agent.instance_store.add([1, 2, 0], "possibly a gray sofa")
     agent.target_instance_id = node.iid
     agent.target_candidate_id = "candidate-1"
     agent.client = _MockClient()
@@ -57,13 +57,13 @@ def test_arrival_decision_goes_directly_to_vlm_without_grounding():
     result, action = agent._arrival_vlm_decision(_obs())
     assert result.action == "REPORT_FOUND"
     assert action is None
-    assert node in agent.memory.available()
+    assert node in agent.instance_store.available()
 
 
 def test_immediate_goto_arrival_runs_arrival_decision_and_reports():
     """A zero-length GOTO path must not be converted into exploration."""
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "gray fabric sofa")
+    node = agent.instance_store.add([1, 2, 0], "gray fabric sofa")
     agent.client = _MockClient()
     agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
     agent._build_decider_input = lambda obs, **kwargs: (
@@ -93,7 +93,7 @@ def test_immediate_goto_arrival_runs_arrival_decision_and_reports():
 
 def test_failed_instance_plan_clears_stale_active_target():
     agent = _make_agent()
-    node = agent.memory.add([3, 4, 0], "gray fabric sofa")
+    node = agent.instance_store.add([3, 4, 0], "gray fabric sofa")
     agent._plan_to_target = lambda obs: False
     ok = agent._apply_decider_steering(
         _obs(), DecisionResult("GOTO_INSTANCE", str(node.iid)))
@@ -105,7 +105,7 @@ def test_failed_instance_plan_clears_stale_active_target():
 
 def test_adjustment_executes_one_vlm_motion_per_observation_then_resumes():
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    node = agent.instance_store.add([1, 2, 0], "possibly a gray sofa")
     agent.target_instance_id = node.iid
     agent.target_candidate_id = "candidate-1"
     agent.client = _MockClient()
@@ -153,7 +153,7 @@ def test_adjustment_executes_one_vlm_motion_per_observation_then_resumes():
 
 def test_adjustment_state_has_pose_target_collision_and_local_map():
     agent = _make_agent()
-    node = agent.memory.add([12, 10, 0], "gray fabric sofa")
+    node = agent.instance_store.add([12, 10, 0], "gray fabric sofa")
     agent.target_instance_id = node.iid
     agent.target_text = "gray fabric sofa"
     agent.client = _MockClient()
@@ -323,9 +323,9 @@ def test_every_valid_3d_hit_becomes_an_instance_even_low_confidence():
     result = agent._ingest_semantic_hits(
         _obs(), [_hit([3, 4, 0], conf=0.1, candidate_id="c1")])
     assert result == 7
-    assert len(agent.memory.available()) == 1
-    assert agent.memory.nodes[0].text == "cup-like object"
-    assert agent.memory.nodes[0].evidence[0]["point_score"] == 0.1
+    assert len(agent.instance_store.available()) == 1
+    assert agent.instance_store.nodes[0].text == "cup-like object"
+    assert agent.instance_store.nodes[0].evidence[0]["point_score"] == 0.1
 
 
 def test_same_candidate_updates_but_different_candidates_do_not_auto_merge():
@@ -336,14 +336,14 @@ def test_same_candidate_updates_but_different_candidates_do_not_auto_merge():
         _hit([3.1, 4, 0], frame_id=2, candidate_id="c2")])
     # 新机制：第二个候选在 3m 内，挂起 duplicate_review 由 VLM 裁决，
     # 不自动合并也不自动新建
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     assert len(agent._last_dup_reviews) == 1
     agent._tool_resolve_duplicate(
         agent._last_dup_reviews[0]["observation_id"], "NEW")
-    assert len(agent.memory.nodes) == 2
+    assert len(agent.instance_store.nodes) == 2
     agent._ingest_semantic_hits(_obs(step=101), [
         _hit([3.2, 4, 0], frame_id=3, candidate_id="c1")])
-    assert len(agent.memory.nodes) == 2
+    assert len(agent.instance_store.nodes) == 2
 
 
 def test_scan_is_general_panorama_without_target_grounding():
@@ -360,7 +360,7 @@ def test_scan_is_general_panorama_without_target_grounding():
             return []
 
     agent.client = Client()
-    agent.target_instance_id = agent.memory.add(
+    agent.target_instance_id = agent.instance_store.add(
         [1, 2, 0], "unresolved object").iid
     captured = {}
 
@@ -381,7 +381,7 @@ def test_scan_is_general_panorama_without_target_grounding():
 
 def _repeat_test_agent(vlm_calls):
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    node = agent.instance_store.add([1, 2, 0], "possibly a gray sofa")
     agent.target_instance_id = node.iid
     agent.target_candidate_id = "candidate-1"
     agent.client = _MockClient()
@@ -450,7 +450,7 @@ if __name__ == "__main__":
 def test_arrival_api_failure_retries_inline():
     """arrival 决策 API transient 故障：事件内就地重试，不丢报告。"""
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    node = agent.instance_store.add([1, 2, 0], "possibly a gray sofa")
     agent.target_instance_id = node.iid
     agent.client = _MockClient()
     agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
@@ -472,7 +472,7 @@ def test_arrival_api_failure_retries_inline():
 def test_arrival_persistent_failure_keeps_target_then_abandons():
     """连续失败：保持目标逐步重触发；达到上限才放弃并回探索。"""
     agent = _make_agent()
-    node = agent.memory.add([1, 2, 0], "possibly a gray sofa")
+    node = agent.instance_store.add([1, 2, 0], "possibly a gray sofa")
     agent.target_instance_id = node.iid
     agent.target_point = np.array([1.0, 2.0, 0.0])
     agent.mode = "nav"

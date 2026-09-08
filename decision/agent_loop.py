@@ -4,7 +4,8 @@ VLM 通过工具读取和编辑 3D instance memory，再选择实例、frontier�
 报告或结束。底层跟随、避障与路径规划保持确定性；VLM 只有在自己
 显式进入 adjustment 状态后，才能每轮输出一个白名单原子动作。
 
-chat_fn(user_text, images) -> dict|None 可注入（生产接
+chat_fn(user_text, images, system_prompt=None) -> dict|None 可注入（生产接
+VLMDecisionClient.agentic_chat，单测用 mock）。
 VLMDecisionClient.agentic_chat，单测用 mock）。
 """
 
@@ -14,7 +15,8 @@ import threading
 import time
 import uuid
 
-from decision.prompts import build_decision_prompt, build_final_decision_prompt
+from decision.prompts import (build_decider_system, build_decision_prompt,
+                              build_final_decision_prompt)
 from decision.trace import snapshot
 
 ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER",
@@ -24,6 +26,10 @@ ACTIONS = ("GOTO_INSTANCE", "GOTO_FRONTIER",
 
 DEFAULT_MAX_TOOL_ROUNDS = 15
 FINAL_ACTION_ATTEMPTS = 2
+# 工具结果统一截断口径：prompt transcript 与 decision_window exchange 共用
+TOOL_RESULT_MAX_CHARS = int(os.environ.get("NAV_TOOL_RESULT_MAX_CHARS",
+                                           "2000"))
+
 
 # 走到目标附近即可上报：成功按距离判定（评估器 0.25m 测地线阈值），
 # 不要求目标在视野内——太近时物体落在相机视野外是正常现象。非 active
@@ -31,7 +37,7 @@ FINAL_ACTION_ATTEMPTS = 2
 REPORT_NEAR_DIST_M = float(os.environ.get("NAV_REPORT_NEAR_DIST_M", "1.0"))
 
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
-WRITE_TOOLS = ("update_instance", "set_notes", "instantiate_points",
+WRITE_TOOLS = ("update_instance", "update_notes", "instantiate_points",
                "commit_candidates", "resolve_duplicate")
 
 EVENT_ACTIONS = {
@@ -109,6 +115,9 @@ class DecisionLoop:
         self.logger = logger
         self.max_tool_rounds = min(
             DEFAULT_MAX_TOOL_ROUNDS, max(0, int(max_tool_rounds)))
+        # 决策级 API 重试次数（chat_fn 返回 None/异常时），默认 1 次
+        self.api_retries = max(
+            0, int(os.environ.get("NAV_DECIDER_API_RETRIES", "1")))
         self._trace_session = uuid.uuid4().hex
         self._trace_sequence = 0
         self._trace_record = None
@@ -116,10 +125,14 @@ class DecisionLoop:
         self._trace_sink = None
         self._trace_call_context = None
         self._trace_warning = False
+        # 最近一次被接受决策的原始交换记录（tool_calls/tool_results/reply/
+        # image_labels），供 nav_agent 追加到 decision_window。
+        self.last_exchange = None
 
     def decide(self, event, world_state, map_png=None, images=None,
                state_fn=None, trace_context=None, trace_snapshot_fn=None,
-               trace_sink=None, trace_call_context=None):
+               trace_sink=None, trace_call_context=None,
+               decision_window=None):
         """一次事件驱动决策。返回 DecisionResult；最终非法/模型不可用
         返回 None（调用方回退确定性规则）。
 
@@ -131,18 +144,28 @@ class DecisionLoop:
             "decision_id": f"{self._trace_session}:{self._trace_sequence}",
             "context": snapshot(trace_context or {}),
             "model_outputs": [], "tools": [], "capture_errors": [],
+            "window_size": len(decision_window or []),
         }
+        self.last_exchange = None
         self._trace_snapshot_fn = trace_snapshot_fn
         self._trace_sink = trace_sink
         self._trace_call_context = trace_call_context
         state = world_state
-        prompt = self._build_prompt(event, state)
+        self._system_prompt = build_decider_system(self.max_tool_rounds)
         images = list(images or [])
         if map_png:
             images = self._with_topdown_map(images, map_png)
         tool_calls = 0
         tool_results = []
+        # decision_window 条目素材：本轮工具调用/结果（截断）、最终被接受
+        # 的 reply 与当时附加图片的标签；校验重试的中间废品不进。
+        exchange = {"tool_calls": [], "tool_results": [],
+                    "image_labels": [label for label, _p in images]}
         while True:
+            # 每轮重渲染 user 文本：world_state 只留最新一份，工具往来与
+            # 校验拒绝经 transcript 滚动保留，不再字符串累加。
+            prompt = self._render_user_prompt(
+                event, state, decision_window, tool_results, tool_calls)
             data = self._chat(prompt, images)
             if data is None:
                 self._log(event, state, None, "model_unavailable",
@@ -155,25 +178,24 @@ class DecisionLoop:
             elif tool_call:
                 if tool_calls >= self.max_tool_rounds:
                     return self._finalize_after_tool_limit(
-                        event, state, images, tool_calls, tool_results)
+                        event, state, images, tool_calls, tool_results,
+                        exchange)
                 tool_calls += 1
                 feedback, tool_img, ok = self._run_tool(tool_call)
                 tool_name = str(tool_call.get("name") or "")
                 tool_results.append(
                     f"Tool {tool_calls}/{self.max_tool_rounds} "
                     f"({tool_name}) result:\n{feedback}")
-                remaining = self.max_tool_rounds - tool_calls
-                prompt += (
-                    "\n\nTool result:\n" + feedback
-                    + f"\nTool usage: {tool_calls}/{self.max_tool_rounds}; "
-                      f"{remaining} calls remain."
-                    + ("\nContinue with another tool call only if needed, "
-                       "otherwise reply with the final decision JSON."
-                       if remaining else
-                       "\nThe hard tool-call limit has been reached."))
+                exchange["tool_calls"].append({
+                    "name": tool_name,
+                    "args": {k: v for k, v in tool_call.items()
+                             if k != "name"}})
+                exchange["tool_results"].append(
+                    str(feedback)[:TOOL_RESULT_MAX_CHARS])
                 if tool_img:
                     for label, payload in tool_img:
                         images = self._with_tool_image(images, label, payload)
+                        exchange["image_labels"].append(label)
                 if ok and state_fn is not None and \
                         str(tool_call.get("name") or "") in WRITE_TOOLS:
                     state, refreshed_map, has_map = self._refresh_context(
@@ -181,22 +203,28 @@ class DecisionLoop:
                     if has_map:
                         images = self._with_topdown_map(
                             images, refreshed_map)
-                    prompt += ("\n\nWorld state after your write:\n"
-                               + json.dumps(state, ensure_ascii=False))
                 if tool_calls >= self.max_tool_rounds:
                     return self._finalize_after_tool_limit(
-                        event, state, images, tool_calls, tool_results)
+                        event, state, images, tool_calls, tool_results,
+                        exchange)
                 continue
             else:
                 result, err = self._validate(data, state, tool_calls, event)
             if result is not None:
                 result = self._enforce_finish(result, state)
+                self.last_exchange = {
+                    **exchange,
+                    "reply": json.dumps(data, ensure_ascii=False,
+                                        default=str)}
                 self._log(event, state, result.as_dict(),
                           result.validation, tool_calls)
                 return result
-            # 校验失败重试一次
-            prompt += ("\n\nYour previous output was rejected: " + err
-                       + "\nReturn exactly one valid decision JSON object.")
+            # 校验失败重试一次：拒绝原因进 transcript，重渲染后重试
+            tool_results.append(
+                "Your previous output was rejected: " + str(err)
+                + "\nReturn exactly one valid decision JSON object.")
+            prompt = self._render_user_prompt(
+                event, state, decision_window, tool_results, tool_calls)
             data2 = self._chat(prompt, images)
             if data2 is None:
                 result2, err2 = None, "model_unavailable"
@@ -209,6 +237,10 @@ class DecisionLoop:
                     data2, state, tool_calls, event)
             if result2 is not None:
                 result2 = self._enforce_finish(result2, state)
+                self.last_exchange = {
+                    **exchange,
+                    "reply": json.dumps(data2, ensure_ascii=False,
+                                        default=str)}
                 self._log(event, state, result2.as_dict(),
                           result2.validation, tool_calls)
                 return result2
@@ -217,7 +249,7 @@ class DecisionLoop:
             return None
 
     def _finalize_after_tool_limit(self, event, state, images, tool_calls,
-                                   tool_results):
+                                   tool_results, exchange=None):
         """Require an action after the hard limit; never validate tool_call.
 
         If the model still refuses the final-action-only contract, return a
@@ -242,6 +274,10 @@ class DecisionLoop:
                     data, state, tool_calls, event)
                 if result is not None:
                     result = self._enforce_finish(result, state)
+                    self.last_exchange = {
+                        **(exchange or {}),
+                        "reply": json.dumps(data, ensure_ascii=False,
+                                            default=str)}
                     self._log(event, state, result.as_dict(),
                               result.validation, tool_calls)
                     return result
@@ -252,6 +288,7 @@ class DecisionLoop:
         result = self._forced_navigation_result(
             event, state, tool_calls, last_error)
         result = self._enforce_finish(result, state)
+        self.last_exchange = {**(exchange or {}), "reply": None}
         self._log(event, state, result.as_dict(),
                   result.validation, tool_calls)
         return result
@@ -362,32 +399,59 @@ class DecisionLoop:
                     break
         return tool_call
 
-    def _build_prompt(self, event, world_state):
+    def _build_prompt(self, event, world_state, decision_window=None):
         return build_decision_prompt(
-            event, world_state, max_tool_rounds=self.max_tool_rounds)
+            event, world_state, max_tool_rounds=self.max_tool_rounds,
+            decision_window=decision_window)
+
+    def _render_user_prompt(self, event, state, decision_window,
+                            tool_results, tool_calls):
+        """每轮重渲染 user 文本：world_state 只留最新一份，工具往来与校验
+        拒绝作为 transcript 一节滚动保留——user 文本不再只增不减。"""
+        prompt = self._build_prompt(event, state, decision_window)
+        if tool_results:
+            remaining = max(0, self.max_tool_rounds - tool_calls)
+            prompt += (
+                "\n\nTool transcript this decision (oldest first):\n"
+                + "\n\n".join(str(item) for item in tool_results)
+                + f"\nTool usage: {tool_calls}/{self.max_tool_rounds}; "
+                  f"{remaining} calls remain."
+                + ("\nContinue with another tool call only if needed, "
+                   "otherwise reply with the final decision JSON."
+                   if remaining else
+                   "\nThe hard tool-call limit has been reached."))
+        return prompt
 
     def _chat(self, prompt, images):
+        """单次决策内 API 调用；返回 None/异常时按 api_retries 决策级重试。"""
         record = self._trace_record
-        call_index = len(record["model_outputs"]) + 1 if record else None
-        if record and self._trace_call_context is not None:
+        data = None
+        for _retry in range(1 + getattr(self, "api_retries", 0)):
+            call_index = len(record["model_outputs"]) + 1 if record else None
+            if record and self._trace_call_context is not None:
+                try:
+                    self._trace_call_context(record["decision_id"], call_index)
+                except Exception as exc:
+                    self._trace_warn(exc)
             try:
-                self._trace_call_context(record["decision_id"], call_index)
-            except Exception as exc:
-                self._trace_warn(exc)
-        try:
-            data = self.chat_fn(prompt, images)
-        except Exception:
-            data = None
-        if record is not None:
-            try:
-                record["model_outputs"].append({
-                    "call_index": call_index, "output": snapshot(data)})
-            except Exception as exc:
-                self._trace_warn(exc)
+                data = self.chat_fn(
+                    prompt, images,
+                    system_prompt=getattr(self, "_system_prompt", None))
+            except Exception:
+                data = None
+            if record is not None:
+                try:
+                    record["model_outputs"].append({
+                        "call_index": call_index,
+                        "output": snapshot(data)})
+                except Exception as exc:
+                    self._trace_warn(exc)
+            if isinstance(data, dict):
+                break
         return data if isinstance(data, dict) else None
 
     @staticmethod
-    def _serialize_tool_feedback(payload, max_chars=4000):
+    def _serialize_tool_feedback(payload, max_chars=TOOL_RESULT_MAX_CHARS):
         """Keep feedback valid JSON even when a tool returns a large record."""
         raw = json.dumps(payload, ensure_ascii=False, default=str)
         if len(raw) <= max_chars:

@@ -4,16 +4,6 @@
 
 ### 1. Introduction
 
-具身导航是完成具身任务（家庭服务、仓储集货、巡检清点）的基础能力,具身智能的发展使得具身导航领域备受关注。为了量化agent的具身导航能力，具身导航benchmark应运而生。
-
-现有的具身导航benchmark(habitat objectnav、HM3D-ovon、goat、LH-VLN)有两条发展主线。一是从单模态扩展到多模态，二是从单目标导航发展到复杂的顺序多目标导航（在agent找到一个目标后保留agent的记忆并分配下一个任务，这种任务 focus on lifelong navigatin）。
-
-但真实服务/家居任务远非这么理想化：接待客人前要"找到 3 把椅子并搬过来"、洗衣前要"收齐家里各处所有换洗衣物"、餐厅要"清点并回收全部餐盘"。agent需要自己并发地寻找多个目标并且按照要求不重复地找齐目标，这需要agent具有目标子集选择、访问排序、实例追踪和未知数量下的终止判断。但现有工作仍然是对单目标任务的拼接，缺少决策空间来量化agent的规划能力，缺少对实例的状态维护能力的考查。
-
-为了补充，我们提出ourbenchmark： Many-Object Navigation（ManyON）/All-Object Navigation（AllON）、结果指标与过程诊断，以及可审计的参考 agent。
-
-贡献收敛为三项：任务与数据；评测与诊断体系；系统baseline与实证发现。
-
 Embodied navigation is a foundational capability for embodied tasks ranging from household assistance to warehouse order-picking because agents typically need to reach a target location before executing downstream manipulations. As embodied intelligence advances, a series of benchmarks have emerged to quantify how well agents navigate.
 
 Existing embodied navigation benchmarks have progressively extended the task horizon. Starting from single-goal episodes [Habitat ObjectNav], a line of works has moved toward sequential multi-goal navigation, in which the agent is assigned the next goal upon reporting completion of the current one, while retaining its memory of the environment across goals [MultiON, GOAT, LH-VLN]. This lifelong setting substantially extends the temporal scope of agent operation, making environmental memory retention and long-horizon efficiency important evaluation targets. However, regardless of how long the task horizon grows, the task structure itself remains fixed: goals, their order, and count are always given to the agent in advance.
@@ -36,16 +26,13 @@ To summarize up, our contributions are threefold:
 
 ### 2. Related Work
 
-**2.1 From Sigle to Multi-Goals**
+**2.1 Embodied Navigation Benchmark**
 
-- 单目标 ObjectGoal Navigation（Habitat ObjectNav、HM3D-ovon）把任务限定为到达某类别的一个实例，成功判定是"是否到达"——无需维护多目标进度，也不考查目标之间的取舍；
-- 以 MultiON、GOAT 为代表的多目标导航 benchmark，本质上是将"多目标导航"简化为"给定顺序的多次单目标导航"；
-- 目标顺序由指令显式给出，agent 只需按序执行 "go to A → go to B → go to C"，每个子任务的决策空间退化为单目标导航问题，Agent 不需要在多个候选目标间做取舍、排序、路径整体规划；
-- 这对 working memory 的要求很弱，只需记住"当前子目标是谁"，无需维护"已找到哪些"和"去过哪里"的复杂状态；
-- 我们的benchmark更进一步，利用 ManyON/AllON 补上对搜索规划，实例记忆维护和终止决策能力的测评；
-- 评测方法论上接续 SPL与 MultiON 的多目标指标；但过程级诊断（U_t、TSQ/OQ，见 §3.3）在现有 benchmark 中普遍缺位。
+Existing embodied navigation benchmarks have mainly evolved along two lines, each substantially broadening what navigation systems are evaluated on. The first line expands how goals are specified: from object categories in a closed label set [Habitat ObjectNav], to open-vocabulary categories [HM3D-OVON], to goals given by category names, natural-language descriptions, or reference images [GOAT], and even to sounding targets localized from acoustic cues [SoundSpaces, AVLEN]. This line has freed navigation from fixed label sets, allowing goals to be expressed in whatever form users naturally provide. Yet while evaluation has shifted toward goal grounding and perceptual generalization, the underlying task structure — reaching one designated target at a time — remains unchanged. The second line extends the task horizon: from single-goal episodes to sequential multi-goal navigation, in which the agent is assigned the next goal upon reporting completion of the current one while retaining its memory of the environment across goals [MultiON, GOAT, LH-VLN]. This lifelong setting extends the temporal scope of agent operation, making environmental memory retention and long-horizon efficiency important evaluation targets.
 
-**2.2 VLM for Exploration and Reasoning**
+Despite expanding different axes, both lines rest on a common structural assumption: the task structure is externally given. The goals, their order, and their count are prescribed by the benchmark, and the metrics score the outcome of executing that prescription rather than the decisions that produced it. Our work is complementary to both lines. We hold goal specification and task horizon as orthogonal axes — AutoNav-Bench supports category, language, and image goals in a long-horizon setting — and vary instead the degree of decision autonomy: which instances to visit, in what order, with what memory of past visits, and when to stop. This isolates a capability that neither line exercises or measures, and allows our tasks to be combined with any point along the two established axes.
+
+**2.2 VLM for Exploration and Navigation**
 
 - VLM 在解决具身导航问题上有前景，但对空间的理解和记忆是 VLM 的弱点，需要外部的表征来辅助 VLM。现有方法从表示形式和交互范式两个互补方向展开，但均未解决开放世界多实例收集的核心挑战。
 - 在场景表示方面可分为三种范式(1) 3D Scene Graph：MSGNav、SG-Nav和 PSG-Nav 将环境建模为物体节点和关系边，使 agent 能利用物体间的语义和空间关系进行导航。然而，scene graph 的预构建开销大，且将复杂空间关系简化为离散文本描述或RGB图片，难以支持精细的空间推理。3D-Mem 提出用 Memory Snapshot 替代 scene graph，虽然保留了更丰富的视觉信息，但其高层决策仍基于离散图片，缺乏对全局空间拓扑的认知。(2) BEV / 语义地图：TopV-Nav将鸟瞰图与物体 bounding box 作为 MLLM 的输入，利用其空间推理能力进行零样本目标导航。3DGSNav、IntentNav和 VLFM也在 BEV 或语义地图上标注目标点或前沿点来引导 VLM 决策。虽然这种压缩简化了空间规划，但在需要实例级视觉验证时，VLM 无法从压缩后的 BEV 中恢复原始视觉证据。(3) 3D 特征场 / Query-based：MTU3D  提出在线 query 表示学习，从 RGB-D 流中实时提取物体 query 和前沿 query，统一了 grounding 与 exploration 的优化目标。但其表示是压缩后的隐式向量，语义不可读，且依赖深度传感器和已知位姿，限制了在纯 RGB 场景下的适用性。本文基于 VGGT 的单目重建直接维护原始点云，配合 VLM 生成的自然语言 caption，在 query 时刻动态实例化语义区域——既避免了全图预构建的开销，又保留了完整几何与显式可读语义，使 VLM 能够直接基于点云密度和 caption 检索进行空间聚类推理与覆盖评估。从结构化场景表示上。
@@ -76,56 +63,113 @@ To summarize up, our contributions are threefold:
 
 ### 4. Reference Agent
 
-参考 agent 承担双重角色：任务的 baseline，并且实证benchmark能够量化agent的水平。
+参考 agent 不是来刷分的 SOTA 竞争者，它承担两个功能：**可解性 / 有效性证明**（任务是可以被一个合理系统做出真实决策的）和**诊断探针**（它的机制与留痕恰好产出 §5 所有诊断指标的数据）。全节每一小节都应能回扣这两个功能之一。
 
-**4.1 Harness 架构：VLM 决策核心 + 确定性工具层**
+**4.1 Design Rationale：为什么必须是 harness**（动机，全节的智力核心）
 
-仿照 coding agent 的组织方式：VLM 只做高层认知（规划、检索、核实、裁决），感知增强、记忆管理与动作执行全部由确定性模块承担，并包装为 VLM 可按需调用的工具：
+从 ManyON/AllON 的任务需求出发，论证两个极端都不行：端到端 VLM 扛不住长时程上下文与精确几何，纯启发式写不出"哪个候选最像目标、能不能停"的通用规则。harness 恰好切走中间地带。五条论证压缩成一段设计原则：
 
-- 感知工具：caption 检索（BGE）、查看任意关键帧、SAM 全分割选目标、像素→3D 实例化；
-- 记忆工具：VGGT-SLAM建图、实例文本修订、重复实例合并、分页动作历史、VLM 自维护 notes；
-- 执行工具：frontier/实例导航、SCAN、报告与终止。
+- 长时程：episode 长达数百步，端到端 VLM 逐步决策成本高、视觉上下文膨胀，早期观察被挤出窗口，且其中大部分决策并不重要；
+- 记账：要求可靠维护"找到过哪些、是否重复、哪里还没探索"，VLM 在长上下文中自行记账不可靠、不可审计；
+- 精确几何：尺度、路径代价、可达性、去重半径都是连续数值，VLM 的数值估计不可靠；
+- 语义判断：候选选择、属性判别、终止判断依赖语义常识与不确定推理，启发式写不出通用规则；
+- 搜索与重访：已看过的区域需要能被语义回访，冷启动需要无目标探索。
 
-决策是事件驱动的：导航执行到底，只有到达、frontier 耗尽、caption 检索命中等事件点才交还 VLM，决策密度降至每 300 步 12–20 次，VLM 的上下文只花在真正的决策点上。
+harness 的定位由此导出：感知增强、记忆管理与动作执行由确定性模块承担并包装为工具，VLM 只做高层认知（规划、检索、核实、裁决）。
 
-```mermaid
-flowchart LR
-    RGB["RGB + instruction"] --> MAP["VGGT-SLAM / 3D map"]
-    RGB --> CAP["caption (API VLM) + BGE retrieval"]
-    MAP --> P3D["pixel → VGGT 3D point"]
-    SOM["SAM 全分割 (AMG)"] -- "编号 mask overlay" --> VLM
-    VLM -- "som_pick 选 mask" --> SOMR["SAM mask 精化<br/>质心 + mask 深度采样"]
-    SOMR --> P3D
-    CAP --> VLM["decision VLM (API)"]
-    MAP --> TOP["RGB point-cloud bird's-eye map"]
-    MEM["InstanceMemory (三层去重)"] --> STATE["world-state JSON<br/>(含 nearby 3m 预筛)"]
-    STATE --> VLM
-    TOP --> VLM
-    VLM -- "tools: search/view/propose/commit..." --> MEM
-    VLM -- "tools: propose_candidates / som_pick" --> SOM
-    VLM -- "REPORT_FOUND" --> HIGH["high-level action / TARGET_FOUND / START_ADJUST"]
-    MEM -- "3m 内有已有实例 → duplicate_review<br/>证据图交 VLM 裁决(resolve_duplicate)" --> VLM
-    HIGH --> EXEC["A* / follower / collision recovery"]
-    EXEC --> RGB
-```
+**4.2 Memory Architecture：三层记忆 + world_state 视图**（v2 改造的成果，显性呈现）
 
-**4.2 VGGT-SLAM：harness 的 3D 记忆**
+- 空间记忆：VGGT-SLAM 点云 / 占据栅格 / 关键帧库 / 尺度标定；
+- 语义记忆：caption_store；instance_store 的 Observation / Instance / ReportClaim 三层；
+- 工作记忆：agent_notes、action_log、decision_window；
+- 代码方与 VLM 的可写性分明：底层结构由代码维护保证正确性，语义层对 VLM 开放写入（审核候选、合并重复、修订文本、维护 notes）；
+- world_state 不是独立记忆，而是每次决策对三层记忆的确定性重建视图。这是"记忆是 harness 强项"这条论点的具体形态，也是和 MemoNav 式被动检索的区别所在。
 
-harness 的全部空间状态——占据栅格、frontier、实例坐标、路径代价、鸟瞰图——都建立在同一个在线点云地图上，其建图后端是 VGGT-SLAM：RGB 帧在线喂入，VGGT 前馈重建各帧深度与相机位姿，子图位姿图与回环闭合把局部观测组织成全局一致的点云。单目重建只恢复 Sim(3) 相对尺度，系统用在线尺度标定（多帧地面–相机高度尺规）恢复米制几何，作为距离、到达半径与去重半径的共同基准。
+**4.3 Spatial Memory：VGGT-SLAM 作为空间记忆载体**
 
-VGGT 点云的固有误差由 harness 的确定性模块吸收，而不是暴露给 VLM：尺度漂移由标定模块锁定；漂移/回环产生的垂直鬼影层由射线法自由空间清除；占据栅格与 A* 在清理后的地图上运行。语义实例的 3D 坐标来自 SAM mask 在点云上的反投影与深度采样，而不是模型的坐标猜测。
+不只介绍建图，重点是"全部空间状态同源"：frontier、覆盖、路径代价、BEV、实例 3D 坐标都从同一个在线点云派生；尺度标定、鬼影清除、反投影实例化由确定性模块吸收误差，VLM 永不输出坐标和尺度。感知 → 反投影实例化链条（caption 检索 → 查看帧 → pointing / SAM 选 mask → 反投影取 3D）在本节给出。误差处理压缩、细节放附录。
 
-**4.3 为什么 harness 与多目标 benchmark 适配**
+**4.4 Decision Loop：工具集 + 调查—核实—入账 + 事件驱动**（与 related work 对位的差异化贡献）
 
-ManyON/AllON 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的中间地带，harness 是针对这一错位的架构选择：
+架构图放本节开头总览。
 
-- **长时程上下文**：一个 episode 长达数百步。端到端 VLM 逐步决策不仅调用成本高，视觉上下文还会随步数膨胀，早期观察被挤出窗口，而且其中大部分决策并不重要。harness 把低层控制交给确定性执行器（GOTO 执行到底，事件点才交还），决策密度下降约60%，VLM 的注意力只花在真正的决策点上。
-- **记忆（实例状态维护）是 harness 的强项**：ManyON/AllON 要求可靠维护"找到过哪些、是否重复、哪里还没探索"。harness 把这些状态外化为显式数据结构：Observation / Instance /ReportClaim 三层记忆保证实例身份与报告幂等；world-state 在每次决策时重建任务账本与最近动作；notes 与分页动作历史让 VLM 自己维护长期工作记忆。记账的正确性、持久性与可审计性由确定性代码保证，VLM 只负责基于记忆做判断。
-- **几何与数值须精确**：尺度、路径代价、可达性、3m 去重半径都是连续数值，VLM 的数值估计不可靠。harness 预计算全部几何量以下发，VLM 不输出世界坐标、不估算尺度。
-- **目标选择、属性判别、终止判断**："这堆候选里哪个最可能是目标""这个区域探索充分了吗、能不能停"依赖语义常识与不确定推理，启发式方法写不出通用规则，harness 恰好把这些决策留给 VLM。实例池让多个已发现候选并行存在，配合预计算的路径代价，目标选择成为显式决策点（这是后文 U_t 分析的结构来源）。
-- **搜索与重访**：harness 用几何+语义双层 frontier 分别显式跟踪，caption 检索让已经看过的区域可以被语义回访，SCAN 处理冷启动。
+- 工具集按读 / 写 / 执行分组：读（caption 检索、查看帧、实例检索与检查、地图状态），写（实例化、文本修订、重复合并、notes），执行（GOTO、SCAN、REPORT、FINISH、ADJUST）；
+- 调查—核实—入账：感知产出只是候选，经 VLM 审核（接受 / 拒绝 / 不确定）才成为可导航实例；重复实例可合并、文本可修订、notes 自维护。VLM 按需索取信息并参与记忆维护，而不是被动接收召回——与 related work 对 AgenticNav 的批评口径一致（那里写对比，这里给机制细节）；
+- 事件驱动决策密度：GOTO 执行到底，仅到达 / frontier 耗尽 / 检索命中等事件点交还 VLM，决策密度降至每 300 步 12–20 次，VLM 的上下文只花在真正的决策点上（正式写之前用正式实验日志核数字）。
 
-尺度恢复、自由空间处理和工程阈值放附录。
+**4.5 Instrumentation：机制 ↔ 考点 ↔ 指标对齐**（全节的收尾，通往 §5 的桥）
+
+benchmark 主导论文里最关键、也最容易被漏掉的一段。一张小表：
+
+| 机制 | benchmark 考点 | 产生的指标 / 证据 |
+|---|---|---|
+| 实例池 + 预计算路径代价 | 目标选择成为显式决策点 | U_t 的结构来源（§5.6）；首选路线代价比较 |
+| FINISH 显式化 | 终止成为可观测决策而非隐式超时 | §5.4 停止分析 |
+| 三层去重 + 报告幂等 | 重复报告 FP 的防线 | 诊断指标归因 |
+| 全程留痕（决策、工具、审核、尺度） | — | §5 所有诊断指标的数据来源 |
+
+写完这段，reader 自然明白为什么 experiments 里那些指标"有数可算"。
+
+**写作注意（降级或不写）**
+
+- 28 个配置项、API 重试、截断口径、尺度标定细节 → 附录或实现细节小节，一句话带过；
+- 不要声称 agent 本身的创新性超过"一个合理的 reference 设计"——它的贡献是和 benchmark 联合呈现的，单独拔高反而给 reviewer 攻击面；
+- mermaid 图换成一张正式架构图（三层记忆居中，工具 / 执行两侧，world_state 视图标注），最好再加一个 episode 内 loop 的时序小图或 running example。
+
+### 4. Reference Agent (English)
+
+The reference agent is not a SOTA competitor chasing scores; it serves two functions: **solvability / validity evidence** — the tasks admit genuine decision-making by a reasonable system — and a **diagnostic probe** — its mechanisms and traces produce exactly the data behind every diagnostic metric in §5. Every subsection should tie back to one of these two functions.
+
+**4.1 Design Rationale: Why a Harness** (motivation; the intellectual core of the section)
+
+Starting from the requirements of ManyON/AllON, we argue that both extremes fail: end-to-end VLMs cannot sustain long-horizon context or precise geometry, while purely heuristic pipelines cannot express general rules for "which candidate is most likely the target" or "whether it is safe to stop". A harness occupies exactly this middle ground. Five arguments, compressed into one design principle:
+
+- Long horizon: an episode runs for hundreds of steps. Step-by-step end-to-end VLM decisions are expensive, the visual context grows without bound, early observations are pushed out of the window — and most of those decisions do not matter.
+- Bookkeeping: the task requires reliably maintaining "what has been found, what is a duplicate, what remains unexplored". A VLM keeping such ledgers inside its own context is neither reliable nor auditable.
+- Precise geometry: scale, path costs, reachability and deduplication radii are continuous quantities that VLMs estimate unreliably.
+- Semantic judgment: candidate selection, attribute discrimination and termination decisions rely on semantic common sense and reasoning under uncertainty — heuristics cannot write general rules for these.
+- Search and revisit: regions already seen must be semantically revisit-able, and cold start requires goal-free exploration.
+
+The harness positioning follows directly: perception augmentation, memory management and action execution are delegated to deterministic modules and exposed as tools; the VLM handles only high-level cognition (planning, retrieval, verification, adjudication).
+
+**4.2 Memory Architecture: Three-Layer Memory + the World-State View** (the outcome of the v2 redesign, presented explicitly)
+
+- Spatial memory: the VGGT-SLAM point cloud / occupancy grid / keyframe store / scale calibration.
+- Semantic memory: caption_store; the three levels of instance_store — Observation / Instance / ReportClaim.
+- Working memory: agent_notes, action_log, decision_window.
+- Writability is split cleanly between code and VLM: underlying structures are maintained by code for correctness, while the semantic layer is open to VLM writes (auditing candidates, merging duplicates, revising texts, maintaining notes).
+- world_state is not an independent memory but a deterministically rebuilt view over the three layers at every decision. This is the concrete form of the claim that memory is the harness's strength, and the substantive difference from MemoNav-style passive retrieval.
+
+**4.3 Spatial Memory: VGGT-SLAM as the Spatial Memory Carrier**
+
+Not just a mapping introduction — the point is that all spatial state shares one source: frontiers, coverage, path costs, the BEV image and instance 3D coordinates are all derived from the same online point cloud. Scale calibration, ghost-layer removal and back-projection instantiation absorb reconstruction errors inside deterministic modules; the VLM never outputs coordinates or scale. The perception → back-projection instantiation chain is presented here (caption retrieval → view frame → pointing / SAM mask selection → back-project to 3D). Keep error handling brief; details go to the appendix.
+
+**4.4 Decision Loop: Tools + Investigate–Verify–Commit + Event-Driven Control** (the differentiated contribution aligned with related work)
+
+Place the architecture figure at the start of this subsection as an overview.
+
+- Tools are grouped as read / write / execute: read (caption retrieval, view frames, instance search and inspection, map status), write (instantiation, text revision, duplicate merging, notes), execute (GOTO, SCAN, REPORT, FINISH, ADJUST).
+- Investigate–verify–commit: perceptual output is only a candidate; it becomes a navigable instance only after VLM review (accept / reject / uncertain). Duplicates can be merged, texts revised, notes self-maintained. The VLM pulls information on demand and participates in memory maintenance instead of passively receiving recalls — consistent with the criticism of AgenticNav in related work (the contrast goes there; the mechanism details go here).
+- Event-driven decision density: GOTO executes to completion and control returns to the VLM only at event points (arrival / frontier exhaustion / retrieval hits). Decision density drops to 12–20 decisions per 300 steps, so VLM context is spent only on real decision points (verify these numbers against the formal experiment logs before writing).
+
+**4.5 Instrumentation: Mechanism ↔ Capability ↔ Metric Alignment** (the close of the section; the bridge to §5)
+
+The most critical — and most easily omitted — paragraph in a benchmark-led paper. A small table:
+
+| Mechanism | Benchmark capability | Resulting metric / evidence |
+|---|---|---|
+| Instance pool + precomputed path costs | Target selection becomes an explicit decision point | Structural source of U_t (§5.6); first-choice route cost comparison |
+| FINISH made explicit | Termination is an observable decision, not an implicit timeout | §5.4 stopping analysis |
+| Three-level deduplication + report idempotency | Defense line against duplicate-report false positives | Failure attribution to the review / dedup stages |
+| Full tracing (decisions, tools, reviews, scale) | — | Data source for every diagnostic in §5 |
+
+After this paragraph, the reader naturally understands why the experiments have "numbers to compute" at all.
+
+**Writing notes (demote or omit)**
+
+- The 28 configuration items, API retries, truncation policy and scale-calibration details → appendix or an implementation-details subsection, one sentence each at most.
+- Do not claim the agent itself is more innovative than "a reasonable reference design" — its contribution is presented jointly with the benchmark; inflating it only gives reviewers attack surface.
+- Replace the mermaid sketch with a proper architecture figure (three-layer memory at the center, tools and execution on the sides, world_state annotated as a view), ideally plus a small timeline of the in-episode loop or a running example.
 
 ### 5. Experiments
 

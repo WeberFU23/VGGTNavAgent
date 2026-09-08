@@ -50,7 +50,7 @@ FINISH is irreversible: the episode ends immediately.
    - navigation: current_pose (x, y, yaw), current_frame_id (the frame id
      of the latest RGB just fed to the map server — the current view; usable
      with view_frame and instantiate_points) and active_target.
-   - notes: YOUR persistent working memory (see Memory below).
+   - agent_notes: YOUR persistent working memory (see Memory below).
    - recent_actions: your last 3 high-level actions with outcomes
      (ok / collision / arrived).
    - rejected_spots: pixels on keyframes that were semantically REJECTED
@@ -90,9 +90,9 @@ system. Never estimate world geometry or output world coordinates; refer to
 objects by their ids. The only coordinates you may provide are normalized
 image pixels required by instantiate_points.
 
-# Memory: instances and notes
+# Memory: instances and agent_notes
 
-Each accepted proposal (from som_pick/instantiate_points) is stored as an
+Each accepted proposal (from pick_segment/instantiate_points) is stored as an
 observation. If its 3D point lies near existing instances it is NOT turned
 into an instance directly:
 you receive a duplicate_review entry with evidence images and must judge
@@ -112,8 +112,9 @@ table is a bounded summary of available instances; instances_omitted_ids are
 also valid GOTO_INSTANCE targets. Use search_instances and get_instance to see
 beyond the table.
 
-notes is a string that persists across decisions and is handed back inside
-every world state. Maintain it with set_notes: current plan, ruled-out
+agent_notes is a string that persists across decisions and is handed back
+inside every world state. Maintain it with update_notes: current plan,
+ruled-out
 areas or hypotheses, next steps (at most 500 characters). It is your only
 long-term memory beyond instances — keep it current.
 
@@ -139,7 +140,7 @@ Perception and retrieval:
   bbox, area_frac}}]}} plus an attached numbered overlay image: segment the
   whole frame into object regions with SAM (no pointing model involved).
   centroid/bbox are 0-1000 normalized, matching the numbers printed on the
-  overlay. Then call som_pick with the ids of the regions matching the target.
+  overlay. Then call pick_segment with the ids of the regions matching the target.
   Rejected regions (rejected_spots) are filtered out automatically; NEVER
   re-propose a frame whose regions were rejected, and never propose the
   same frame repeatedly from the same viewpoint.
@@ -194,7 +195,7 @@ re-propose from the new viewpoint instead of repeating from afar.
   background, wall, floor, a different object, or outside the object;
   UNCERTAIN when the image cannot establish this. Never use ACCEPT based on
   the caption or a plausible nearby object.
-- som_pick(frame_id, mask_ids, query, goal_index=null) -> {{proposals: [{{candidate_id,
+- pick_segment(frame_id, mask_ids, query, goal_index=null) -> {{proposals: [{{candidate_id,
   frame_id, mask_id, pixel}}]}}: register the picked regions as reviewable
   proposals; each mask's centroid becomes the candidate pixel and the mask
   itself is used for depth sampling. Evidence panels are attached; review
@@ -224,7 +225,7 @@ re-propose from the new viewpoint instead of repeating from afar.
   SAM_UNAVAILABLE. This is not evidence that the target is absent: move
   closer and retry, or use instantiate_points with pixels you read
   yourself, or continue exploration.
-  goal_index has the same meaning as in som_pick: pass it whenever this
+  goal_index has the same meaning as in pick_segment: pass it whenever this
   instantiation is meant to match a specific goal_image_N.
 
 Instance memory:
@@ -241,11 +242,11 @@ Housekeeping:
 - get_agent_status() -> {{num_frames, caption_pending,
   latest_captioned_frame_ids, instances_total, unreported_instances,
   steps_remaining}}: coverage and budget snapshot.
-- set_notes(text): overwrite your notes (see Memory above).
+- update_notes(text): overwrite your agent_notes (see Memory above).
 - get_action_history(before_step, limit) -> [{{step, action, target_id,
   outcome}}]: your older action history; recent_actions covers the last 3.
 
-After a write tool (update_instance, set_notes, instantiate_points,
+After a write tool (update_instance, update_notes, instantiate_points,
 commit_candidates) the
 refreshed world state is
 included in your next prompt — rely on it, not on the pre-write state.
@@ -301,7 +302,7 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   rejected (see rejected_spots), you MUST get closer before proposing
   again — never retry the same frame from the same viewpoint. After
   END_ADJUST the newest view is navigation.current_frame_id: propose on it
-  (propose_candidates) and pick the matching mask with som_pick.
+  (propose_candidates) and pick the matching mask with pick_segment.
 - REPORT_FOUND instance_id: report the active canonical instance you are
   standing next to. target_id is REQUIRED and must equal
   navigation.active_target.id (or an instance whose dist_m shows you are
@@ -331,13 +332,13 @@ EVENT_GUIDANCE = {
     "world_state_updated": (
         "\nFIRST check the current observation: if it already shows a target "
         "object (for image-goal tasks: anything matching a goal_image_N), "
-        "instantiate it NOW (propose_candidates + som_pick, or "
+        "instantiate it NOW (propose_candidates + pick_segment, or "
         "instantiate_points) before choosing any movement — an object seen "
         "but never instantiated is lost, and walking away may cost you the "
         "view. Then: instances and reachable frontiers were refreshed "
         "together; check "
         "new_keyframes for scenes collected since your last decision and "
-        "keep your notes current. Read and, when useful, update instance "
+        "keep your agent_notes current. Read and, when useful, update instance "
         "texts. Choose globally among GOTO_INSTANCE, GOTO_FRONTIER and SCAN "
         "(REPORT_FOUND and FINISH are also available when their "
         "conditions are met). When choosing a frontier, read the topdown "
@@ -418,13 +419,67 @@ EVENT_GUIDANCE = {
 }
 
 
-def build_decision_prompt(event, world_state, max_tool_rounds):
-    """组合固定契约、当前事件提示和结构化 world state。"""
+def _render_decision_window(decision_window):
+    """最近 N 轮决策原始窗口的 prompt 节；窗口为空/未启用时返回 None。
+
+    只放 VLM 自己的工具调用、被接受的 reply 与执行结果；图片以占位符
+    标注，world_state 旧副本与窗口节自身不进（防递归）。"""
+    entries = list(decision_window or [])
+    if not entries:
+        return None
+    lines = [
+        "\nRecent decision window (last %d rounds, oldest first; your own "
+        "tool calls and replies, images omitted):" % len(entries)]
+    for entry in entries:
+        seg = "[step %s | %s]" % (entry.get("step"), entry.get("event"))
+        labels = entry.get("image_labels") or []
+        if labels:
+            seg += " images: " + ", ".join(
+                "[image attached: %s]" % label for label in labels)
+        calls = entry.get("tool_calls") or []
+        results = entry.get("tool_results") or []
+        if calls:
+            rendered = []
+            for i, call in enumerate(calls):
+                args = ", ".join(
+                    "%s=%s" % (k, json.dumps(v, ensure_ascii=False,
+                                             default=str))
+                    for k, v in (call.get("args") or {}).items())
+                text = "%s(%s)" % (call.get("name"), args)
+                if i < len(results):
+                    text += " -> %s" % results[i]
+                rendered.append(text)
+            seg += " tools: " + "; ".join(rendered)
+        if entry.get("reply"):
+            seg += "; reply: %s" % entry["reply"]
+        seg += "; outcome: %s" % (entry.get("outcome") or "pending")
+        lines.append(seg)
+    return "\n".join(lines)
+
+
+DECIDER_SYSTEM_PREAMBLE = (
+    "You are the strategic visual reasoning module of an embodied "
+    "navigation agent. Use only supplied state and images. Never invent "
+    "geometry or simulator state. Return one strict JSON object with no "
+    "markdown or extra text.")
+
+
+def build_decider_system(max_tool_rounds):
+    """决策契约（静态部分）：走 system 角色，不再随 user 文本每轮重发。"""
+    return (DECIDER_SYSTEM_PREAMBLE + "\n\n"
+            + DECIDER_PROMPT.format(max_rounds=max_tool_rounds))
+
+
+def build_decision_prompt(event, world_state, max_tool_rounds,
+                          decision_window=None):
+    """组合当前事件提示和结构化 world state（user 角色，只装动态内容）。"""
     parts = [
-        DECIDER_PROMPT.format(max_rounds=max_tool_rounds),
-        "\nEvent: " + str(event),
         "\nWorld state:\n" + json.dumps(world_state, ensure_ascii=False),
     ]
+    window_section = _render_decision_window(decision_window)
+    if window_section:
+        parts.append(window_section)
+    parts.append("\nEvent: " + str(event))
     guidance = EVENT_GUIDANCE.get(str(event))
     if guidance:
         parts.append(guidance)
@@ -439,7 +494,7 @@ def build_decision_prompt(event, world_state, max_tool_rounds):
             "lists the indexes still to find. You can also spot targets "
             "yourself: whenever you see an outlined object's match in the "
             "current observation or a viewed frame, instantiate it "
-            "immediately (som_pick or instantiate_points) and pass "
+            "immediately (pick_segment or instantiate_points) and pass "
             "goal_index=N. Before REPORT_FOUND on an image-goal instance, "
             "compare your evidence image against the corresponding "
             "goal_image_N — they must show the same physical object."

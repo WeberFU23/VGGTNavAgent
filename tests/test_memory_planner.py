@@ -7,7 +7,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.memory import InstanceMemory
+from agents.instance_store import InstanceMemory
 from agents import planner
 
 

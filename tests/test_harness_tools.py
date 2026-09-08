@@ -48,7 +48,7 @@ class _ScriptedChat:
         self.replies = list(replies)
         self.calls = []
 
-    def __call__(self, prompt, images):
+    def __call__(self, prompt, images, system_prompt=None):
         self.calls.append((prompt, images))
         return self.replies.pop(0) if self.replies else None
 
@@ -61,14 +61,14 @@ def _hit():
 
 
 # ---------------------------------------------------------------- 工具：notes
-def test_set_notes_tool_truncates_and_roundtrips():
+def test_update_notes_tool_truncates_and_roundtrips():
     agent = _make_agent()
-    out = agent._tool_set_notes("plan: check frame 7")
-    assert out == {"notes": "plan: check frame 7"}
-    assert agent._notes == "plan: check frame 7"
-    out = agent._tool_set_notes("x" * 600)
-    assert len(agent._notes) == 500
-    assert out["notes"] == agent._notes
+    out = agent._tool_update_notes("plan: check frame 7")
+    assert out == {"agent_notes": "plan: check frame 7"}
+    assert agent._agent_notes == "plan: check frame 7"
+    out = agent._tool_update_notes("x" * 600)
+    assert len(agent._agent_notes) == 500
+    assert out["agent_notes"] == agent._agent_notes
 
 
 # -------------------------------------------------------- 工具：action history
@@ -136,9 +136,9 @@ def test_mark_goto_arrived_settles_latest_goto():
 def test_get_agent_status_aggregates_server_and_agent_state():
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=100, max_steps=500)
-    agent.memory.add([1, 0, 0], "basket")
-    reported = agent.memory.add([2, 0, 0], "reported basket")
-    agent.memory.mark_reported(reported)
+    agent.instance_store.add([1, 0, 0], "basket")
+    reported = agent.instance_store.add([2, 0, 0], "reported basket")
+    agent.instance_store.mark_reported(reported)
     agent.client = SimpleNamespace(
         get_state=lambda: {"num_frames": 42, "num_submaps": 3,
                            "num_loop_closures": 1, "caption_pending": 2,
@@ -205,10 +205,10 @@ def _two_stage_client():
 
 
 def _som_client():
-    """SAM 全分割主链路 mock：propose（分割）→ som_pick（选 mask）。
+    """SAM 全分割主链路 mock：propose（分割）→ pick_segment（选 mask）。
 
     frame 99 报 SAM_UNAVAILABLE；其他帧分割出一个 basket mask（centroid
-    637.1/359.1 对应旧 crosshair 坐标），som_pick 注册为候选 c5。
+    637.1/359.1 对应旧 crosshair 坐标），pick_segment 注册为候选 c5。
     """
     base = _two_stage_client()
 
@@ -222,7 +222,7 @@ def _som_client():
                             "bbox": [600.0, 320.0, 680.0, 400.0],
                             "area_frac": 0.05}]}, b"som-jpeg")
 
-    def som_pick(fid, mask_ids):
+    def pick_segment(fid, mask_ids):
         return {"candidates": [
             {"candidate_id": "c5", "frame_id": fid,
              "mask_id": int(mask_ids[0]),
@@ -230,7 +230,7 @@ def _som_client():
              "bbox": [600.0, 320.0, 680.0, 400.0]}]}
 
     base.som_segment = som_segment
-    base.som_pick = som_pick
+    base.pick_segment = pick_segment
     return base
 
 
@@ -246,7 +246,7 @@ def test_instantiate_points_unconfirmed_returns_pending_and_no_instances():
     assert out["pending_confirmation"] == [
         {"candidate_id": "c5", "frame_id": 5, "pixel": [637.1, 359.1]}]
     assert out["_tool_images"] == [("confirm_c5", b"confirm-jpeg")]
-    assert agent.memory.nodes == []
+    assert agent.instance_store.nodes == []
 
 
 def test_instantiate_points_accept_review_then_ingests():
@@ -261,13 +261,13 @@ def test_instantiate_points_accept_review_then_ingests():
     second = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert "pending_confirmation" not in second
     assert "_tool_images" not in second      # 十字图已渲染过，不重复渲染
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     row = second["instances"][0]
-    assert row["instance_id"] == agent.memory.nodes[0].iid
+    assert row["instance_id"] == agent.instance_store.nodes[0].iid
     assert row["observation_id"] == 1
     assert row["frame_id"] == 5
     assert row["association"] == "new"
-    assert agent.memory.nodes[0].text == "basket"
+    assert agent.instance_store.nodes[0].text == "basket"
 
 
 def test_instantiate_points_tolerates_vlm_coordinate_drift():
@@ -282,14 +282,14 @@ def test_instantiate_points_tolerates_vlm_coordinate_drift():
     assert review["instantiation_allowed"] is True
     second = agent._tool_instantiate_points(5, [[768.7, 328.3]], "speaker")
     assert "pending_confirmation" not in second
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     # 超出 ±20 容差的坐标仍是新像素，需要重新确认
     third = agent._tool_instantiate_points(5, [[700.0, 328.3]], "speaker")
     assert third["pending_confirmation"]
 
 
 def test_candidate_transaction_only_commits_explicit_accepts():
-    """SAM 分割→som_pick 候选不可导航；仅 ACCEPT 才进入 canonical memory。"""
+    """SAM 分割→pick_segment 候选不可导航；仅 ACCEPT 才进入 canonical memory。"""
     agent = _make_agent()
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _som_client()
@@ -298,17 +298,17 @@ def test_candidate_transaction_only_commits_explicit_accepts():
         {"mask_id": 1, "centroid": [637.1, 359.1],
          "bbox": [600.0, 320.0, 680.0, 400.0], "area_frac": 0.05}]
     assert proposed["_tool_images"] == [("som_5", b"som-jpeg")]
-    assert agent.memory.nodes == []
-    picked = agent._tool_som_pick(5, [1], "basket")
+    assert agent.instance_store.nodes == []
+    picked = agent._tool_pick_segment(5, [1], "basket")
     assert picked["proposals"] == [
         {"candidate_id": "c5", "frame_id": 5, "mask_id": 1,
          "pixel": [637.1, 359.1]}]
-    assert agent.memory.nodes == []
+    assert agent.instance_store.nodes == []
     committed = agent._tool_commit_candidates([
         {"candidate_id": "c5", "verdict": "ACCEPT",
          "reason": "mask is on basket"}], "basket")
     assert len(committed["instances"]) == 1
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
 
 
 def test_candidate_transaction_keeps_uncertain_out_of_memory():
@@ -316,12 +316,12 @@ def test_candidate_transaction_keeps_uncertain_out_of_memory():
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _som_client()
     agent._tool_propose_candidates(5, "basket")
-    agent._tool_som_pick(5, [1], "basket")
+    agent._tool_pick_segment(5, [1], "basket")
     committed = agent._tool_commit_candidates([
         {"candidate_id": "c5", "verdict": "UNCERTAIN"}], "basket")
     assert committed["uncertain"] == ["c5"]
-    assert agent._proposals["c5"]["status"] == "uncertain"
-    assert agent.memory.nodes == []
+    assert agent._proposal_queue["c5"]["status"] == "uncertain"
+    assert agent.instance_store.nodes == []
 
 
 def test_reject_or_uncertain_crosshair_never_instantiates():
@@ -336,7 +336,7 @@ def test_reject_or_uncertain_crosshair_never_instantiates():
         out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
         assert out["instances"] == []
         assert out["semantic_rejections"][0]["verdict"] == verdict
-        assert agent.memory.nodes == []
+        assert agent.instance_store.nodes == []
 
 
 def test_crosshair_review_requires_shown_evidence():
@@ -354,7 +354,7 @@ def test_instantiate_points_rounding_within_tolerance_accepts_review():
     agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
     out = agent._tool_instantiate_points(5, [[637, 359]], "basket")
     assert "pending_confirmation" not in out
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     # 明显不同的坐标不算确认，重新进入 pending
     out2 = agent._tool_instantiate_points(5, [[300.0, 300.0]], "basket")
     assert out2["instances"] == []
@@ -380,7 +380,7 @@ def test_instantiate_points_geometry_rejection_when_depth_invalid():
     # 诊断信息：reason 带有效采样点数
     assert rej[0]["reason"].startswith("no valid depth")
     assert "valid_points=" in rej[0]["reason"]
-    assert agent.memory.nodes == []
+    assert agent.instance_store.nodes == []
 
 
 def test_rejected_spot_recorded_by_review_and_propose_hard_blocked():
@@ -391,8 +391,8 @@ def test_rejected_spot_recorded_by_review_and_propose_hard_blocked():
     agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     agent._tool_review_crosshair(
         5, [637.1, 359.1], "REJECT", "crosshair is on the wall")
-    assert (5, 637, 359) in agent._rejected_spots
-    assert agent._rejected_spots[(5, 637, 359)]["count"] == 1
+    assert (5, 637, 359) in agent._rejected_spot_log
+    assert agent._rejected_spot_log[(5, 637, 359)]["count"] == 1
     # 同帧同区域 propose → 质心被过滤，全部区域被拒
     out = agent._tool_propose_candidates(5, "basket")
     assert out["all_spots_rejected"] is True
@@ -419,12 +419,12 @@ def test_reject_in_commit_candidates_also_memorized():
     agent._last_observation = SimpleNamespace(step_count=50)
     agent.client = _som_client()
     agent._tool_propose_candidates(5, "basket")
-    agent._tool_som_pick(5, [1], "basket")
+    agent._tool_pick_segment(5, [1], "basket")
     out = agent._tool_commit_candidates(
         [{"candidate_id": "c5", "verdict": "REJECT", "reason": "wrong spot"}],
         "basket")
     assert out["rejected"] == ["c5"]
-    assert (5, 637, 359) in agent._rejected_spots
+    assert (5, 637, 359) in agent._rejected_spot_log
 
 
 def test_geometry_rejection_records_revisit_target():
@@ -443,12 +443,12 @@ def test_geometry_rejection_records_revisit_target():
     out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
     assert out["instances"] == []
     assert len(out["geometry_rejections"]) == 1
-    entry = agent._revisit_targets[5]
+    entry = agent._revisit_queue[5]
     assert entry["attempts"] == 1
     assert np.allclose(entry["point"], [1.0, 2.0, 0.5])
     # 几何拒绝的像素也进被拒记忆：阻止对同一帧同一位置反复 commit
     # 空转；走近重拍发生在新帧上，不受此拦截。
-    assert (5, 637, 359) in agent._rejected_spots
+    assert (5, 637, 359) in agent._rejected_spot_log
 
 
 def test_revisit_attempts_capped_at_max():
@@ -466,7 +466,7 @@ def test_revisit_attempts_capped_at_max():
         assert out["navigating"] is False
     out = agent._schedule_revisit(5)
     assert out["error"] == "max revisit attempts reached for this frame"
-    assert agent._revisit_targets[5]["attempts"] == \
+    assert agent._revisit_queue[5]["attempts"] == \
         agent.revisit_max_attempts + 1
 
 
@@ -481,7 +481,7 @@ def test_molmo_pixels_require_explicit_accept_before_instantiation():
     assert pending["pending_confirmation"]
     agent._tool_review_crosshair(5, [637.1, 359.1], "ACCEPT")
     out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
 
 
 def test_instantiate_points_requires_observation_and_handles_errors():
@@ -505,7 +505,7 @@ def test_instantiate_points_rejects_legacy_server_without_audit_path():
         "results": [_hit()]})
     rows = agent._tool_instantiate_points(5, [[500, 500]], "basket")
     assert "error" in rows
-    assert agent.memory.nodes == []
+    assert agent.instance_store.nodes == []
 
 
 def test_instantiate_points_label_becomes_initial_text():
@@ -515,7 +515,7 @@ def test_instantiate_points_label_becomes_initial_text():
     agent._tool_instantiate_points(5, [[500, 500]], "wooden chair by the table")
     agent._tool_review_crosshair(5, [500, 500], "ACCEPT")
     agent._tool_instantiate_points(5, [[500, 500]], "wooden chair by the table")
-    assert agent.memory.nodes[0].text == "wooden chair by the table"
+    assert agent.instance_store.nodes[0].text == "wooden chair by the table"
 
 
 def test_instantiate_points_requires_pixels():
@@ -590,7 +590,7 @@ def test_propose_propagates_unknown_frame_error():
 # -------------------------------------------- world-state：notes / recent_actions
 def test_world_state_includes_notes_and_recent_actions():
     agent = _make_agent()
-    agent._notes = "working on frame 7"
+    agent._agent_notes = "working on frame 7"
     agent._last_observation = SimpleNamespace(step_count=9)
     agent._record_action("GOTO_INSTANCE", 1)
     agent._action_log[0]["outcome"] = "arrived"
@@ -598,7 +598,7 @@ def test_world_state_includes_notes_and_recent_actions():
     obs = SimpleNamespace(step_count=50, max_steps=500,
                           goal_text="Find all baskets")
     state = build_world_state(agent, obs)
-    assert state["notes"] == "working on frame 7"
+    assert state["agent_notes"] == "working on frame 7"
     assert state["recent_actions"] == [
         {"step": 9, "action": "GOTO_INSTANCE", "target_id": "1",
          "outcome": "arrived"}]
@@ -636,7 +636,7 @@ def test_world_state_reports_revisit_targets_with_distance():
     agent = _make_agent()
     agent.align_R = np.eye(3)
     agent._last_observation = SimpleNamespace(step_count=50)
-    agent._revisit_targets = {5: {"point": np.array([0.0, 0.0, 0.0]),
+    agent._revisit_queue = {5: {"point": np.array([0.0, 0.0, 0.0]),
                                   "attempts": 2, "step": 50}}
     obs = SimpleNamespace(step_count=60, max_steps=500, goal_text="x")
     state = build_world_state(agent, obs, start_xy=(3.0, 4.0))
@@ -750,11 +750,11 @@ def test_adjustment_disables_tool_calls():
 def test_new_write_tools_refresh_world_state():
     fresh = _state()
 
-    def set_notes(text):
-        return {"notes": text}
+    def update_notes(text):
+        return {"agent_notes": text}
 
     chat = _ScriptedChat([
-        {"tool_call": {"name": "set_notes", "text": "go to frame 7"}},
+        {"tool_call": {"name": "update_notes", "text": "go to frame 7"}},
         {"action": "GOTO_FRONTIER", "target_id": "f0"},
     ])
     calls = []
@@ -764,11 +764,12 @@ def test_new_write_tools_refresh_world_state():
         return fresh
 
     result = DecisionLoop(
-        chat, tools={"set_notes": set_notes}).decide(
+        chat, tools={"update_notes": update_notes}).decide(
             "world_state_updated", _state(), state_fn=state_fn)
     assert result.action == "GOTO_FRONTIER"
-    assert calls == [1]          # set_notes 触发 world-state 刷新
-    assert "World state after your write" in chat.calls[1][0]
+    assert calls == [1]          # update_notes 触发 world-state 刷新
+    # 重渲染后写后状态走标准节，只有一份 world_state
+    assert chat.calls[1][0].count("World state:") == 1
 
 
 # ------------------------------------------------------- 放宽后的事件白名单
@@ -924,7 +925,7 @@ def test_nav_stuck_recovery_marks_unreachable_and_asks_decider():
 
     class _Loop:
         def decide(self, event, state, map_png=None, images=None,
-                   state_fn=None):
+                   state_fn=None, decision_window=None, **_kwargs):
             events.append(event)
             state, _map = state_fn()
             assert state["navigation"]["blocked_target"]["instance_id"] == 3
@@ -1003,7 +1004,7 @@ def test_metric_snapshot_out_of_range_grid_never_seeds():
 def test_unreachable_instance_excluded_from_world_state():
     agent = _make_agent()
     agent._unreachable_instance_ids = {2}
-    agent.memory = SimpleNamespace(
+    agent.instance_store = SimpleNamespace(
         nodes=[
             SimpleNamespace(iid=1, reported=False, text="basket",
                             point=np.array([1.0, 1.0, 0.0]), step=1,
@@ -1025,7 +1026,7 @@ def test_unreachable_instance_kept_when_agent_stands_near():
     # 走到目标附近即可上报：agent 就在不可达实例旁时保留条目并打标记
     agent = _make_agent()
     agent._unreachable_instance_ids = {2}
-    agent.memory = SimpleNamespace(
+    agent.instance_store = SimpleNamespace(
         nodes=[
             SimpleNamespace(iid=1, reported=False, text="basket",
                             point=np.array([1.0, 1.0, 0.0]), step=1,
@@ -1049,7 +1050,7 @@ def test_unreachable_instance_kept_when_agent_stands_near():
 def test_activate_memory_target_skips_unreachable():
     agent = _make_agent()
     agent._unreachable_instance_ids = {1}
-    agent.memory = SimpleNamespace(
+    agent.instance_store = SimpleNamespace(
         nodes=[
             SimpleNamespace(iid=1, reported=False, text="basket",
                             point=np.array([1.0, 1.0, 0.0]), step=1,
@@ -1059,7 +1060,7 @@ def test_activate_memory_target_skips_unreachable():
                             point=np.array([2.0, 2.0, 0.0]), step=2,
                             observation_ids=[], report_claim_id=None,
                             candidate_id=None)])
-    agent._ordered_memory_nodes = lambda: agent.memory.nodes
+    agent._ordered_memory_nodes = lambda: agent.instance_store.nodes
     agent._plan_to_target = lambda obs: True
     obs = SimpleNamespace(step_count=1)
     assert agent._activate_memory_target(obs)

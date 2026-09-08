@@ -25,19 +25,16 @@ Navigation（AllON）任务、结果指标与过程诊断体系；本仓库实�
 
 | 文档 | 内容 |
 |---|---|
-| [PAPER_OUTLINE.md](PAPER_OUTLINE.md) | 论文全文框架：任务定义（§3.1–3.2）、评测指标体系（§3.3，含 SC/SQ、TSQ/OQ/PE、RTSR、U_t、NE/OSR 等）、参考 agent 章节（§4）、实验设计（§5） |
+| [PAPER_OUTLINE.md](PAPER_OUTLINE.md) | 论文全文框架：任务定义（§3.1–3.2）、评测指标体系（§3.3，含 SC/SQ、TSQ/OQ、PE、RTSR、U_t、NE/OSR 等）、参考 agent 章节（§4）、实验设计（§5） |
 | [PAPER_LOGGING.md](PAPER_LOGGING.md) | 论文实验数据的采集与读取口径：输出文件与 manifest、各分析读取的字段、决策快照与动作关联、目标选择离线比较口径 |
-| 本文档 | agent 系统架构详解：harness 设计思想，感知 / 记忆 / 决策 / 执行各层，评测采集接口 |
-
-最近一轮改动向日志体系补充了结构化候选快照、决策/模型调用关联、原始提议
-与处理后动作，以及只读 `get_paper_trace()` 接口（字段与分析口径见
-PAPER_LOGGING.md）；该旁路不进入模型输入。
+| [MEMORY_CONVENTIONS.md](MEMORY_CONVENTIONS.md) | 记忆系统命名与组织规范：三层记忆 + world_state 视图、存储后缀与工具动词约定、decision_window 设计 |
+| 本文档 | agent 系统架构详解：harness 设计思想（§1）、生命周期（§5）、感知/记忆/决策/执行各层（§6–§10）、留痕与配置（§11–§12）、设计决策记录（§14） |
 
 ## 仓库结构
 
 | 目录 / 文件 | 职责 |
 |---|---|
-| `agents/` | 高层状态机（`nav_agent.py`）、三层去重记忆（`memory.py`）、执行层（`navigator.py`：占据栅格 / A* / 路径跟随 / 碰撞恢复）、探索（`skeleton.py`）、路径排序回退（`planner.py`）、鸟瞰图渲染（`map_render.py`） |
+| `agents/` | 高层状态机（`nav_agent.py`）、三层去重记忆（`instance_store.py`）、执行层（`navigator.py`：占据栅格 / A* / 路径跟随 / 碰撞恢复）、探索（`skeleton.py`）、路径排序回退（`planner.py`）、鸟瞰图渲染（`map_render.py`） |
 | `decision/` | 决策 harness：工具循环（`agent_loop.py`）、提示词（`prompts.py`）、trace（`trace.py`）、VLM 网关（`vlm.py`） |
 | `mapping/` | VGGT-SLAM 服务端：关键帧（`keyframes.py`）、caption 与 BGE 检索（`caption_store.py`）、pointing / SAM 后端（`sam_backend.py`）、尺度标定（`scale_calibration.py`）、决策 VLM 网关（`vllm_client.py`） |
 | `tests/` | 单元 / 集成测试 |
@@ -67,13 +64,9 @@ PAPER_LOGGING.md）；该旁路不进入模型输入。
 建立永久黑名单。凡是能由 VGGT 点云恢复出有效 3D 点的像素都可以成为
 可导航 instance；类别与任务匹配关系由 VLM 根据证据持续判断。
 
-在与 benchmark 的关系上，本系统承担双重角色（**参考实现**与
-**诊断仪器**）：基准分数与诊断证据的完整论述见文档开头的项目定位，
-对应指标定义见 [PAPER_OUTLINE.md](PAPER_OUTLINE.md) §3.3。
-
 ### 1.1 为什么用 harness 应对这类任务
 
-Many-Object Navigation（ManyON）/All-Object Navigation（AllON）任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的
+ManyON/AllON 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的
 中间地带，harness 是针对这一错位的架构选择：
 
 - **长时程 vs 上下文与成本**：一个 episode 长达数百步。端到端 VLM
@@ -85,10 +78,9 @@ Many-Object Navigation（ManyON）/All-Object Navigation（AllON）任务的要�
   要求可靠维护"找到过哪些、是否重复、哪里还没探索"——这正是 benchmark
   的核心考点之一。harness 把这些状态外化为显式数据结构：三层去重记忆
   保证实例身份与报告幂等，world-state 每步重建任务账本与最近动作，
-  notes 与分页动作历史让 VLM 自己维护长期工作记忆。全程 completion
-  模式、不依赖 server 端对话状态：记忆的正确性、持久性和可审计性由
-  确定性代码保证，VLM 只负责基于记忆做判断；相比之下，端到端 VLM 在
-  长上下文中自行记账既不可靠，也无法审计和复现。
+  agent_notes、分页动作历史与 decision_window 让 VLM 维护长期工作记忆
+  与意图连续性。全程 completion 模式、不依赖 server 端对话状态：记忆的
+  正确性、持久性和可审计性由确定性代码保证（设计权衡见 §14.1）。
 - **几何与数值必须精确**：尺度、路径代价、可达性、3m 去重半径都是
   连续数值，VLM 的数值估计不可靠。harness 预计算全部几何量以下发，
   VLM 不输出世界坐标、不估算尺度。
@@ -138,8 +130,9 @@ Many-Object Navigation（ManyON）/All-Object Navigation（AllON）任务的要�
    中途打断是确定性信号——新关键帧 caption 与目标短语的 BGE 相关度
    超阈值即打断当前路径立即决策，把"路过即发现"变成显式机制。
 7. **记忆外包的决策上下文**：world-state JSON（任务账本、frontier 表、
-   实例表有界摘要、最近 3 步动作）+ VLM 自维护 notes（≤500 字符）+
-   分页动作历史工具，全程 completion 模式、不依赖 server 端对话状态。
+   实例表有界摘要、最近 3 步动作）+ VLM 自维护 agent_notes（≤500 字符）+
+   分页动作历史工具 + 最近 N 轮原始决策窗口（decision_window），全程
+   completion 模式、不依赖 server 端对话状态。
 8. **诊断透明性**：决策事件、工具调用、候选审核、尺度锁定与实例池
    全程留痕（`decision_trace.jsonl` / `vlm_calls.jsonl` /
    `get_target_pool()`）。这使 agent 同时成为 benchmark 的诊断仪器：
@@ -150,7 +143,19 @@ Many-Object Navigation（ManyON）/All-Object Navigation（AllON）任务的要�
    （重复报告、提前终止、搜索覆盖不足等）也都在本系统的实测中被真实
    观测到，形成指标设计的存在性证明。
 
-## 3. 系统架构总览
+## 3. 快速上手
+
+- **测试**：`python -m pytest tests/ -q`（325+ 用例，全绿为准）。
+- **依赖**：`VGGT-SLAM/` 子模块（安装见 `scripts/setup_vggtslam.sh`）；
+  SAM 权重由 `NAV_SAM_CKPT` 指定（缺失时 SAM 链路自动禁用并回退）；
+  决策 / caption VLM 走 OpenAI 兼容 API，密钥与 endpoint 配置在 `.env`。
+- **运行**：本地单测不依赖 GPU 与网络（Embedder/Gateway 均可 mock）；
+  完整 episode 需要 mapping server（`scripts/run_mapping_server.sh`）+
+  benchmark 评测 harness（`_benchmark_eval/evaluate.sh`）；远端跑批见
+  `scripts/run_formal10_*.sh` 与 `scripts/remote/`。
+- **配置**：全部运行期旋钮为 `NAV_*` 环境变量，总表见 §12。
+
+## 4. 系统架构总览
 
 ```mermaid
 flowchart LR
@@ -158,15 +163,15 @@ flowchart LR
     RGB --> CAP["caption (API VLM) + BGE retrieval"]
     MAP --> P3D["pixel → VGGT 3D point"]
     SOM["SAM 全分割 (AMG)"] -- "编号 mask overlay" --> VLM
-    VLM -- "som_pick 选 mask" --> SOMR["SAM mask 精化<br/>质心 + mask 深度采样"]
+    VLM -- "pick_segment 选 mask" --> SOMR["SAM mask 精化<br/>质心 + mask 深度采样"]
     SOMR --> P3D
     CAP --> VLM["decision VLM (API)"]
     MAP --> TOP["RGB point-cloud bird's-eye map"]
-    MEM["InstanceMemory (三层去重)"] --> STATE["world-state JSON<br/>(含 nearby 3m 预筛)"]
+    MEM["instance_store (三层去重)"] --> STATE["world-state JSON<br/>(含 nearby 3m 预筛)"]
     STATE --> VLM
     TOP --> VLM
     VLM -- "tools: search/view/propose/commit..." --> MEM
-    VLM -- "tools: propose_candidates / som_pick" --> SOM
+    VLM -- "tools: propose_candidates / pick_segment" --> SOM
     VLM -- "REPORT_FOUND" --> HIGH["high-level action / TARGET_FOUND / START_ADJUST"]
     MEM -- "3m 内有已有实例 → duplicate_review<br/>证据图交 VLM 裁决(resolve_duplicate)" --> VLM
     HIGH --> EXEC["A* / follower / collision recovery"]
@@ -182,7 +187,7 @@ flowchart LR
 | 语义模型接口 | `mapping/pointing.py` | pointing 双后端（qwen JSON / molmo XML 标签，已停用，仅保留 point_pixels RPC 兼容）、patch 深度采样 |
 | SAM 后端 | `mapping/sam_backend.py` | 点提示精化 + AMG 全分割（SoM），server 端惰性加载 |
 | 尺度标定 | `mapping/scale_calibration.py` | 动作步长回归的尺度诊断信号（不播种导航尺度） |
-| 三层语义记忆 | `agents/memory.py` | 追加式 Observation、Canonical Instance、一次性 ReportClaim |
+| 三层语义记忆 | `agents/instance_store.py` | 追加式 Observation、Canonical Instance、一次性 ReportClaim |
 | 决策状态 | `agents/decision_state.py` | 将实例、frontier、任务进度和几何代价组织成 JSON |
 | 决策 harness | `decision/agent_loop.py` | 工具循环（默认最多 15 轮）、动作 schema、ID 校验与 trace |
 | 决策提示词 | `decision/prompts.py` | 系统契约、事件说明和 world-state prompt 组装 |
@@ -193,9 +198,43 @@ flowchart LR
 | 运维诊断 | `scripts/diagnostics/` | 重力、自由空间和点云的只读检查脚本 |
 | 远端工具 | `scripts/remote/` | SSH 助手（`remote_ssh.py`）、跑批脚本与远端离线验证脚本 |
 
-## 4. 建图与几何
+## 5. 一次 episode 的生命周期
 
-### 4.1 关键帧与子图
+把静态各层串成动态故事。粗体字是**决策事件**（VLM 被叫来的时刻），
+其余步骤全部由代码确定性执行：
+
+1. **初始化**：instruction 下发（text 或 image-goal），`reset()` 清空
+   decision_window、action_log、实例与账本；后端预检（§11.1）通过后
+   进入 episode。冷启动时无图无实例，world-state 明确提示先
+   `SCAN` / `GOTO_FRONTIER`。
+2. **探索建图**（code）：选定 frontier 后执行器沿预计算路径走到底。
+   移动中 RGB 持续流入：VGGT-SLAM 按关键帧策略取帧建图、caption worker
+   异步生成描述、BGE 索引更新。唯一的中途打断是 caption 命中中断
+   （§9.3 动作语义）——新帧 caption 与目标短语相关度超阈值时立即停下
+   交还决策。
+3. **world_state_updated**（VLM）：路径走完/走丢/碰撞恢复后触发。
+   VLM 收到最新 world-state（含 `new_keyframes` 摘要）、BEV 图与
+   decision window，开始按需调查：`search_frames` 检索 caption →
+   `view_frame` 亲眼核实 → 走近后 `propose_candidates`（SAM 全分割）→
+   `pick_segment` 选 mask → `commit_candidates` 三值审核。审核产出先
+   进候选池，只有 ACCEPT 且过几何验证才成为可导航实例；3m 内有邻居时
+   挂起 `duplicate_review`，由 `resolve_duplicate` 裁决（§8.3）。
+4. **GOTO_INSTANCE 执行**（code）：选定实例后执行器再次执行到底，
+   途中 VLM 不被咨询。
+5. **arrival**（VLM）：到达实例点附近触发，附当前 RGB。VLM 决定
+   `REPORT_FOUND`（harness 两层校验：active 实例 + 距离 ≤
+   `NAV_REPORT_NEAR_DIST_M`）→ 创建一次性 ReportClaim、任务账本
+   found+1；或离开换目标、`START_ADJUST` 逼近微调。
+6. **终止**：`FINISH`（many/all 数量不足时被拒绝并降级）或步数预算
+   耗尽；episode 产出全部 trace 与 summary（§11.3）。
+
+`adjustment` 微调是贯穿的旁路：任何决策点 VLM 都可 `START_ADJUST`
+进入有界接管（每轮一个原子动作 + 新 RGB，工具禁用），用于修正位姿、
+逼近可见目标或探查近处盲区，`END_ADJUST` 后回到全局决策。
+
+## 6. 建图与几何
+
+### 6.1 关键帧与子图
 
 建图不把每个观测都作为关键帧。默认在相对上一关键帧的平均光流超过 40
 像素时取帧；即使光流不足，也最多间隔 3 个观测强制刷新。每个子图包含
@@ -204,7 +243,7 @@ flowchart LR
 工具返回前会等待 caption worker 消化完已入队关键帧（`caption_pending`，
 有界等待，超时继续），避免异步 caption 漏掉刚看到的场景。
 
-### 4.2 射线法自由空间与双层覆盖
+### 6.2 射线法自由空间与双层覆盖
 
 地图保留两个职责不同的 bool 层：
 
@@ -224,7 +263,7 @@ flowchart LR
 聚类、A* 可达性过滤和冷却。每个候选带 `reason`、两类 gain、路径代价和
 utility。
 
-### 4.3 在线度量尺度
+### 6.3 在线度量尺度
 
 所有米制消费者使用同一版本化 `MetricTransformSnapshot`。尺度只来自多帧
 地面到已知相机高度（1.5m）的尺规；动作回归（`ScaleCalibrator`，利用
@@ -237,10 +276,10 @@ target pool 使用同一尺度。revision 切换会废弃 follower、临时障�
 frontier 路径，并从同一服务端 frame snapshot 重规划；目标导航不得混用
 独立 pose RPC 与点云 RPC。
 
-## 5. 语义感知链路（全部由 VLM 按需驱动）
+## 7. 语义感知链路（全部由 VLM 按需驱动）
 
 系统采用候选事务而非自动 ground 入库。首选工具链是
-`propose_candidates → som_pick → commit_candidates`：SAM 全分割选中的
+`propose_candidates → pick_segment → commit_candidates`：SAM 全分割选中的
 mask（质心为像素）先作为不可导航 proposal，Decision VLM 批量给出三值
 审核，只有 ACCEPT 才批量解析为 active instance。扫描和 caption 刷新绝不
 直接入库。
@@ -258,10 +297,10 @@ mask（质心为像素）先作为不可导航 proposal，Decision VLM 批量给
 4. **propose_candidates(frame_id, query)**：对整帧做 SAM automatic mask
    generation（`som_segment` RPC），返回编号 mask 表（0-1000 归一化
    centroid/bbox/area_frac）+ 编号 overlay 图，不注册任何实例。已在
-   `_rejected_spots` 中的质心会被硬过滤（全被滤时返回
+   `_rejected_spot_log` 中的质心会被硬过滤（全被滤时返回
    `all_spots_rejected`，提示 VLM 走近再试）。要求 VLM 在**近处、当前
    帧**调用——远距小目标面积占比低于 0.2% 门槛不会被分割出来；
-5. **som_pick(frame_id, mask_ids, query)**：把选中 mask 注册为不可导航
+5. **pick_segment(frame_id, mask_ids, query)**：把选中 mask 注册为不可导航
    proposal（质心为候选像素、mask 参与深度采样），随后走批量
    `commit_candidates` 三值审核。只有 `ACCEPT` 允许实例化；后两者记录为
    `semantic_rejections`，绝不入实例记忆；
@@ -278,7 +317,7 @@ mask（质心为像素）先作为不可导航 proposal，Decision VLM 批量给
    兼容接口（同 5 的三值审核语义），新代码优先使用批量
    `commit_candidates`。
 
-### 5.1 SAM mask 精化与 SoM 全分割
+### 7.1 SAM mask 精化与 SoM 全分割
 
 `mapping/sam_backend.py`（server 端，惰性加载 `segment_anything`，
 `NAV_SAM_CKPT`/`NAV_SAM_MODEL_TYPE`/`NAV_SAM_DEVICE`/`NAV_SAM_ENABLED`
@@ -295,16 +334,50 @@ mask（质心为像素）先作为不可导航 proposal，Decision VLM 批量给
   `pred_iou_thresh=0.86`、`stability_score_thresh=0.92`、
   `min_mask_region_area=100`），过滤面积 <0.2%（≈614px @640×480）的
   碎片与 >55% 的背景区域，上限 `max_masks=24`；渲染编号 overlay 返回
-  给决策 VLM，VLM 用 `som_pick` 把选中 mask 注册为 proposal（质心为
+  给决策 VLM，VLM 用 `pick_segment` 把选中 mask 注册为 proposal（质心为
   候选像素、mask 参与深度采样），后续走证据面板 + `commit_candidates`
   流程。mask 在服务端按帧缓存（LRU 8 帧）。由此把"生成坐标"降级为
   "选择题"：决策 VLM 不再依赖 pointing 模型的点指精度，只在近处帧上做
   mask 选择。代价是**必须走近目标再 propose**——远距小目标过不了 AMG
   的面积/网格门槛。
 
-## 6. 记忆系统：三层去重
+## 8. 记忆系统
 
-### 6.1 Observation：采集幂等层
+体系为**三层记忆 + 一个视图**（完整命名规范见
+[MEMORY_CONVENTIONS.md](MEMORY_CONVENTIONS.md)）：
+
+```
+                 ┌─────────────────────────────┐
+                 │  world_state（确定性视图）    │  每次决策由代码对三层记忆
+                 │  + BEV 图 + 预计算几何       │  有界渲染，非独立记忆
+                 └──────────────┬──────────────┘
+        ┌───────────────────────┼───────────────────────┐
+  空间记忆（code）         语义记忆（code）          工作记忆（vlm 可写）
+  点云 / 占据栅格          caption_store           agent_notes
+  关键帧库                 instance_store          action_log
+  尺度标定                 （Obs/Instance/Claim）   decision_window
+```
+
+- **空间记忆**：VGGT-SLAM 在线维护的几何状态（§6）。原始点云/栅格
+  永不进 JSON，经 BEV 图、行内预计算 `path_cost_m`/`dist_m` 间接暴露。
+- **语义记忆**：`caption_store`（可检索语料库，§7）+
+  `instance_store`（实体集合：身份解析、去重/合并/报告事务，§8.1–8.4）。
+  实例文本经 `update_instance` 由 VLM 修订，身份与几何由代码管。
+- **工作记忆**：唯一 VLM 可写的层（§8.5）。写入者规则一句话：除
+  `agent_notes` 外全部由代码写入；`decision_window` 的追加由代码执行、
+  内容来自 VLM 原始输出。
+- **world_state 是视图不是记忆**：每步由代码对三层记忆有界渲染、整体
+  重建——进多少由摘要策略决定（实例 top-K、动作最近 3 条）。无论对话
+  历史如何压缩，任务账本与几何永远正确，这是 harness 记忆正确性的根基。
+
+命名约定（细节见规范文档）：存储组件用四个后缀——`*_store`（集合类）、
+`*_log`（append-only）、`*_window`（有界滚动原文）、`*_queue`（有状态机）；
+VLM 可写组件用 `agent_` 前缀；工具动词分 `view_*/search_*/get_*/update_*`
+与实例化管线阶段动词 `propose→review→instantiate→resolve→commit`。
+审核队列、被拒像素记录、frontier 状态等是**工具内部状态**，不属于记忆
+体系，只经 world_state 摘要暴露结论。
+
+### 8.1 Observation：采集幂等层
 
 每次有效 2D→3D 结果产生一条追加式 Observation，保存 `observation_id`、
 3D 点、frame/candidate、像素、bbox、置信度和原始文本。`candidate_id` 只是
@@ -313,7 +386,7 @@ mapping 证据句柄，不被当作跨视角物体身份。同一 candidate 的�
 Observation 的身份与原始证据不变；SLAM 回环后只允许通过 candidate 句柄
 刷新其 3D 点。
 
-### 6.2 Canonical Instance：物理实体层
+### 8.2 Canonical Instance：物理实体层
 
 `InstanceNode` 是供导航和决策引用的稳定实体，包含 `id`、`text`、
 `observation_ids`、证据集合、当前导航点和 `report_claim_id`。实例导航点
@@ -321,7 +394,7 @@ Observation 的身份与原始证据不变；SLAM 回环后只允许通过 candi
 回环后仍可由 candidate 重投影刷新。关联结果采用三态生命周期：
 `proposal → active canonical instance → reported instance`。
 
-### 6.3 实例化时去重（而非报告时）
+### 8.3 实例化时去重（而非报告时）
 
 同帧重复实例化先按 `candidate_id`、像素距离或 bbox IoU 确定性幂等。新
 Observation 的 3D 点在 `NAV_INSTANCE_DUPLICATE_RADIUS_M`（默认 3m）内
@@ -334,7 +407,7 @@ text)` 裁决：`DUPLICATE` 把观测并入既有实例（`attach_observation`�
 字段提前暴露 3m 内的空间冲突。旧的人工 `merge_instances/undo_merge`
 已删除，避免错误合并后破坏证据来源和报告状态。
 
-### 6.4 ReportClaim：报告幂等层
+### 8.4 ReportClaim：报告幂等层
 
 一次合法 `REPORT_FOUND` 创建一条原子 ReportClaim：`claim_id`、
 `instance_id`、报告 step 和当时已有的 `observation_ids`。Claim 不维护
@@ -343,17 +416,53 @@ instance 最多产生一个 Claim；报告后该实例从可导航集合移入
 `reported_instances`。`REPORT_FOUND.target_id` 必须等于当前 active
 canonical instance，不能用另一个近邻实例或空 ID 代替。
 
-## 7. 决策层
+### 8.5 工作记忆：agent_notes、action_log 与 decision_window
 
-### 7.1 决策 VLM 的输入
+工作记忆是 VLM 唯一可写的记忆层，三个组件分工明确：
 
-每次事件决策包含三类输入：
+- **agent_notes**（VLM 覆写，≤500 字符，经 `update_notes` 维护）：
+  跨多步成立的长期结论——当前计划、已排除的区域与假设。逐步意图
+  不写在这里，交给 decision_window。
+- **action_log**（代码写入，append-only）：客观动作流水
+  `{step, action, target_id, outcome}`；最近 3 条进 world_state 的
+  `recent_actions`，更早的经 `get_action_history` 分页查询。记录
+  "发生了什么"，不含模型的推理。
+- **decision_window**（代码追加、内容来自 VLM 原始输出，
+  `NAV_DECISION_WINDOW` 默认 5，0 关闭）：最近 N 轮决策的动态输入与
+  输出——`{step, event, tool_calls, tool_results（每条截
+  NAV_TOOL_RESULT_MAX_CHARS）, image_labels, reply 原文, outcome 回填}`。
+  明确排除静态 system prompt（只发一次）、world_state 旧副本、图片本体
+  （以 `[image attached: ...]` 占位）、窗口节自身（防递归）。工具结果
+  跨决策只保留紧凑语义摘要而非原文（理由见 §14.3）。它补齐的是意图
+  连续性：模型能看到"我查了什么、查到什么、决定做什么、结果如何"，
+  例如"正朝着某实例导航"这种瞬时意图不再依赖 notes 转述。窗口作为
+  独立 prompt 节渲染在 world_state 之后，不进 world_state JSON；
+  episode reset 时清空。
+
+## 9. 决策层
+
+### 9.1 决策 VLM 的输入
+
+每次 API 调用为独立 completion（无服务端对话状态），消息分两个角色：
+
+- **system 角色**：静态决策契约（任务说明、工具签名、动作空间、输出
+  格式），每次决策构建一次，不随 user 文本重发——user 每轮只装动态
+  内容，也为 prompt caching 留好静态前缀；
+- **user 角色**：动态内容，顺序为 world-state JSON → decision window
+  节（先客观现状、后主观历史）→ Event 与事件引导（"现在发生了什么、
+  该做什么"收在末尾，紧贴生成位置）→ 图片。一次决策内的工具轮不再
+  字符串累加：loop 内维护 `{最新 world_state, window, event+引导,
+  工具 transcript}` 四部分，每轮重新拼装（§14.2）——world_state 永远
+  只留最新一份（写工具刷新生效于下一轮渲染），工具往来与校验拒绝作为
+  transcript 一节滚动保留，最新结果始终落在近因位置。
+
+动态内容包含四类：
 
 - **world-state JSON**：任务账本（goal/mode/found/expected）、
   step/max_steps/steps_remaining、frontier 表（路径代价、几何/语义 gain、
   branch、失败数和新颖度）及 `frontier_branches` 局部路径分支摘要、
-  导航状态（当前位姿、active target）、`notes`（VLM 自己的持久工作记忆，
-  上限 500 字符，经 set_notes 维护）、`recent_actions`（最近 3 个高层
+  导航状态（当前位姿、active target）、`agent_notes`（VLM 自己的持久
+  工作记忆，上限 500 字符，经 update_notes 维护）、`recent_actions`（最近 3 个高层
   动作及 ok/collision/arrived 结果，更早的经 get_action_history 分页查询）、
   `new_keyframes`（仅当存在：自上次决策以来收集的 `{frame_id, caption
   摘要}`，图像不自动附）、`relevant_frames`（每次决策按完整目标短语自动
@@ -371,26 +480,34 @@ canonical instance，不能用另一个近邻实例或空 ID 代替。
   `fN` = 可选 frontier，绿色圆圈 `tN` = 实例，橙色星形 = active target。
   点、颜色、位姿和 frontier 来自 mapping server 同一次锁内 snapshot；
 - **事件图像**：到达时的当前 RGB、SCAN 后的四向环视图、或工具请求的
-  图像。
+  图像；
+- **decision window 节**：最近 N 轮（`NAV_DECISION_WINDOW` 默认 5）
+  决策的动态输入与输出（工具调用与结果、被接受的 reply 原文、执行
+  结果回填），渲染在 world-state 之后的独立 prompt 节，详见 §8.5。
 
 所有距离与路径代价由确定性几何模块预计算，VLM 不输出世界坐标（实例化用
 的像素坐标除外），也不估算地图尺度。
 
-### 7.2 工具循环
+### 9.2 工具循环
 
 VLM 在最终动作前每轮可调用一个工具，每次决策硬上限为 15 轮；
 `NAV_DECIDER_MAX_TOOL_ROUNDS` 可将上限调低但不能超过 15。初始 prompt
 明确告知实际上限，每次工具结果也携带 `已用/上限/剩余`。第 15 次工具
 返回后切换到独立的 final-action-only prompt；后续 `tool_call` 不执行也
 不进入 action 校验。若两次最终动作请求仍无效，harness 直接选择合法的
-实例、frontier 或扫描动作，避免以空 action 返回上层 fallback：
+实例、frontier 或扫描动作，避免以空 action 返回上层 fallback。
+
+工具结果统一截断为 `NAV_TOOL_RESULT_MAX_CHARS`（默认 2000 字符），
+prompt transcript 与 decision_window 条目共用同一口径。API 调用失败
+（超时/5xx/解析失败）时在决策级重试 `NAV_DECIDER_API_RETRIES` 次
+（默认 1），全部失败才回退确定性规则。
 
 | 工具 | 返回与副作用 |
 |---|---|
 | `search_frames(query, top_k=5)` | `[{frame_id, score, caption}]`，只读 |
 | `view_frame(frame_id)` | 下一轮附加该关键帧原始 RGB，只读 |
-| `propose_candidates(frame_id, query)` | SAM 全分割整帧 → 编号 mask 表 + overlay 图，创建候选池（质心在 `_rejected_spots` 的硬过滤掉），只读 |
-| `som_pick(frame_id, mask_ids, query)` | 选中 mask 注册为 proposal（质心为像素、mask 用于深度采样），随后走 commit 流程，写 |
+| `propose_candidates(frame_id, query)` | SAM 全分割整帧 → 编号 mask 表 + overlay 图，创建候选池（质心在 `_rejected_spot_log` 的硬过滤掉），只读 |
+| `pick_segment(frame_id, mask_ids, query)` | 选中 mask 注册为 proposal（质心为像素、mask 用于深度采样），随后走 commit 流程，写 |
 | `commit_candidates(reviews, label)` | 批量 `ACCEPT/REJECT/UNCERTAIN`；只解析 ACCEPT 写入 active instance（3m 内有邻居的挂起 duplicate_review），写 |
 | `resolve_duplicate(observation_id, decision, duplicate_of, text)` | 去重复核裁决：DUPLICATE 并入既有实例 / NEW 新建，写 |
 | `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录三值审核（新代码优先走批量 commit），写 |
@@ -400,16 +517,17 @@ VLM 在最终动作前每轮可调用一个工具，每次决策硬上限为 15 
 | `view_instance(instance_id)` | 下一轮附加该实例证据图，只读 |
 | `update_instance(instance_id, text)` | 只覆盖 text，写 |
 | `get_agent_status()` | 建图/caption/实例/预算快照，只读 |
-| `set_notes(text)` | 覆盖 notes 工作记忆（≤500 字符），写 |
+| `update_notes(text)` | 覆盖 agent_notes 工作记忆（≤500 字符），写 |
 | `get_action_history(before_step, limit)` | 分页查询更早的动作流水，只读 |
 
 所有工具结果统一为 `{ok, tool, state_changed, result}`；失败统一为
 `{ok:false, error:{code,message}}`。图像工具返回可追踪的 `image_ref`，
 实际附件使用 `tool_frame_<id>_rgb` 或 `tool_instance_<id>_evidence` 标签。
 工具不能伪造或直接改写 3D 坐标、路径代价和 `reported` 状态。写工具成功
-执行后，harness 重新生成 world-state 并随工具结果下发。
+执行后，harness 重新生成 world-state，在下一轮重渲染中作为唯一一份
+state 下发。
 
-### 7.3 动作空间与事件
+### 9.3 动作空间与事件
 
 VLM 必须输出一个 JSON 对象：
 
@@ -472,7 +590,7 @@ VLM 必须输出一个 JSON 对象：
 程序只做结构性约束：动作属于当前事件、目标 ID 存在、导航实例尚未报告；
 报告 ID 还必须等于当前 active canonical instance。
 
-## 8. 执行层
+## 10. 执行层
 
 `GOTO_INSTANCE` 解析为实例 3D 点，经占据栅格和 A* 生成路径，由
 `PathFollower` 输出离散运动。回环优化后，各 Observation 通过其
@@ -506,9 +624,9 @@ inspect_sector 至少产生一个 mapping keyframe；否则 harness 继续一个
 时立即清除 active target，避免物理控制在探索而 world-state 长期保留
 旧目标。
 
-## 9. 可靠性与可复盘
+## 11. 可靠性、留痕与评测接口
 
-### 9.1 后端预检
+### 11.1 后端预检
 
 semantic mapping server 启动时对 pointing endpoint 做一次 `/v1/models`
 探测（`NAV_POINTING_HEALTH_TIMEOUT`，默认 10s）；失败只打 WARNING 不再
@@ -523,7 +641,7 @@ SAM 不可用时 `propose_candidates` 返回稳定错误码 `SAM_UNAVAILABLE`，
 降级成空 mask 表——该错误只表示基础设施不可用，不构成"图中没有目标"的
 语义证据。
 
-### 9.2 确定性降级
+### 11.2 确定性降级
 
 启动后的单次非法结构仍可确定性回退：优先最近的未报告实例，否则最高
 utility 的可达 frontier，再否则基础探索。已配置的 Decision/Caption 后端
@@ -531,7 +649,7 @@ utility 的可达 frontier，再否则基础探索。已配置的 Decision/Capti
 长期确定性降级。frontier utility 由加权几何/语义信息增益、路径代价和执行
 失败次数构成，不含目标类别 belief。
 
-### 9.3 诊断输出
+### 11.3 诊断输出
 
 所有输出统一放在 `debug_output/<run-id>/`（`NAV_DEBUG_ROOT` +
 `NAV_RUN_ID` 隔离），按职责分为 `agent/`、`mapping/`、`benchmark/` 和
@@ -553,29 +671,7 @@ trace 开关时内联。
 子目录：prompt.txt + images/ + output.json + index.md）。
 `scripts/diagnostics/` 下可重放 occupancy/frontier 构建做只读检查。
 
-## 10. 已知边界
-
-- 感知主链路为"走近 → SAM 全分割 → som_pick 选 mask"，pointing 模型
-  （Molmo/Qwen）已整体移出 agent 工具链（RPC 保留兼容）。代价是 SAM AMG
-  有两道硬门槛：面积 <0.2% 的 mask 被过滤（远距小目标分割不出）、
-  `points_per_side=32` 的网格采样对极小目标覆盖不足，因此**必须走近目标
-  再 propose**，VLM 若在远帧 propose 会拿到空表或错过目标；
-- `search_frames` 的 caption 检索在部分场景只召回个别帧（实测 8 次检索
-  仅返回同一 2 帧），会锁死旧帧导致 propose 无法推进——必要时需扩大
-  top_k 或加"新帧强制入表"机制；
-- 跨视角实例关联依赖标注照片的专用 VLM 判定；遮挡、视角差过大或证据图
-  过期时按 `UNCERTAIN→proposal` 保守处理，既不误合并，也不创建可导航、
-  可报告的假实例，等待后续视角消歧；
-- `REPORT_FOUND` 的 harness 校验是纯距离判定（`dist_m ≤
-  NAV_REPORT_NEAR_DIST_M`，默认 1.0m），评估器 TP 按测地距离到目标
-  viewpoint 计分（默认 0.25m）；主要风险是实例 3D 点漂移导致"走到附近"
-  判定失败；
-- 相机高度尺度锁定后仍观察到中途重锁的 2 倍跳变案例（候选估计双峰），
-  待加固；
-- 完整效果需要在真实模型、VGGT-SLAM 服务和 benchmark episode 上做闭环
-  评测。
-
-## 11. 评测采集接口 `get_target_pool()`（只读旁路）
+### 11.4 评测采集接口 `get_target_pool()`（只读旁路）
 
 benchmark 评测器在每步 `act()` 之后调用 `NavAgent.get_target_pool()`，
 统计"已实例化但未上报的目标"（U_t）与发现池的搜索质量（SQ）。该接口是纯只读旁路：
@@ -585,7 +681,7 @@ benchmark 评测器在每步 `act()` 之后调用 `NavAgent.get_target_pool()`�
 
 **契约**：`list[dict]`，每项 `{"position": [x, y, z], "reported": bool,
 "label": str}`。包含当前 episode 至今实例化过的所有 canonical
-instance（`self.memory.nodes`，含已上报的，`reported` 标志区分）；
+instance（`self.instance_store.nodes`，含已上报的，`reported` 标志区分）；
 `position` 为 habitat 世界系坐标（米，y-up）；`label` 为
 `InstanceNode.text` 截断 100 字符。数据不可用（锚点或尺度未建立）时
 返回 `[]`，绝不抛异常。
@@ -618,4 +714,126 @@ instance（`self.memory.nodes`，含已上报的，`reported` 标志区分）；
 重规划时刷新）；尺度来自多帧地面—相机高度尺规（地面峰误判会污染）；
 首帧 SLAM 位姿对应 step-0 观测、`pose_to_yaw_2d` 的相机 +Z 为朝向等假设
 若被服务端改动会破坏对齐；若发现系统性镜像/固定角度偏差，首要检查
-compass 符号约定。该接口只服务评测统计，不进入导航主路径。
+锚点与符号约定。
+
+## 12. 配置项总表（`NAV_*` 环境变量）
+
+| 变量 | 默认 | 作用 | 层 |
+|---|---|---|---|
+| `NAV_VLM_MODEL` / `NAV_VLM_TIMEOUT` / `NAV_VLM_ENABLED` | — / 45s / 自动 | 决策 VLM endpoint 与开关 | 决策 |
+| `NAV_REQUIRE_DECISION_PREFLIGHT` | 1 | 决策后端最小生成预检 | 决策 |
+| `NAV_DECIDER_MAX_TOOL_ROUNDS` | 15 | 每次决策工具轮硬上限（只能调低） | 决策 |
+| `NAV_DECIDER_API_RETRIES` | 1 | 决策级 API 失败重试次数 | 决策 |
+| `NAV_TOOL_RESULT_MAX_CHARS` | 2000 | 工具结果截断统一口径（transcript 与 window 共用） | 决策 |
+| `NAV_DECISION_WINDOW` | 5 | decision_window 滚动轮数（0 关闭） | 记忆 |
+| `NAV_STATE_MAX_INSTANCES` | 30 | world-state 实例表 top-K 上限 | 记忆 |
+| `NAV_INSTANCE_DUPLICATE_RADIUS_M` | 3.0 | 实例化去重 3m 预筛半径 | 记忆 |
+| `NAV_REPORT_NEAR_DIST_M` | 1.0 | REPORT_FOUND 距离校验阈值 | 决策 |
+| `NAV_RELEVANT_FRAME_TOP_K` | 5 | 每决策自动检索的相关 caption 帧数 | 感知 |
+| `NAV_CAPTION_API_MODEL` / `NAV_CAPTION_WORKERS` | — / 4 | caption 模型与并发 | 感知 |
+| `NAV_REQUIRE_CAPTION_PREFLIGHT` | 1 | caption 后端最小生成预检 | 感知 |
+| `NAV_CAPTION_HIT_INTERVAL` / `NAV_CAPTION_HIT_MIN_SCORE` | 5 / 0.6 | caption 命中中断的检查间隔与相关度阈值 | 执行 |
+| `NAV_SAM_CKPT` / `NAV_SAM_MODEL_TYPE` / `NAV_SAM_DEVICE` / `NAV_SAM_ENABLED` | — | SAM 权重、类型、设备与总开关 | 感知 |
+| `NAV_POINTING_HEALTH_TIMEOUT` | 10s | pointing endpoint 健康探测（已停用主链路） | 感知 |
+| `NAV_DECISION_MAP_MAX_POINTS` | 2000000 | BEV 渲染点云上限 | 决策 |
+| `NAV_VLM_MAX_IMAGES` | — | 单轮决策图像预算 | 决策 |
+| `NAV_ADJUST_MAX_STEPS` | 10 | 单次 adjustment 总步数上限 | 执行 |
+| `NAV_ADJUST_MAX_FORWARD_STEPS` | 8 | MOVE_FORWARD 单指令最大步数（0.25m/步） | 执行 |
+| `NAV_ADJUST_MAX_SESSIONS_PER_TARGET` / `NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET` / `NAV_ADJUST_MAX_TURNS_PER_TARGET` | 2 / 8 / 4 | 同一 target 的 adjust 频次与总量限制 | 执行 |
+| `NAV_NAV_ESCAPE_TURNS` / `NAV_NAV_BLOCK_RADIUS_M` / `NAV_NAV_BLOCK_TTL_STEPS` / `NAV_NAV_COLLISION_LIMIT` | 1 / 0.35 / 80 / 3 | 碰撞恢复：脱困转向、临时障碍半径与 TTL、unreachable 判定 | 执行 |
+| `MAPPING_STUCK_CONFIRM_STEPS` | 2 | 前进受阻的双帧静止确认 | 执行 |
+| `NAV_DEBUG_ROOT` / `NAV_RUN_ID` | — | 诊断输出目录隔离 | 留痕 |
+| `NAV_VLM_TRACE_INLINE_IMAGES` | 0 | trace 中内联图像 base64 | 留痕 |
+| `NAV_ORACLE_GEOMETRY` | — | 消融开关（oracle 几何），与 get_target_pool 无关 | 评测 |
+
+## 13. 已知边界
+
+- 感知主链路为"走近 → SAM 全分割 → pick_segment 选 mask"，pointing 模型
+  （Molmo/Qwen）已整体移出 agent 工具链（RPC 保留兼容）。代价是 SAM AMG
+  有两道硬门槛：面积 <0.2% 的 mask 被过滤（远距小目标分割不出）、
+  `points_per_side=32` 的网格采样对极小目标覆盖不足，因此**必须走近目标
+  再 propose**，VLM 若在远帧 propose 会拿到空表或错过目标；
+- `search_frames` 的 caption 检索在部分场景只召回个别帧（实测 8 次检索
+  仅返回同一 2 帧），会锁死旧帧导致 propose 无法推进——必要时需扩大
+  top_k 或加"新帧强制入表"机制；
+- 跨视角实例关联依赖标注照片的专用 VLM 判定；遮挡、视角差过大或证据图
+  过期时按 `UNCERTAIN→proposal` 保守处理，既不误合并，也不创建可导航、
+  可报告的假实例，等待后续视角消歧；
+- `REPORT_FOUND` 的 harness 校验是纯距离判定（`dist_m ≤
+  NAV_REPORT_NEAR_DIST_M`，默认 1.0m），评估器 TP 按测地距离到目标
+  viewpoint 计分（默认 0.25m）；主要风险是实例 3D 点漂移导致"走到附近"
+  判定失败；
+- 相机高度尺度锁定后仍观察到中途重锁的 2 倍跳变案例（候选估计双峰），
+  待加固；
+- 完整效果需要在真实模型、VGGT-SLAM 服务和 benchmark episode 上做闭环
+  评测。
+
+## 14. 设计决策记录
+
+关键权衡的"问题 → 选择 → 理由"，按主题归档；与代码现状同步更新。
+
+### 14.1 记忆：completion 模式 + 原始滑动窗口，而非 response 模式
+
+- **问题**：对话历史自己维护有压缩损失，是否改用服务端 response 模式
+  让 VLM 记忆更连续？
+- **选择**：坚持 completion 模式，新增 decision_window（最近 5 轮动态
+  输入+输出）补齐意图连续性。
+- **理由**：response 模式并不消除上下文上限，撑满后截断主动权不在
+  自己手里，而任务账本、去重状态这些"绝不能丢"的信息正是 harness
+  要自己管的；服务端历史每轮全量重计费，成本随步数平方增长；服务端
+  状态是黑盒且有保留期，破坏可审计与复现；绑定单一供应商，换模型
+  链即断。window 以约 1k token 的代价获得"我上一轮想干什么"的连续性，
+  长期记忆仍由 world_state 每步全量重建兜底。
+
+### 14.2 prompt 结构：契约走 system 角色 + user 每轮重渲染
+
+- **问题**：契约曾放在 user 消息里每轮全文重发；工具轮间 user 文本
+  只增不减，一次重度决策可能带 3–4 份不同版本的 world_state。
+- **选择**：静态契约挪 system 角色；user 由 `{最新 world_state,
+  window, event+引导, 工具 transcript}` 四部分每轮重渲染。
+- **理由**：user 每轮只装动态内容，成本有界且为 prompt caching 留好
+  静态前缀；world_state 永远只有最新一份，模型不再被互相矛盾的过期
+  state 干扰；最新工具结果始终落在近因位置。Event 与事件引导收在
+  末尾，紧贴生成位置。
+
+### 14.3 工具结果：跨决策只留结论摘要，不留原文
+
+- **问题**：decision_window 该保存工具结果的原文吗？
+- **选择**：不留。每条工具记录压缩为一行语义摘要（做了什么、结论
+  是什么）。
+- **理由**：留原文必须同时满足"不被 world_state 吸收"且"不可重查"
+  才有意义——现有工具结果要么进实例表/proposal 摘要（被吸收，原文
+  必过期且成为矛盾源），要么 caption/实例全文随时可重查（记忆靠
+  重查是 harness 哲学）。留下不过时的因果链：参数+reason 表意图、
+  工具名表动作、摘要表结论、outcome 表结果。
+
+### 14.4 去重时机：实例化时，而非报告时
+
+- **问题**：同一物理物体被重复实例化，什么时候去重？
+- **选择**：实例化时按 3m 空间预筛挂起 `duplicate_review`，证据图交
+  VLM 裁决；报告层再用 ReportClaim 保证幂等。
+- **理由**：many/all 模式下重复实例一旦可导航，重复报告直接变成
+  FP，报告时再去重为时已晚；实例化时挂起不可导航，把"是不是同一
+  个"的语义判断交给 VLM 在证据图上做，几何预筛（3m）与语义裁决
+  各司其职。
+
+### 14.5 目标定位：SoM 选择题，而非 pointing 坐标生成
+
+- **问题**：pointing 模型/VLM 直接输出像素坐标，落点稳定偏移（地板、
+  墙、天花板），接受率曾低至 17.7%。
+- **选择**：SAM AMG 全分割整帧 → 编号 mask overlay，VLM 只做 mask
+  选择（pick_segment）+ 三值审核；深度在 mask 区域内取中位数。
+- **理由**：把"生成坐标"降级为"选择题"，绕开像素坐标输出不可靠的
+  瓶颈；mask 区域采样避免 patch 边缘背景污染。代价是必须走近目标
+  再 propose（远距小目标过不了 AMG 面积/网格门槛），这是已接受的
+  边界（§13）。
+
+### 14.6 执行粒度：执行到底 + caption 命中中断
+
+- **问题**：逐步咨询 VLM 决策密度过高（上下文与成本爆炸），但全程
+  不咨询又会"路过目标而不自知"。
+- **选择**：GOTO 选定后执行器静默走到底，事件点才交还；唯一中途
+  打断是确定性信号——新关键帧 caption 与目标短语 BGE 相关度超阈值。
+- **理由**：决策密度降到每 300 步 12–20 次，VLM 注意力只花在决策
+  点上；"路过即发现"由 caption 检索这一确定性机制承接，不需要 VLM
+  轮询。

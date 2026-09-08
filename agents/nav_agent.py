@@ -2,7 +2,7 @@
 
 流程（多目标状态机）：
 1. EXPLORE：持续建图；决策 VLM 自主调用 propose_candidates（SAM 全分割）
-   挑选编号 mask → som_pick 注册候选 → commit_candidates 裁决，经 3D
+   挑选编号 mask → pick_segment 注册候选 → commit_candidates 裁决，经 3D
    几何验证后写入实例记忆。
 2. 拿到目标点后用点云构建 2D 占据栅格（agents/navigator.py），A* 规划，
    进入 NAV 模式沿路径输出离散动作。位姿锚定最新关键帧 + 航位推算，
@@ -23,6 +23,8 @@ import os
 import re
 import time
 
+from collections import deque
+
 import numpy as np
 
 from benchmark_api import Action
@@ -30,7 +32,7 @@ from agents import navigator as nav
 from agents import planner
 from agents import skeleton as skel
 from agents.mapping_agent import MappingAgent
-from agents.memory import InstanceMemory
+from agents.instance_store import InstanceMemory
 from decision import (DecisionLoop, DecisionResult, DecisionTraceLogger,
                       VLMDecisionClient)
 from runtime_paths import env_debug_path
@@ -115,11 +117,11 @@ class NavAgent(MappingAgent):
                            "commit_candidates": self._tool_commit_candidates,
                            "review_crosshair": self._tool_review_crosshair,
                            "instantiate_points": self._tool_instantiate_points,
-                           "som_pick": self._tool_som_pick,
+                           "pick_segment": self._tool_pick_segment,
                            "resolve_duplicate": self._tool_resolve_duplicate,
                            "merge_instances": self._tool_merge_instances,
                            "get_agent_status": self._tool_get_agent_status,
-                           "set_notes": self._tool_set_notes,
+                           "update_notes": self._tool_update_notes,
                            "get_action_history": self._tool_get_action_history},
                     logger=DecisionTraceLogger(env_debug_path(
                         "NAV_DECIDER_LOG",
@@ -148,7 +150,12 @@ class NavAgent(MappingAgent):
         self.grid = None
         self.align_R = None
         # harness：VLM 工作记忆、动作流水与新关键帧通知水位
-        self._notes = ""
+        self._agent_notes = ""
+        # 最近 N 轮决策原始窗口（0=关闭），只入 prompt 独立节，不进
+        # world_state / 日志。
+        window_len = max(0, int(os.environ.get("NAV_DECISION_WINDOW", "5")))
+        self._decision_window = (deque(maxlen=window_len)
+                                 if window_len else None)
         self._action_log = []          # [{step, action, target_id, outcome}]
         self._last_notified_frame_id = 0
         self._last_observation = None
@@ -170,7 +177,7 @@ class NavAgent(MappingAgent):
         self._scanning = False          # 到达后原地 360° 扫描确认中
         self._scan_steps = 0
         self._scan_images = []
-        self.memory = InstanceMemory()
+        self.instance_store = InstanceMemory()
         self._reported_count = 0
         self._last_dup_reviews = []
         # 评测采集（get_target_pool）只读锚点状态：世界系 (gps, compass)
@@ -222,15 +229,15 @@ class NavAgent(MappingAgent):
         self._crosshair_reviews = {}
         # Candidate transaction state.  A proposal is not a navigation target:
         # only explicitly accepted proposals are inserted into InstanceMemory.
-        self._proposals = {}
+        self._proposal_queue = {}
         self._proposal_limit = 128
         # 被拒候选记忆：(frame_id, round(x), round(y)) -> {count, reason, step}。
         # molmo/VLM 反复在同一个像素报同一个目标时，硬过滤禁止再次 propose；
         # 全部被过滤时向 VLM 报 ALL_SPOTS_REJECTED，引导其先靠近再看。
-        self._rejected_spots = {}
+        self._rejected_spot_log = {}
         # geometry 解析失败候选的重看导航：frame_id -> {point, attempts, step}。
         # 系统把 agent 导航到该帧拍摄位姿附近重新观察，不再直接丢弃。
-        self._revisit_targets = {}
+        self._revisit_queue = {}
         self.revisit_max_attempts = max(1, int(os.environ.get(
             "NAV_REVISIT_MAX_ATTEMPTS", "3")))
         # 到达决策失败处理：每次 arrival 事件内部先重试 NAV_ARRIVAL_RETRIES
@@ -399,7 +406,7 @@ class NavAgent(MappingAgent):
             print(f"[NavAgent] 最终轨迹位姿拉取失败: {exc}")
         instances = [{"id": nd.iid, "xy": tuple(nd.point[:2]),
                       "reported": nd.reported}
-                     for nd in getattr(self.memory, "nodes", [])]
+                     for nd in getattr(self.instance_store, "nodes", [])]
         png = render_topdown(
             grid, trajectory=trajectory, pose=pose_xy,
             instances=instances,
@@ -707,7 +714,7 @@ class NavAgent(MappingAgent):
         # 骨架拓扑只用于给实例附着可通行节点；语义判断交给 VLM。
         graph = skel.build_skeleton_graph(grid)
         if graph is not None:
-            self.memory.attach_to_skeleton(graph)
+            self.instance_store.attach_to_skeleton(graph)
 
         raw_clusters, frontier_layers = skel.frontier_clusters(
             grid, min_size=5, return_layers=True)
@@ -1444,7 +1451,7 @@ class NavAgent(MappingAgent):
             alpha = psi_w + yaw_s0
             cos_a, sin_a = math.cos(alpha), math.sin(alpha)
             pool = []
-            for node in self.memory.nodes:
+            for node in self.instance_store.nodes:
                 point = np.asarray(node.point, dtype=np.float64).reshape(-1)
                 if point.size < 3 or not np.isfinite(point[:3]).all():
                     continue
@@ -1489,8 +1496,8 @@ class NavAgent(MappingAgent):
                 "created_step": nd.step,
                 "unreachable": nd.iid in self._unreachable_instance_ids,
                 "goal_index": self._instance_goal_index.get(nd.iid),
-            } for nd in self.memory.nodes],
-            "report_claims": [c.as_dict() for c in self.memory.report_claims],
+            } for nd in self.instance_store.nodes],
+            "report_claims": [c.as_dict() for c in self.instance_store.report_claims],
         }
 
     def _paper_trace_kwargs(self, observation, event):
@@ -1539,7 +1546,7 @@ class NavAgent(MappingAgent):
                     getattr(self.decision_loop, "logger", None), "_warned", False)),
                 "vlm_trace": bool(getattr(self.vlm, "_trace_warned", False)),
             },
-            "observations": [o.as_dict() for o in self.memory.observations.values()],
+            "observations": [o.as_dict() for o in self.instance_store.observations.values()],
             "action_history": self._action_log,
             "artifacts": {
                 "decision_trace": getattr(getattr(self.decision_loop, "logger", None),
@@ -1569,14 +1576,14 @@ class NavAgent(MappingAgent):
             return
         selected = None if instance_ids is None else {
             int(iid) for iid in instance_ids}
-        nodes = [node for node in self.memory.nodes
+        nodes = [node for node in self.instance_store.nodes
                  if selected is None or node.iid in selected]
         if not nodes:
             return
         candidate_to_observations = {}
         legacy_candidates = {}
         for node in nodes:
-            observations = [self.memory.get_observation(oid)
+            observations = [self.instance_store.get_observation(oid)
                             for oid in node.observation_ids]
             observations = [obs for obs in observations
                             if obs is not None and obs.candidate_id]
@@ -1597,9 +1604,9 @@ class NavAgent(MappingAgent):
             point = self._aligned_point(resolved["point"])
             for observed in candidate_to_observations.get(
                     str(candidate_id), []):
-                self.memory.refresh_observation_point(observed, point)
+                self.instance_store.refresh_observation_point(observed, point)
             for node in legacy_candidates.get(str(candidate_id), []):
-                self.memory.refresh_point(node, point)
+                self.instance_store.refresh_point(node, point)
 
         batch = getattr(self.client, "resolve_candidates", None)
         if callable(batch):
@@ -1620,12 +1627,12 @@ class NavAgent(MappingAgent):
 
     def _report_found(self, instance_id=None):
         """Atomically claim and report the active canonical instance."""
-        node = self.memory.get(instance_id)
+        node = self.instance_store.get(instance_id)
         if node is None or node.iid != self.target_instance_id:
             self._log_event("ignored REPORT_FOUND not bound to active instance")
             return int(Action.TURN_LEFT)
         step = int(getattr(self._last_observation, "step_count", 0) or 0)
-        claim = self.memory.claim(node, step=step)
+        claim = self.instance_store.claim(node, step=step)
         if claim is None:
             self._log_event("ignored duplicate/invalid TARGET_FOUND report")
             self._clear_current_target()
@@ -1717,7 +1724,7 @@ class NavAgent(MappingAgent):
         except (TypeError, ValueError):
             return {"error": "top_k must be an integer"}
         rows = []
-        for node in self.memory.nodes:
+        for node in self.instance_store.nodes:
             if reported is not None and node.reported != reported:
                 continue
             haystack = node.text.lower()
@@ -1742,7 +1749,7 @@ class NavAgent(MappingAgent):
     def _tool_view_instance(self, instance_id, wide_only=False):
         """返回实例最相关的证据图；优先pointing overlay，回退关键帧。
         wide_only=True 时 overlay 不放大裁剪（duplicate review 用）。"""
-        node = self.memory.get(instance_id)
+        node = self.instance_store.get(instance_id)
         if node is None:
             return None
         candidate_ids = [node.candidate_id] + [
@@ -1791,13 +1798,13 @@ class NavAgent(MappingAgent):
         }
 
     def _tool_get_instance(self, instance_id):
-        node = self.memory.get(instance_id)
+        node = self.instance_store.get(instance_id)
         if node is None:
             return {"error": f"instance {instance_id!r} not found"}
         return self._instance_tool_view(node)
 
     def _tool_update_instance(self, instance_id, text):
-        node = self.memory.update_text(instance_id, text)
+        node = self.instance_store.update_text(instance_id, text)
         if node is None:
             return {"error": f"instance {instance_id!r} not found"}
         self._log_event(f"VLM updated instance {node.iid}: {node.text[:120]}")
@@ -1825,6 +1832,40 @@ class NavAgent(MappingAgent):
             entry["outcome"] = "ok"
         if self._last_motion_failed:
             pending[-1]["outcome"] = "collision"
+        self._settle_decision_window(
+            "collision" if self._last_motion_failed else "ok")
+
+    def _decision_window_entries(self):
+        return (list(self._decision_window)
+                if self._decision_window else None)
+
+    def _append_decision_window(self, event, step):
+        """把本轮被接受决策的原始交换追加进 decision_window。
+
+        内容来自 DecisionLoop.last_exchange（校验重试的废品不进）；
+        outcome 先 None，执行结算时回填。"""
+        if self._decision_window is None:
+            return
+        exchange = getattr(self.decision_loop, "last_exchange", None)
+        if exchange is None:
+            return
+        self._decision_window.append({
+            "step": int(step),
+            "event": str(event),
+            "tool_calls": list(exchange.get("tool_calls") or []),
+            "tool_results": list(exchange.get("tool_results") or []),
+            "image_labels": list(exchange.get("image_labels") or []),
+            "reply": exchange.get("reply"),
+            "outcome": None,
+        })
+
+    def _settle_decision_window(self, outcome):
+        """回填窗口中所有未完成条目的 outcome（与 _action_log 同时机）。"""
+        if not self._decision_window:
+            return
+        for entry in self._decision_window:
+            if entry.get("outcome") is None:
+                entry["outcome"] = outcome
 
     def _mark_goto_arrived(self):
         """到达事件发生：把最近一条 GOTO_* 记录结算为 arrived。"""
@@ -1832,6 +1873,16 @@ class NavAgent(MappingAgent):
             if entry["action"] in ("GOTO_INSTANCE", "GOTO_FRONTIER"):
                 entry["outcome"] = "arrived"
                 break
+        if self._decision_window:
+            for entry in reversed(self._decision_window):
+                try:
+                    reply_action = str(json.loads(
+                        entry.get("reply") or "{}").get("action") or "")
+                except ValueError:
+                    reply_action = ""
+                if reply_action in ("GOTO_INSTANCE", "GOTO_FRONTIER"):
+                    entry["outcome"] = "arrived"
+                    break
 
     # harness：新增决策工具
     def _tool_view_frame(self, frame_id):
@@ -1905,7 +1956,7 @@ class NavAgent(MappingAgent):
                    int(round(float(pixel_norm[1]))))
         except (TypeError, ValueError, IndexError):
             return None
-        entry = self._rejected_spots.setdefault(
+        entry = self._rejected_spot_log.setdefault(
             key, {"count": 0, "reason": "", "step": 0})
         entry["count"] += 1
         if reason:
@@ -1920,7 +1971,7 @@ class NavAgent(MappingAgent):
             x, y = float(pixel_norm[0]), float(pixel_norm[1])
         except (TypeError, ValueError, IndexError):
             return False
-        for (fkey, kx, ky) in self._rejected_spots:
+        for (fkey, kx, ky) in self._rejected_spot_log:
             if fkey == fid and math.hypot(kx - x, ky - y) <= 40.0:
                 return True
         return False
@@ -1941,7 +1992,7 @@ class NavAgent(MappingAgent):
             return {"frame_id": fid, "attempts": 0, "navigating": False,
                     "error": "no pose for this frame; re-observe from a "
                              "fresh viewpoint"}
-        entry = self._revisit_targets.setdefault(
+        entry = self._revisit_queue.setdefault(
             fid, {"point": None, "attempts": 0, "step": 0})
         entry["attempts"] += 1
         entry["step"] = int(getattr(self._last_observation, "step_count", 0))
@@ -1989,7 +2040,7 @@ class NavAgent(MappingAgent):
                 "instantiation_allowed": verdict == "ACCEPT"}
 
     def _tool_propose_candidates(self, frame_id, query=""):
-        """SAM 全分割整帧 → 编号 mask 表 + overlay；VLM 选编号走 som_pick。
+        """SAM 全分割整帧 → 编号 mask 表 + overlay；VLM 选编号走 pick_segment。
 
         molmo 点指已废弃：分割只依赖 SAM（不依赖 pointing 模型），把
         "生成坐标"变成"选编号"。目标太小/太远时 SAM 会漏分割——先
@@ -2019,7 +2070,7 @@ class NavAgent(MappingAgent):
                           "area_frac": row.get("area_frac")})
         out = {"frame_id": fid, "masks": masks,
                "next": "the numbered labels on the attached overlay match "
-                       "mask_id; call som_pick(frame_id, mask_ids, query) "
+                       "mask_id; call pick_segment(frame_id, mask_ids, query) "
                        "with the ids of the regions matching the target, "
                        "then review and commit them with commit_candidates"}
         if payload:
@@ -2047,7 +2098,7 @@ class NavAgent(MappingAgent):
             return idx
         return None
 
-    def _tool_som_pick(self, frame_id, mask_ids, query="", goal_index=None):
+    def _tool_pick_segment(self, frame_id, mask_ids, query="", goal_index=None):
         """把 SoM 选中的 mask 注册为待审核候选（复用 commit 流程）。
 
         每个 mask 的质心成为候选像素、mask 本体用于深度采样与证据图。
@@ -2058,7 +2109,7 @@ class NavAgent(MappingAgent):
         if not isinstance(mask_ids, (list, tuple)) or not mask_ids:
             return {"error": "mask_ids must be a non-empty list of ints"}
         try:
-            resp = self.client.som_pick(int(frame_id), list(mask_ids))
+            resp = self.client.pick_segment(int(frame_id), list(mask_ids))
         except Exception as exc:
             return {"error": str(exc)[:200]}
         if resp.get("error"):
@@ -2070,7 +2121,7 @@ class NavAgent(MappingAgent):
             pixel = candidate.get("pixel_norm")
             if not cid or fid is None or not pixel:
                 continue
-            self._proposals[cid] = {
+            self._proposal_queue[cid] = {
                 "candidate_id": cid, "frame_id": int(fid),
                 "pixel_norm": list(pixel), "bbox": candidate.get("bbox"),
                 "query": str(query)[:300]
@@ -2090,11 +2141,11 @@ class NavAgent(MappingAgent):
             rows.append({"candidate_id": cid, "frame_id": int(fid),
                          "mask_id": candidate.get("mask_id"),
                          "pixel": list(pixel)})
-        if len(self._proposals) > self._proposal_limit:
-            oldest = sorted(self._proposals.values(),
+        if len(self._proposal_queue) > self._proposal_limit:
+            oldest = sorted(self._proposal_queue.values(),
                             key=lambda row: row["step"])[:-self._proposal_limit]
             for row in oldest:
-                self._proposals.pop(row["candidate_id"], None)
+                self._proposal_queue.pop(row["candidate_id"], None)
         out = {"proposals": rows, "next":
                "inspect panels, then commit any reviewed subset with one "
                "verdict per submitted candidate; other proposals stay pending"}
@@ -2115,7 +2166,7 @@ class NavAgent(MappingAgent):
                 continue
             cid = str(row.get("candidate_id") or "")
             verdict = str(row.get("verdict") or "UNCERTAIN").upper()
-            proposal = self._proposals.get(cid)
+            proposal = self._proposal_queue.get(cid)
             if not cid or cid in seen or proposal is None or \
                     proposal.get("status") != "pending":
                 continue
@@ -2337,18 +2388,18 @@ class NavAgent(MappingAgent):
                 int(fid) for fid in frame_ids][-5:]
         except Exception as exc:
             return {"error": str(exc)[:200]}
-        status["instances_total"] = len(self.memory.nodes)
-        status["unreported_instances"] = len(self.memory.available())
+        status["instances_total"] = len(self.instance_store.nodes)
+        status["unreported_instances"] = len(self.instance_store.available())
         obs = self._last_observation
         if obs is not None:
             status["steps_remaining"] = max(
                 0, int(obs.max_steps) - int(obs.step_count))
         return status
 
-    def _tool_set_notes(self, text):
+    def _tool_update_notes(self, text):
         """覆盖 VLM 自己的跨决策工作记忆（上限 500 字，随决策回传）。"""
-        self._notes = str(text)[:500]
-        return {"notes": self._notes}
+        self._agent_notes = str(text)[:500]
+        return {"agent_notes": self._agent_notes}
 
     def _tool_get_action_history(self, before_step=None, limit=20):
         """分页查询更早的动作流水（不含 outcome 为 None 的进行中条目）。"""
@@ -2448,7 +2499,7 @@ class NavAgent(MappingAgent):
         """Return JSON metadata and renderer metadata for the active target."""
         target_type, target_id, target_xy, target_text = None, None, None, None
         if self.target_instance_id is not None:
-            node = self.memory.get(self.target_instance_id)
+            node = self.instance_store.get(self.target_instance_id)
             target_type = "instance"
             target_id = self.target_instance_id
             if node is not None:
@@ -2598,7 +2649,7 @@ class NavAgent(MappingAgent):
                     pointcloud[0], pointcloud[1], pose=pose,
                     instances=[{"id": nd.iid, "xy": tuple(nd.point[:2]),
                                 "reported": nd.reported}
-                               for nd in self.memory.nodes
+                               for nd in self.instance_store.nodes
                                if nd.iid in visible_ids],
                     frontiers=[{"id": f"f{i}", "xy": tuple(c["world"][:2]),
                                 "reason": c.get("reason", "geometry")}
@@ -2634,7 +2685,7 @@ class NavAgent(MappingAgent):
         """把决策结果映射到现有状态机动作（GOTO_INSTANCE/GOTO_FRONTIER）。
         底层跟随/避障/重规划仍由确定性模块执行。"""
         if result.action == "GOTO_INSTANCE" and result.target_id is not None:
-            nd = self.memory.get(result.target_id)
+            nd = self.instance_store.get(result.target_id)
             if nd is not None and not nd.reported and \
                     nd.iid not in self._unreachable_instance_ids:
                 self.target_instance_id = nd.iid
@@ -2727,9 +2778,11 @@ class NavAgent(MappingAgent):
         result = self.decision_loop.decide(
             "finish_check", state, map_png,
             state_fn=lambda: self._build_decider_input(observation),
+            decision_window=self._decision_window_entries(),
             **self._paper_trace_kwargs(observation, "finish_check"))
         if result is None:
             return None                       # 回退规则
+        self._append_decision_window("finish_check", observation.step_count)
         self._record_action(result.action, result.target_id)
         print(f"[NavAgent] 决策层 finish_check: {result}")
         if result.action == "FINISH":
@@ -2763,12 +2816,14 @@ class NavAgent(MappingAgent):
             result = self.decision_loop.decide(
                 event, state, map_png, images=images,
                 state_fn=state_fn,
+                decision_window=self._decision_window_entries(),
                 **self._paper_trace_kwargs(observation, event))
         except Exception as exc:
             print(f"[NavAgent] 决策层调用失败，回退规则: {exc}")
             return None, None
         if result is None:
             return None, None
+        self._append_decision_window(event, observation.step_count)
         print(f"[NavAgent] 决策层 {event}: {result}")
         self._last_decision_output = {
             "step": observation.step_count,
@@ -3372,7 +3427,7 @@ class NavAgent(MappingAgent):
             late = observation.step_count >= int(0.8 * observation.max_steps)
             frontier_fresh = observation.step_count - self._last_frontier_step \
                 <= 2 * self.explore_replan_interval
-            no_pending = not self.memory.available()
+            no_pending = not self.instance_store.available()
             geometric_ready = \
                 self._reported_count > 0 and late and no_pending and \
                 self._no_hit_queries >= self.finish_patience and frontier_fresh and \
@@ -3523,7 +3578,7 @@ class NavAgent(MappingAgent):
 
     def _ordered_memory_nodes(self):
         """从未报告实例记忆产生确定性回退规划序列。"""
-        instances = self.memory.available()
+        instances = self.instance_store.available()
         if not instances:
             return []
         start = self._current_aligned_xy()
@@ -3601,17 +3656,17 @@ class NavAgent(MappingAgent):
             hit_goal_index = self._validate_goal_index(h.get("goal_index"))
             if hit_goal_index is not None:
                 evidence["goal_index"] = hit_goal_index
-            replay_observation = self.memory.find_replay_observation(
+            replay_observation = self.instance_store.find_replay_observation(
                 candidate_id=h.get("candidate_id"),
                 frame_id=h.get("frame_id"), pixel=h.get("pixel"),
                 bbox=h.get("bbox"))
-            replay = (self.memory.instance_for_observation(
+            replay = (self.instance_store.instance_for_observation(
                 replay_observation.oid)
                 if replay_observation is not None else None)
             is_new = False
             association = None
             if replay is not None:
-                node = self.memory.register_replay(
+                node = self.instance_store.register_replay(
                     replay, candidate_id=h.get("candidate_id"),
                     evidence=evidence, point=aligned, step=step)
                 association = "observation_replay"
@@ -3623,14 +3678,14 @@ class NavAgent(MappingAgent):
                 node = None
                 observation_id = replay_observation.oid
             else:
-                observed = self.memory.new_observation(
+                observed = self.instance_store.new_observation(
                     aligned, text=initial_text, evidence=evidence,
                     frame_id=h.get("frame_id"), step=step,
                     candidate_id=h.get("candidate_id"),
                     pixel=h.get("pixel"), bbox=h.get("bbox"))
                 observation_id = observed.oid
                 scale = self._metric_scale_value() or 1.0
-                neighbors = self.memory.nearby(
+                neighbors = self.instance_store.nearby(
                     observed.point, scale, self.instance_dup_radius_m,
                     top_k=4)
                 if neighbors:
@@ -3648,7 +3703,7 @@ class NavAgent(MappingAgent):
                             for dist, nd in neighbors],
                     })
                 else:
-                    node = self.memory.create_instance(
+                    node = self.instance_store.create_instance(
                         observed, text=initial_text)
                     is_new = True
                     association = "new"
@@ -3657,7 +3712,7 @@ class NavAgent(MappingAgent):
                 under_review = any(
                     row["observation_id"] == observation_id
                     for row in dup_reviews)
-                self._proposals[cid] = {
+                self._proposal_queue[cid] = {
                     "candidate_id": cid, "frame_id": h.get("frame_id"),
                     "pixel_norm": h.get("pixel"), "bbox": h.get("bbox"),
                     "query": initial_text[:300], "step": int(step),
@@ -3731,22 +3786,22 @@ class NavAgent(MappingAgent):
     def _tool_resolve_duplicate(self, observation_id, decision,
                                 duplicate_of=None, text=""):
         """实例化去重裁决：NEW 新建实例；DUPLICATE 并入既有实例。"""
-        observation = self.memory.get_observation(observation_id)
+        observation = self.instance_store.get_observation(observation_id)
         if observation is None:
             return {"error": f"observation {observation_id!r} not found"}
-        if self.memory.instance_for_observation(observation.oid) is not None:
+        if self.instance_store.instance_for_observation(observation.oid) is not None:
             return {"error": f"observation {observation.oid} already resolved"}
         decision = str(decision or "").strip().upper()
         if decision == "NEW":
-            node = self.memory.create_instance(
+            node = self.instance_store.create_instance(
                 observation, text=str(text or observation.text))
             resolved = "new"
         elif decision == "DUPLICATE":
-            node = self.memory.get(duplicate_of)
+            node = self.instance_store.get(duplicate_of)
             if node is None:
                 return {"error": f"duplicate_of {duplicate_of!r} is not an "
                                  "existing instance"}
-            self.memory.attach_observation(
+            self.instance_store.attach_observation(
                 node, observation, text=str(text or ""))
             resolved = "duplicate"
         else:
@@ -3755,7 +3810,7 @@ class NavAgent(MappingAgent):
         obs_goal = (observation.evidence or {}).get("goal_index")
         if obs_goal is not None and node.iid not in self._instance_goal_index:
             self._instance_goal_index[node.iid] = int(obs_goal)
-        for proposal in self._proposals.values():
+        for proposal in self._proposal_queue.values():
             if proposal.get("observation_id") == observation.oid:
                 proposal["status"] = f"resolved_{resolved}"
         self._log_event(
@@ -3766,15 +3821,15 @@ class NavAgent(MappingAgent):
 
     def _tool_merge_instances(self, instance_id, other_instance_id, text=""):
         """随时合并两个实例为同一物理物体：other 并入 instance。"""
-        keep = self.memory.get(instance_id)
-        drop = self.memory.get(other_instance_id)
+        keep = self.instance_store.get(instance_id)
+        drop = self.instance_store.get(other_instance_id)
         if keep is None:
             return {"error": f"instance {instance_id!r} not found"}
         if drop is None:
             return {"error": f"instance {other_instance_id!r} not found"}
         if keep.iid == drop.iid:
             return {"error": "cannot merge an instance into itself"}
-        self.memory.merge_instances(keep, drop)
+        self.instance_store.merge_instances(keep, drop)
         if text:
             keep.text = str(text)
         # image-goal 记账：drop 带目标索引而 keep 没有时迁移过去。

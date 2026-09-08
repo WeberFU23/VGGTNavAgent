@@ -143,7 +143,7 @@ def test_merge_migrates_goal_index():
         goal_type="image", goal_images=[_goal_rgb(1)]))
     obs = _obs(step=100)
     agent._last_observation = obs
-    keep = agent.memory.add([0.0, 0.0, 0.0], "old clock")
+    keep = agent.instance_store.add([0.0, 0.0, 0.0], "old clock")
     changed = agent._ingest_semantic_hits(
         obs, [_hit([5.0, 5.0, 0.0], "c1", goal_index=0)], select=False)
     drop_id = changed[0]["instance_id"]

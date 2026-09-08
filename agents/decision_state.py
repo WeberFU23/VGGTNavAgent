@@ -38,7 +38,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
                       start_xy=None, scale=None):
     """组装决策用世界状态 JSON。
 
-    agent: NavAgent（访问 memory/calibrator/_events）；
+    agent: NavAgent（访问 instance_store/calibrator/_events）；
     grid: 当前占据栅格（有则预计算 A* path_cost）；
     frontiers: 当前 frontier clusters（与地图上的编号顺序一致）。
     start_xy: 与该栅格快照一致的当前二维位置；未提供时兼容旧调用。
@@ -52,7 +52,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
     # 摘要的实例预计算（长 episode 下对全部实例跑 A* 太贵）。
     max_instances = int(os.environ.get(
         "NAV_STATE_MAX_INSTANCES", str(MAX_STATE_INSTANCES)))
-    nodes = list(agent.memory.nodes)
+    nodes = list(agent.instance_store.nodes)
     # 导航确认不可达的实例默认不进表（VLM 不会主动再选；REPORT_FOUND
     # 校验仍可用——agent 可能就停在目标旁直接确认）。但 agent 就在不可达
     # 实例旁边时（dist_m ≤ NAV_REPORT_NEAR_DIST_M）保留条目并打 unreachable
@@ -146,7 +146,7 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
             "novelty": str(c.get("novelty", "unknown")),
         })
 
-    proposals = list(getattr(agent, "_proposals", {}).values())
+    proposals = list(getattr(agent, "_proposal_queue", {}).values())
     proposal_counts = {
         status: sum(1 for row in proposals if row.get("status") == status)
         for status in ("pending", "uncertain", "rejected", "active",
@@ -159,12 +159,12 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
           "count": entry["count"],
           "reason": str(entry.get("reason") or "")[:80],
           "step": entry["step"]}
-         for key, entry in getattr(agent, "_rejected_spots", {}).items()),
+         for key, entry in getattr(agent, "_rejected_spot_log", {}).items()),
         key=lambda row: (-row["count"], -row["step"]))[:10]
     # geometry 解析失败的重看导航 top-5（按尝试次数）：系统已把 agent
     # 导航到对应帧位姿附近，VLM 应等到达后从近处新视角重新 propose。
     revisit_targets = []
-    for fid, entry in getattr(agent, "_revisit_targets", {}).items():
+    for fid, entry in getattr(agent, "_revisit_queue", {}).items():
         dist_m = None
         point = entry.get("point")
         if point is not None and start is not None:
@@ -211,15 +211,15 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         "reported_instance_ids": reported_ids,
         "reported_instances": reported_instances,
         "report_claims": [claim.as_dict() for claim in
-                          getattr(agent.memory, "report_claims", [])[-20:]],
+                          getattr(agent.instance_store, "report_claims", [])[-20:]],
         "frontiers": frontier_rows,
         "frontier_branches": [dict(row) for row in
                               getattr(agent, "_frontier_branches", [])[:8]],
         "proposal_summary": proposal_counts,
         "rejected_spots": rejected_spots,
         "revisit_targets": revisit_targets,
-        # VLM 自己维护的跨决策工作记忆（经 set_notes 工具改写）。
-        "notes": getattr(agent, "_notes", ""),
+        # VLM 自己维护的跨决策工作记忆（经 update_notes 工具改写）。
+        "agent_notes": getattr(agent, "_agent_notes", ""),
         # 最近 3 步高层动作流水（不含进行中的条目）；更早的经
         # get_action_history 按需查询。
         "recent_actions": [

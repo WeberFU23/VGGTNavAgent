@@ -67,7 +67,7 @@ def _agent_with_anchor(c0=0.7, yaw_s0=-1.1, scale=0.42):
 
 def test_not_ready_returns_empty():
     agent = _make_agent()
-    agent.memory.add(point=[1.0, 2.0, 0.5], text="chair")
+    agent.instance_store.add(point=[1.0, 2.0, 0.5], text="chair")
     assert agent.get_target_pool() == []  # 无锚点
     agent._pool_world_anchor = (np.zeros(3), 0.0)
     assert agent.get_target_pool() == []  # 无 SLAM 锚点
@@ -87,7 +87,7 @@ def test_roundtrip_through_ground_truth_sim3():
                     np.array([3.0, 1.5, -2.0])]  # 第三个即锚点自身
     labels = ["red chair", "basket near shelf", "anchor object"]
     for p_w, label in zip(world_points, labels):
-        agent.memory.add(point=_world_to_slam(p_w, Q, t, s), text=label)
+        agent.instance_store.add(point=_world_to_slam(p_w, Q, t, s), text=label)
 
     pool = agent.get_target_pool()
     assert len(pool) == 3
@@ -104,8 +104,8 @@ def test_heading_maps_to_world_forward():
     agent, g0, slam_anchor = _agent_with_anchor(c0, yaw_s0, s)
     forward_s = slam_anchor + np.array([math.cos(yaw_s0),
                                         math.sin(yaw_s0), 0.0])
-    agent.memory.add(point=slam_anchor, text="a")
-    agent.memory.add(point=forward_s, text="b")
+    agent.instance_store.add(point=slam_anchor, text="a")
+    agent.instance_store.add(point=forward_s, text="b")
     pool = agent.get_target_pool()
     direction = np.asarray(pool[1]["position"]) - np.asarray(
         pool[0]["position"])
@@ -115,9 +115,9 @@ def test_heading_maps_to_world_forward():
 
 def test_reported_flag_and_label_truncation():
     agent, g0, slam_anchor = _agent_with_anchor()
-    node = agent.memory.add(point=[0.5, 0.5, 0.1], text="x" * 500)
-    agent.memory.claim(node, step=3)
-    agent.memory.add(point=[1.0, 1.0, 0.2], text="short")
+    node = agent.instance_store.add(point=[0.5, 0.5, 0.1], text="x" * 500)
+    agent.instance_store.claim(node, step=3)
+    agent.instance_store.add(point=[1.0, 1.0, 0.2], text="short")
     pool = agent.get_target_pool()
     assert [entry["reported"] for entry in pool] == [True, False]
     assert len(pool[0]["label"]) == 100

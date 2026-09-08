@@ -13,7 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents import navigator as nav
-from agents.memory import InstanceMemory
+from agents.instance_store import InstanceMemory
 from agents.nav_agent import NavAgent
 from benchmark_api import Action
 from decision import VLMDecisionClient
@@ -130,7 +130,7 @@ def test_multi_target_finish_policy():
     agent._reported_count = 1
     agent._no_hit_queries = 5
     agent.target_text = "sink"
-    agent.memory = InstanceMemory()
+    agent.instance_store = InstanceMemory()
     agent.explore_replan_interval = 25
     agent._last_frontier_step = 80
     agent._last_frontier_count = 0
@@ -185,9 +185,9 @@ def test_deterministic_candidate_fallback():
     agent.target_text = "tv"
     agent.align_R = np.eye(3)
     agent._target_mode = "any"
-    n1, _ = agent.memory.remember(
+    n1, _ = agent.instance_store.remember(
         [0, 0, 0], "TV candidate", candidate_id="c1", frame_id=1)
-    n2, _ = agent.memory.remember(
+    n2, _ = agent.instance_store.remember(
         [2, 0, 0], "TV candidate", candidate_id="c2", frame_id=2)
     agent._ordered_memory_nodes = lambda: [n1, n2]
     agent._plan_to_target = lambda obs: False
@@ -201,14 +201,14 @@ def test_deterministic_candidate_fallback():
 
 def test_runtime_memory_route_uses_persistent_instances():
     agent = object.__new__(NavAgent)
-    agent.memory = InstanceMemory()
+    agent.instance_store = InstanceMemory()
     agent.target_text = "bag"
     agent._target_mode = "many"
     agent._target_count = 2
     agent._reported_count = 0
     agent._current_aligned_xy = lambda: (0.0, 0.0)
     for x in (10.0, 2.0, 5.0):
-        agent.memory.remember(
+        agent.instance_store.remember(
             [x, 0, 0], "bag candidate", candidate_id=f"c{x}")
     ordered = agent._ordered_memory_nodes()
     assert [float(nd.point[0]) for nd in ordered] == [2.0, 5.0]

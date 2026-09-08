@@ -39,34 +39,34 @@ def test_instantiation_without_neighbors_creates_instance():
     changed = agent._ingest_semantic_hits(
         _obs(), [_hit([1.0, 2.0, 0.0], "c1")], select=False)
     assert len(changed) == 1 and changed[0]["is_new"] is True
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     assert agent._last_dup_reviews == []
 
 
 def test_instantiation_near_existing_suspends_for_review():
     agent = _make_agent()
-    agent.memory.add([1.0, 2.0, 0.0], "dark leather chair")
+    agent.instance_store.add([1.0, 2.0, 0.0], "dark leather chair")
     changed = agent._ingest_semantic_hits(
         _obs(), [_hit([1.4, 2.0, 0.0], "c2")], select=False)
     assert changed == []
-    assert len(agent.memory.nodes) == 1  # 没有新建实例
+    assert len(agent.instance_store.nodes) == 1  # 没有新建实例
     assert len(agent._last_dup_reviews) == 1
     review = agent._last_dup_reviews[0]
     assert review["neighbors"][0]["dist_m"] == 0.4
     # 挂起的 observation 不可导航
-    assert agent.memory.instance_for_observation(
+    assert agent.instance_store.instance_for_observation(
         review["observation_id"]) is None
 
 
 def test_resolve_duplicate_new_creates_instance():
     agent = _make_agent()
-    agent.memory.add([1.0, 2.0, 0.0], "dark leather chair")
+    agent.instance_store.add([1.0, 2.0, 0.0], "dark leather chair")
     agent._ingest_semantic_hits(_obs(), [_hit([1.4, 2.0, 0.0], "c2")],
                                 select=False)
     oid = agent._last_dup_reviews[0]["observation_id"]
     out = agent._tool_resolve_duplicate(oid, "NEW", text="red leather chair")
     assert out["resolved"] == "new"
-    assert len(agent.memory.nodes) == 2
+    assert len(agent.instance_store.nodes) == 2
     # 重复裁决被拒
     again = agent._tool_resolve_duplicate(oid, "NEW")
     assert "error" in again
@@ -74,24 +74,24 @@ def test_resolve_duplicate_new_creates_instance():
 
 def test_resolve_duplicate_merges_into_existing():
     agent = _make_agent()
-    node = agent.memory.add([1.0, 2.0, 0.0], "dark leather chair")
+    node = agent.instance_store.add([1.0, 2.0, 0.0], "dark leather chair")
     agent._ingest_semantic_hits(_obs(), [_hit([1.4, 2.0, 0.0], "c2")],
                                 select=False)
     oid = agent._last_dup_reviews[0]["observation_id"]
     out = agent._tool_resolve_duplicate(oid, "DUPLICATE", duplicate_of=node.iid)
     assert out["resolved"] == "duplicate" and out["instance_id"] == node.iid
-    assert len(agent.memory.nodes) == 1
+    assert len(agent.instance_store.nodes) == 1
     assert len(node.observation_ids) == 2
 
 
 def test_resolve_duplicate_rejects_unknown_target():
     agent = _make_agent()
-    node = agent.memory.add([1.0, 2.0, 0.0], "dark leather chair")
+    node = agent.instance_store.add([1.0, 2.0, 0.0], "dark leather chair")
     agent._ingest_semantic_hits(_obs(), [_hit([1.4, 2.0, 0.0], "c2")],
                                 select=False)
     oid = agent._last_dup_reviews[0]["observation_id"]
     out = agent._tool_resolve_duplicate(oid, "DUPLICATE", duplicate_of=999)
     assert "error" in out
-    assert agent.memory.instance_for_observation(oid) is None
+    assert agent.instance_store.instance_for_observation(oid) is None
     bad = agent._tool_resolve_duplicate(oid, "MAYBE")
     assert "error" in bad

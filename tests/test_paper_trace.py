@@ -25,7 +25,7 @@ def run_script(trace=False, broken=False):
         {"action": "FINISH", "reason": "done"},
     ])
 
-    def chat(prompt, images):
+    def chat(prompt, images, system_prompt=None):
         calls.append((prompt, images))
         return next(replies)
 
@@ -66,7 +66,7 @@ def test_capture_and_disk_failure_preserve_prompts_tools_and_action():
 
 def test_decisions_on_same_step_have_distinct_ids_and_call_correlation(tmp_path):
     records, call_ids = [], []
-    loop = DecisionLoop(lambda *_: {"action": "GOTO_INSTANCE", "target_id": 1},
+    loop = DecisionLoop(lambda *_, **__: {"action": "GOTO_INSTANCE", "target_id": 1},
                         logger=DecisionTraceLogger(tmp_path / "trace.jsonl"))
     for _ in range(2):
         loop.decide("arrival", state(), trace_sink=records.append,
@@ -81,7 +81,7 @@ def test_snapshot_failure_keeps_valid_decision_and_reports_missing_data():
     records = []
     def broken():
         raise RuntimeError("snapshot unavailable")
-    result = DecisionLoop(lambda *_: {"action": "GOTO_INSTANCE", "target_id": 1}).decide(
+    result = DecisionLoop(lambda *_, **__: {"action": "GOTO_INSTANCE", "target_id": 1}).decide(
         "arrival", state(), trace_snapshot_fn=broken, trace_sink=records.append)
     assert result.action == "GOTO_INSTANCE"
     assert records[0]["snapshot_error"] == "snapshot unavailable"
@@ -89,7 +89,7 @@ def test_snapshot_failure_keeps_valid_decision_and_reports_missing_data():
 
 def test_agent_snapshot_is_read_only_and_keeps_identity_without_world_transform():
     agent = NavAgent()
-    node = agent.memory.add(point=[1., 2., 3.], text="cup")
+    node = agent.instance_store.add(point=[1., 2., 3.], text="cup")
     before = copy.deepcopy(node.point)
     # No RPC is allowed from either diagnostic getter.
     class NoRPC:
@@ -111,7 +111,7 @@ def test_optional_pool_ids_preserve_existing_contract():
     agent._pool_world_anchor = (np.zeros(3), 0.)
     agent._pool_slam_anchor = (0., 0., 0., 0.)
     agent._metric_snapshot.update(scale=1., revision=1)
-    node = agent.memory.add(point=[1., 2., 0.], text="cup")
+    node = agent.instance_store.add(point=[1., 2., 0.], text="cup")
     old = agent.get_target_pool()
     diagnostic = agent.get_target_pool(include_ids=True)
     assert set(old[0]) == {"position", "label", "reported"}

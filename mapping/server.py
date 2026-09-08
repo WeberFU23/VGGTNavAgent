@@ -1119,7 +1119,7 @@ class MappingServer:
     def som_segment(self, frame_id, max_masks=None):
         """对指定关键帧做全景分割，返回 mask 元数据 + 编号 overlay JPEG。
 
-        mask 缓存在服务端（_som_cache），供后续 som_pick 按 mask_id 引用；
+        mask 缓存在服务端（_som_cache），供后续 pick_segment 按 mask_id 引用；
         overlay 中每个 mask 半透明着色并在质心标注 mask_id。
         """
         if self.sam is None or not self.sam.available:
@@ -1167,7 +1167,7 @@ class MappingServer:
             meta["mime_type"] = "image/jpeg"
         return meta, (jpeg or b"")
 
-    def som_pick(self, frame_id, mask_ids):
+    def pick_segment(self, frame_id, mask_ids):
         """按 mask_id 注册候选（质心 + 实例 mask），供 commit 流程复用。"""
         fid = int(frame_id)
         cached = self._som_cache.get(fid)
@@ -1195,7 +1195,7 @@ class MappingServer:
                 "bbox": meta.get("bbox"),
                 "refined": True,
             })
-        self._diag_write({"cmd": "som_pick", "frame_id": fid,
+        self._diag_write({"cmd": "pick_segment", "frame_id": fid,
                           "mask_ids": [int(v) for v in (mask_ids or [])][:16],
                           "num_candidates": len(candidates)})
         return {"candidates": candidates}
@@ -1650,8 +1650,8 @@ class MappingServer:
             resp, overlay = self.som_segment(
                 int(header["frame_id"]), header.get("max_masks"))
             return {"ok": True, **resp}, overlay
-        if cmd == "som_pick":
-            return {"ok": True, **self.som_pick(
+        if cmd == "pick_segment":
+            return {"ok": True, **self.pick_segment(
                 int(header["frame_id"]), header.get("mask_ids", []))}, b""
         if cmd == "resolve_candidate":
             return {"ok": True, **self.resolve_candidate(

@@ -80,11 +80,12 @@ class VLMDecisionClient:
             timeout=float(os.environ.get("NAV_VLM_TIMEOUT", "45")),
             enabled=_env_bool("NAV_VLM_ENABLED", configured))
 
-    def agentic_chat(self, user_prompt, images=None):
+    def agentic_chat(self, user_prompt, images=None, system_prompt=None):
         """决策层 agentic 循环低层接口：自由 prompt + 原始 JPEG 字节图像
         列表，返回解析后的 JSON dict；API 不可达自动回退 None（调用方
         走确定性规则），并打 warning。复用同一 HTTP/JSON 解析通路。"""
-        return self.chat_json(user_prompt, images, trace_kind="decision")
+        return self.chat_json(user_prompt, images, trace_kind="decision",
+                              system_prompt=system_prompt)
 
     def probe(self):
         """Perform a real minimal generation so quota/auth failures fail fast."""
@@ -99,7 +100,8 @@ class VLMDecisionClient:
                     parsed)
         return isinstance(parsed, dict) and parsed.get("ok") is True
 
-    def chat_json(self, user_prompt, images=None, trace_kind="json"):
+    def chat_json(self, user_prompt, images=None, trace_kind="json",
+                  system_prompt=None):
         """Focused structured visual call outside the decision tool loop.
 
         Entity identity resolution uses this path so its comparison does not
@@ -110,7 +112,8 @@ class VLMDecisionClient:
         prompt = str(user_prompt)
         image_parts = self._image_parts(images)
         payload = self._build_payload(
-            prompt, image_parts, self.JSON_SYSTEM, self.json_mode)
+            prompt, image_parts, system_prompt or self.JSON_SYSTEM,
+            self.json_mode)
         response = self._send(payload)
         parsed = self._extract_json(response)
         self._trace(str(trace_kind), prompt, image_parts, response, parsed)

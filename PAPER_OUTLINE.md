@@ -4,12 +4,35 @@
 
 ### 1. Introduction
 
-- 具身导航是许多具身任务的基础能力，随着具身智能的发展，具身导航备受关注。
-- 列出现在具身导航benchmark(habitat objectnav、HM3D-ovon、goat、LH-VLN)的发展，指出它们从单目标扩展到focus on lifelong的顺序多目标。
-- 但这个方向实际上仍然是对单目标任务的拼接，缺少决策空间来量化agent的规划能力，缺少对实例的状态维护能力的考查。
-- 通过接待客人时 “找3个椅子”  和洗衣服前 “找到所有衣服” 这样的现实任务需求，引出目标子集选择、访问排序、实例追踪和未知数量下的终止判断。
-- 提出 MOS/MOC、结果指标与过程诊断，以及可审计的参考 agent。
-- 贡献收敛为三项：任务与数据；评测与诊断体系；系统baseline与实证发现。
+具身导航是完成具身任务（家庭服务、仓储集货、巡检清点）的基础能力,具身智能的发展使得具身导航领域备受关注。为了量化agent的具身导航能力，具身导航benchmark应运而生。
+
+现有的具身导航benchmark(habitat objectnav、HM3D-ovon、goat、LH-VLN)有两条发展主线。一是从单模态扩展到多模态，二是从单目标导航发展到复杂的顺序多目标导航（在agent找到一个目标后保留agent的记忆并分配下一个任务，这种任务 focus on lifelong navigatin）。
+
+但真实服务/家居任务远非这么理想化：接待客人前要"找到 3 把椅子并搬过来"、洗衣前要"收齐家里各处所有换洗衣物"、餐厅要"清点并回收全部餐盘"。agent需要自己并发地寻找多个目标并且按照要求不重复地找齐目标，这需要agent具有目标子集选择、访问排序、实例追踪和未知数量下的终止判断。但现有工作仍然是对单目标任务的拼接，缺少决策空间来量化agent的规划能力，缺少对实例的状态维护能力的考查。
+
+为了补充，我们提出ourbenchmark： Many-Object Navigation（ManyON）/All-Object Navigation（AllON）、结果指标与过程诊断，以及可审计的参考 agent。
+
+贡献收敛为三项：任务与数据；评测与诊断体系；系统baseline与实证发现。
+
+Embodied navigation is a foundational capability for embodied tasks ranging from household assistance to warehouse order-picking because agents typically need to reach a target location before executing downstream manipulations. As embodied intelligence advances, a series of benchmarks have emerged to quantify how well agents navigate.
+
+Existing embodied navigation benchmarks have progressively extended the task horizon. Starting from single-goal episodes [Habitat ObjectNav], a line of works has moved toward sequential multi-goal navigation, in which the agent is assigned the next goal upon reporting completion of the current one, while retaining its memory of the environment across goals [MultiON, GOAT, LH-VLN]. This lifelong setting substantially extends the temporal scope of agent operation, making environmental memory retention and long-horizon efficiency important evaluation targets. However, regardless of how long the task horizon grows, the task structure itself remains fixed: goals, their order, and count are always given to the agent in advance.
+
+Real-world service and household tasks, however, expose a property the line leaves untouched: how much of the task the agent must decide for itself. For instance, before hosting guests, a robot is asked to "find three chairs and bring them over"; before doing laundry, to "collect all the clothes scattered around the house"; in a restaurant, to "round up all the dishes." Serving such requests requires the agent to decide which subset of candidate instances to visit and in what order, to track which instances it has already found so that each is reported exactly once, and to judge whether the search is complete when the total count is not given. Existing sequential multi-goal benchmarks exercise none of these capabilities: (i) the goal order is prescribed by the instruction, so the agent never selects a subset or ranks its visits, whereas unordered multi-instance tasks induce a combinatorial space of subset choices and visit orderings; (ii) working-memory demands remain weak, as the agent tracks only the current sub-goal rather than the growing set of already-found instances; (iii) termination is never in question, since the goal count is known and a scheduler hands over the next sub-task; and (iv) existing metrics score the outcome of ordered execution but cannot attribute failure to a specific cause: whether the agent failed to recognize the targets, chose a poor subset, ordered a suboptimal visit, or stopped at the wrong time. We argue that these capabilities constitute a largely unexplored dimension for navigation benchmarks — decision autonomy: beyond how long agents operate, this dimension asks how much of a multi-object task the agent must plan and decide on its own.
+
+To close this gap, we present XXX-Bench, a benchmark for multi-object navigation built around two tasks. In Many-Object Navigation (ManyON), the agent must find $k$ distinct instances that match the goal, in a visiting order of its own choosing, within a step budget. In All-Object Navigation (AllON), the total number of instances is withheld, and the agent must find every instance and actively signal completion once it judges the search to be complete. In both tasks, goals can be specified by a category name, a natural-language description, or a reference image. XXX-Bench comprises 750 episodes built on 36 scenes from the HM3D dataset, with controlled target counts, scene scales, and description types.
+
+The evaluation protocol in XXX-Bench mirrors the four gaps identified above. A compact leader-board (Success Rate, Success Rate by Length, and de-duplication-aware Precision/Recall/F1) scores the final outcome, while process-level diagnostics attribute performance to its sources: a multiplicative decomposition of path inefficiency into search-side (coverage, search quality) and planning-side (target selection, ordering) factors measures how well the agent exploits its ordering freedom; a repeated-target-selection rate probes instance memory; and a stopping-regret measure evaluates termination decisions in AllON. Choice-opportunity statistics further verify that genuine decision spaces actually arise rather than being degenerate. Each diagnostic corresponds to a failure mode we observe in practice, rather than a purely theoretical construct.
+
+We further contribute an auditable reference agent that serves both as a baseline and as a measurement instrument for the diagnostics above. The agent follows a harness design: the VLM performs only high-level cognition — planning, retrieval, verification, and arbitration — while deterministic modules handle perception, memory, and execution, all exposed as callable tools with fully traced decisions. Experiments show that XXX-Bench is far from saturated: the reference agent reaches only [X]\% success on AllON. Its failures are attributable rather than opaque — choice opportunities with multiple instantiated candidates arise in [X]\% of decision steps, non-greedy target choices carry measurable cost consequences, efficiency losses decompose cleanly into search-side and planning-side terms, and stopping emerges as a genuine decision point with non-trivial regret. 
+
+To summarize up, our contributions are threefold:
+\begin{itemize}
+\item \textbf{Task and data.} We propose ManyON and AllON, two multi-object navigation tasks that operationalize decision autonomy — free visit order, mandatory deduplication, and, in AllON, self-determined termination — and construct XXX-Bench with 750 episodes across 36 HM3D scenes, supporting category, language, and image goal specifications.
+\item \textbf{Evaluation and diagnostics.} We design a two-level protocol that pairs leaderboard metrics with process-level diagnostics, enabling failures to be attributed to search, selection, ordering, memory, or stopping, rather than collapsed into a single opaque score.
+\item \textbf{Reference system and empirical findings.} We contribute an auditable harness-style VLM agent and show that XXX-Bench is unsaturated, creates genuine and consequential decision spaces, and supports precise localization of where current agents fall short.
+\end{itemize}
+
 
 ### 2. Related Work
 
@@ -19,7 +42,7 @@
 - 以 MultiON、GOAT 为代表的多目标导航 benchmark，本质上是将"多目标导航"简化为"给定顺序的多次单目标导航"；
 - 目标顺序由指令显式给出，agent 只需按序执行 "go to A → go to B → go to C"，每个子任务的决策空间退化为单目标导航问题，Agent 不需要在多个候选目标间做取舍、排序、路径整体规划；
 - 这对 working memory 的要求很弱，只需记住"当前子目标是谁"，无需维护"已找到哪些"和"去过哪里"的复杂状态；
-- 我们的benchmark更进一步，利用 MOS/MOC 补上对搜索规划，实例记忆维护和终止决策能力的测评；
+- 我们的benchmark更进一步，利用 ManyON/AllON 补上对搜索规划，实例记忆维护和终止决策能力的测评；
 - 评测方法论上接续 SPL与 MultiON 的多目标指标；但过程级诊断（U_t、TSQ/OQ，见 §3.3）在现有 benchmark 中普遍缺位。
 
 **2.2 VLM for Exploration and Reasoning**
@@ -33,8 +56,8 @@
 **3.1 任务定义**
 
 - 任务规则定义（观测输入、动作输出、成功标准、agent规格）。
-- MOS：数量已知、顺序未知。
-- MOC：总数未知，要求找全并主动停止。
+- ManyON：数量已知、顺序未知。
+- AllON：总数未知，要求找全并主动停止。
 
 **3.2 数据构建与统计**
 
@@ -94,10 +117,10 @@ VGGT 点云的固有误差由 harness 的确定性模块吸收，而不是暴露
 
 **4.3 为什么 harness 与多目标 benchmark 适配**
 
-MOS/MOC 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的中间地带，harness 是针对这一错位的架构选择：
+ManyON/AllON 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的中间地带，harness 是针对这一错位的架构选择：
 
 - **长时程上下文**：一个 episode 长达数百步。端到端 VLM 逐步决策不仅调用成本高，视觉上下文还会随步数膨胀，早期观察被挤出窗口，而且其中大部分决策并不重要。harness 把低层控制交给确定性执行器（GOTO 执行到底，事件点才交还），决策密度下降约60%，VLM 的注意力只花在真正的决策点上。
-- **记忆（实例状态维护）是 harness 的强项**：MOS/MOC 要求可靠维护"找到过哪些、是否重复、哪里还没探索"。harness 把这些状态外化为显式数据结构：Observation / Instance /ReportClaim 三层记忆保证实例身份与报告幂等；world-state 在每次决策时重建任务账本与最近动作；notes 与分页动作历史让 VLM 自己维护长期工作记忆。记账的正确性、持久性与可审计性由确定性代码保证，VLM 只负责基于记忆做判断。
+- **记忆（实例状态维护）是 harness 的强项**：ManyON/AllON 要求可靠维护"找到过哪些、是否重复、哪里还没探索"。harness 把这些状态外化为显式数据结构：Observation / Instance /ReportClaim 三层记忆保证实例身份与报告幂等；world-state 在每次决策时重建任务账本与最近动作；notes 与分页动作历史让 VLM 自己维护长期工作记忆。记账的正确性、持久性与可审计性由确定性代码保证，VLM 只负责基于记忆做判断。
 - **几何与数值须精确**：尺度、路径代价、可达性、3m 去重半径都是连续数值，VLM 的数值估计不可靠。harness 预计算全部几何量以下发，VLM 不输出世界坐标、不估算尺度。
 - **目标选择、属性判别、终止判断**："这堆候选里哪个最可能是目标""这个区域探索充分了吗、能不能停"依赖语义常识与不确定推理，启发式方法写不出通用规则，harness 恰好把这些决策留给 VLM。实例池让多个已发现候选并行存在，配合预计算的路径代价，目标选择成为显式决策点（这是后文 U_t 分析的结构来源）。
 - **搜索与重访**：harness 用几何+语义双层 frontier 分别显式跟踪，caption 检索让已经看过的区域可以被语义回访，SCAN 处理冷启动。
@@ -114,18 +137,18 @@ MOS/MOC 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不�
 
 | 小节 | 放哪些实验与指标 | 推荐呈现 | 结论与指标的作用 |
 |---|---|---|---|
-| **5.2 Overall Performance** | MOS/MOC 分别报告 SR、F1、SPL-multi、P/R、样本数 | 主结果表 | 建立参考性能；用部分完成指标区分“同样失败但完成程度不同”。单系统低分不能独自证明 benchmark 有效或普遍困难 |
+| **5.2 Overall Performance** | ManyON/AllON 分别报告 SR、F1、SPL-multi、P/R、样本数 | 主结果表 | 建立参考性能；用部分完成指标区分“同样失败但完成程度不同”。单系统低分不能独自证明 benchmark 有效或普遍困难 |
 | **5.3 Scaling with Task Difficulty** | 按目标数量、场景规模、描述类型分组的 SR、Recall、SPL-multi | 少量分桶曲线及置信区间 | 展示性能如何随目标数量变化；复杂的任务对agent架构要求更高；控制/分层报告每个episode |
-| **5.4 Completion versus Stopping in MOC** | 找齐率、正式 SR；找齐并停止/找齐被截断/未找齐主动停/未找齐被截断四类比例；找齐后额外步数、提前停止遗漏数；Stopping Regret 作补充 | 四类结果分布 + 停止成本图 | 分开观察搜索完成与宣布完成；原始量解释问题，Regret 概括代价。未找齐被截断不能直接归因为停止错误；找齐后继续探索不一定意味着当时已有充分停止证据 |
-| **5.5 Decoupling SPL ：Searching and Planning** | 搜索质量 SQ、TSQ、OQ、PE 四因子 + RTSR（单列） | 开篇给出分解等式；log 损失堆叠分解图（乘性转加性）；因子几何均值表；搜索/规划两轴散点 | 核心等式 $SPL\text{-}multi = S \times (SQ \times PE) \times (TSQ \times OQ)$：完成度由 $S$ 承担，效率项乘法归因到搜索侧（发现候选 + 探索移动开销）与规划侧（子集选择 + 访问排序），"同样的低 SPL"由此可区分"没找到"与"没排好"。PE 在确定性执行器下主要反映探索移动，归搜索侧而非低层执行；MOC 无 TSQ（分解只三项）、池欠覆盖时 SQ 记 null 并以 SC 单列、精确/近似 TSP、池不足/未完成单独标识；四因子是归因不是因果失败占比；RTSR 属目标记忆，不进乘法链 |
+| **5.4 Completion versus Stopping in AllON** | 找齐率、正式 SR；找齐并停止/找齐被截断/未找齐主动停/未找齐被截断四类比例；找齐后额外步数、提前停止遗漏数；Stopping Regret 作补充 | 四类结果分布 + 停止成本图 | 分开观察搜索完成与宣布完成；原始量解释问题，Regret 概括代价。未找齐被截断不能直接归因为停止错误；找齐后继续探索不一定意味着当时已有充分停止证据 |
+| **5.5 Decoupling SPL ：Searching and Planning** | 搜索质量 SQ、TSQ、OQ、PE 四因子 + RTSR（单列） | 开篇给出分解等式；log 损失堆叠分解图（乘性转加性）；因子几何均值表；搜索/规划两轴散点 | 核心等式 $SPL\text{-}multi = S \times (SQ \times PE) \times (TSQ \times OQ)$：完成度由 $S$ 承担，效率项乘法归因到搜索侧（发现候选 + 探索移动开销）与规划侧（子集选择 + 访问排序），"同样的低 SPL"由此可区分"没找到"与"没排好"。PE 在确定性执行器下主要反映探索移动，归搜索侧而非低层执行；AllON 无 TSQ（分解只三项）、搜索欠覆盖时 SQ 记 null 并以 SC 单列、精确/近似 TSP、池不足/未完成单独标识；四因子是归因不是因果失败占比；RTSR 属目标记忆，不进乘法链 |
 | **5.6 Target Choice Opportunities and Value** | `U_t` 机会覆盖率；目标非贪心率；离线首选路线比较的胜/平/负及代价差 | 机会覆盖图 + 路线代价差分布 | `U_t` 说明实际出现多个候选；路线差异说明选择具有代价后果；比较 VLM 首选是否比最近目标更有利。具体口径见第 3 节 |
-| **5.7 Budget-Related Action Changes** | 按原始预算剩余比例统计探索、目标访问、核验/调整、报告、主动停止；MOS/MOC 分开 | 分段动作分布 + 样本量；必要时按进度分层 | 展示行为是否随预算阶段变化。进度和候选条件相近时仍有变化，支持与预算压力相关的调整；不声称单凭分布变化证明因果或更优策略 |
+| **5.7 Budget-Related Action Changes** | 按原始预算剩余比例统计探索、目标访问、核验/调整、报告、主动停止；ManyON/AllON 分开 | 分段动作分布 + 样本量；必要时按进度分层 | 展示行为是否随预算阶段变化。进度和候选条件相近时仍有变化，支持与预算压力相关的调整；不声称单凭分布变化证明因果或更优策略 |
 
 ### 6. Discussion and Conclusion （todo）
 
 - 用 5.2–5.8 的证据回答三个问题——任务是否制造了自主选择机会（`U_t`）、选择是否有代价后果（路线比较）、停止与预算是否构成真实决策压力（停止分解、预算行为漂移）。判据是各环节都被实证制造出决策空间，而不是参考 agent 分数低。
 - SPL 乘法分解把效率损失归因到搜索侧与规划侧；失败现象与诊断指标一一对应，指明改进落点。
-- MOS/MOC 补上多目标导航"并行搜索规划"的评测空白；回收三项贡献（任务与数据、评测与诊断、参考系统与实证发现）。
+- ManyON/AllON 补上多目标导航"并行搜索规划"的评测空白；回收三项贡献（任务与数据、评测与诊断、参考系统与实证发现）。
 - and more
 
 

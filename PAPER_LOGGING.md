@@ -23,8 +23,8 @@ JSONL checkpoint 在最终跨 episode 聚合之前写入，Stopping Regret 的�
 |---|---|
 | 主结果 | 原有 `sr / precision / recall / f1 / spl_multi` 和聚合 `metrics` |
 | 规模变化 | 原有目标数量、场景、描述类型；`paper.episode_definition` 保存完整任务定义，`paper.scene_navigable_area_m2` 保存可用的 navmesh 面积 |
-| MOC 停止 | 原有 `report_events / finish_step / all_required_found_step / finished_by_agent / timed_out / stopping_regret_*`；`paper.completion` 辅助归类 |
-| 发现池与路径诊断 | 原有池覆盖、TSE/OE/LE/RTSR、精确性字段；`paper.steps` 保存逐步原始池与匹配结果、报告前真值完成集合和动态认领配额 |
+| All-Object Navigation（AllON）停止 | 原有 `report_events / finish_step / all_required_found_step / finished_by_agent / timed_out / stopping_regret_*`；`paper.completion` 辅助归类 |
+| 发现池与路径诊断 | 原有搜索覆盖（SC）、TSQ/OQ/PE/RTSR、精确性字段；`paper.steps` 保存逐步原始池与匹配结果、报告前真值完成集合和动态认领配额 |
 | `U_t` | 原有 `u_t_series` 保持不变；高层决策时刻的重算使用 `paper.agent_trace.decisions[].agent_snapshot.world_pool` 和 `paper.route_reference.decisions[].candidate_matches` |
 | 目标非贪心 | `decisions[].world_state.instances` 中实际呈现的 ID/路径代价，`instances_omitted_ids / instances_unreachable_ids`，及 `output / validation / decision_origin` |
 | 首选路线价值 | 当时的候选匹配、完成集合和剩余配额；`paper.route_reference` 的固定目标距离矩阵与各决策起点距离向量 |
@@ -58,7 +58,7 @@ JSONL checkpoint 在最终跨 episode 聚合之前写入，Stopping Regret 的�
 - 匹配保留阈值内所有候选真值 ID、距离、最近匹配及 `matched/ambiguous/unmatched` 状态；不能将匹配歧义、误识别或不可达的选择无说明删除。
 - `null` 距离表示不可达或不可用，不是 0；矩阵附缺失计数。变换缺失、日志缺失和无适用选择事件也要单独报告覆盖率。
 
-MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计算 `J(最近首选) - J(VLM首选)`，不解释成完整贪心 agent 的任务成绩。
+Many-Object Navigation（ManyON）应检查池是否满足剩余配额，AllON 只评价已知池的访问；计算 `J(最近首选) - J(VLM首选)`，不解释成完整贪心 agent 的任务成绩。
 
 ## 5. 不干扰评测的措施与边界
 
@@ -69,7 +69,7 @@ MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计
 - 已有动态认领配额逻辑保留；仅增加其记录，不修改配额或判分。
 - 不支持用这些日志恢复完整 SLAM/仿真器状态并执行另一策略；它们服务于本文约定的离线分析。
 
-测试覆盖了模型输入/工具反馈/动作不变、MOS/MOC 原有指标逐字段相等、冻结快照不被后续状态修改、同一步多决策关联、缺失接口/磁盘失败容错、跨 run checkpoint 和凭据排除。实际 Habitat/VGGT 服务运行仍需在具备服务和数据的环境中验证。
+测试覆盖了模型输入/工具反馈/动作不变、ManyON/AllON 原有指标逐字段相等、冻结快照不被后续状态修改、同一步多决策关联、缺失接口/磁盘失败容错、跨 run checkpoint 和凭据排除。实际 Habitat/VGGT 服务运行仍需在具备服务和数据的环境中验证。
 
 
 
@@ -82,7 +82,7 @@ MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计
 
 - 定义：时刻 t 已实例化、匹配合法目标且尚未报告的目标数。
 - 报告出现 `U_t >= 2` 的 episode 比例，以及高层决策时刻比例；可附 `U_t >= 3` 子集。
-- 原始 `u_t_series` 按环境步采集，需与高层决策时刻对齐；不把连续路径执行重复计为独立选择，排除 MOS 配额完成后的尾段。
+- 原始 `u_t_series` 按环境步采集，需与高层决策时刻对齐；不把连续路径执行重复计为独立选择，排除 ManyON 配额完成后的尾段。
 - 从“池内有多个目标”进一步筛出当前可选、可达且任务相关的目标选择事件，并报告筛选后的覆盖率。
 - `U_t` 不覆盖仅存在于 caption/视觉记忆、尚未实例化的目标；低值不能证明任务没有规划空间。
 
@@ -98,10 +98,10 @@ MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计
 
 | 任务条件 | 路线比较口径 |
 |---|---|
-| MOS，候选池覆盖剩余配额 | 固定首选后，优化剩余子集与顺序，并满足类别配额 |
-| MOS，仅剩一个目标需求 | 单独报告；同样合法可达时最近目标对纯距离目标已最优 |
-| MOS，池覆盖不足 | 报告比例，跳过完整剩余任务路线比较，不把较少目标的路线与完整任务混比 |
-| MOC | 访问冻结池内所有尚未报告目标；只解释已知目标的排序，不评价未来探索或停止 |
+| ManyON，候选池覆盖剩余配额 | 固定首选后，优化剩余子集与顺序，并满足类别配额 |
+| ManyON，仅剩一个目标需求 | 单独报告；同样合法可达时最近目标对纯距离目标已最优 |
+| ManyON，搜索覆盖不足 | 报告比例，跳过完整剩余任务路线比较，不把较少目标的路线与完整任务混比 |
+| AllON | 访问冻结池内所有尚未报告目标；只解释已知目标的排序，不评价未来探索或停止 |
 
 - 报告有效机会/可比较样本覆盖率、目标非贪心率，以及非贪心事件中的胜/平/负比例和 `Delta_t` 分布。
 - 错误实例、不可达或缺少距离的选择单独计数，不能无说明删除；如用真值合法性筛选，明确为条件化诊断。
@@ -112,8 +112,8 @@ MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计
 
 - 按 `steps_remaining / max_steps` 分四段，以原始预算为分母，不按实际结束时间归一化。
 - 统计高层决策事件，统一动作类别；工具核验若单独分析，应使用独立分母，不与高层动作频次混算。
-- MOS/MOC 分开，报告每段有效决策数及 episode 数；注意晚段只剩长轨迹的样本构成变化。
-- 样本允许时按任务进度、可选实例/frontier 数和决策事件类型分层；MOS 排除配额完成后的尾段，MOC 可使用当时可见的已报告数等状态。
+- ManyON/AllON 分开，报告每段有效决策数及 episode 数；注意晚段只剩长轨迹的样本构成变化。
+- 样本允许时按任务进度、可选实例/frontier 数和决策事件类型分层；ManyON 排除配额完成后的尾段，AllON 可使用当时可见的已报告数等状态。
 - 主动 FINISH 与预算/超时截断分开，VLM 原始提议与 harness 改写动作分开；不把评测器截断当模型决策。
 - 结论表述为“与预算阶段/压力相关的行动调整”；分布不变也不能证明预算没有作用。
 
@@ -125,4 +125,4 @@ MOS 应检查池是否满足剩余配额，MOC 只评价已知池的访问；计
 - **归档：** 逐 episode 结果 JSON、`decision_trace.jsonl`、含完整 prompt 的 `vlm_calls.jsonl`、配套图像与动作日志，以及模型/配置/代码版本和 run/episode 标识。
 - **数据依赖：** `decision_trace` 只有状态摘要，目标代价与最新候选应从完整 VLM 输入恢复；静态路线计算还需当时位置、候选坐标/身份及相应距离信息。缺失时报告不可分析数量，不用未来状态补齐当时知识。
 
-相关设计：[BENCHMARK_DESIGN.md](BENCHMARK_DESIGN.md)、[AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md)。
+相关设计：[PAPER_OUTLINE.md](PAPER_OUTLINE.md)（benchmark 定义与论文框架）、[AGENT_ARCHITECTURE.md](AGENT_ARCHITECTURE.md)（agent 系统架构）。

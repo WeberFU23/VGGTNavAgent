@@ -1,6 +1,50 @@
-# VGGT-Nav Agent 架构文档
+# VGGT-Nav Agent
 
-论文诊断日志已补充结构化候选快照、决策/模型调用关联、原始提议与处理后动作，以及只读 `get_paper_trace()` 接口。字段、分析口径和非干扰边界见 [PAPER_LOGGING.md](PAPER_LOGGING.md)；该旁路不进入模型输入。
+> 与论文 benchmark（ManyON / AllON 多目标具身导航）配套的**参考 agent**：
+> harness 式 VLM 导航系统，同时充当 benchmark 的 baseline 与诊断仪器。
+> 本文档是全项目 README。
+
+本项目是论文 benchmark 的**配套工作**。论文（[PAPER_OUTLINE.md](PAPER_OUTLINE.md)）
+的核心贡献是 benchmark——Many-Object Navigation（ManyON）/ All-Object
+Navigation（AllON）任务、结果指标与过程诊断体系；本仓库实现论文实验所
+依赖的 auditable 参考 agent，承担双重角色：
+
+- **参考实现 / baseline**：以强组件（VGGT-SLAM + SAM 全分割 + 决策 VLM）
+  搭建的基线系统，实证任务可解、分数未饱和（PAPER_OUTLINE.md §4、§5.2）；
+- **诊断仪器**：决策、工具调用、候选审核、尺度锁定全程留痕
+  （`decision_trace.jsonl` / `vlm_calls.jsonl` / `get_target_pool()`），
+  为指标有效性提供"选择存在性"实证证据（本文档 §2 第 8 条、§11）。
+
+> **与 benchmark 的关系**（见 [PAPER_OUTLINE.md](PAPER_OUTLINE.md) 第 2 节）：
+> **核心贡献是 benchmark；agent 是基线并提供诊断。**叙事主线为"任务提出
+> 自主目标选择、任务进度维护与完成判断需求 → 指标量化 agent 的能力 →
+> agent 提供 baseline → 实验展示性能、决策机会与具体瓶颈"。本文件只讲述
+> agent 一侧的系统设计，benchmark 的任务、指标与实验设计见 PAPER_OUTLINE.md。
+
+## 文档地图
+
+| 文档 | 内容 |
+|---|---|
+| [PAPER_OUTLINE.md](PAPER_OUTLINE.md) | 论文全文框架：任务定义（§3.1–3.2）、评测指标体系（§3.3，含 SC/SQ、TSQ/OQ/PE、RTSR、U_t、NE/OSR 等）、参考 agent 章节（§4）、实验设计（§5） |
+| [PAPER_LOGGING.md](PAPER_LOGGING.md) | 论文实验数据的采集与读取口径：输出文件与 manifest、各分析读取的字段、决策快照与动作关联、目标选择离线比较口径 |
+| 本文档 | agent 系统架构详解：harness 设计思想，感知 / 记忆 / 决策 / 执行各层，评测采集接口 |
+
+最近一轮改动向日志体系补充了结构化候选快照、决策/模型调用关联、原始提议
+与处理后动作，以及只读 `get_paper_trace()` 接口（字段与分析口径见
+PAPER_LOGGING.md）；该旁路不进入模型输入。
+
+## 仓库结构
+
+| 目录 / 文件 | 职责 |
+|---|---|
+| `agents/` | 高层状态机（`nav_agent.py`）、三层去重记忆（`memory.py`）、执行层（`navigator.py`：占据栅格 / A* / 路径跟随 / 碰撞恢复）、探索（`skeleton.py`）、路径排序回退（`planner.py`）、鸟瞰图渲染（`map_render.py`） |
+| `decision/` | 决策 harness：工具循环（`agent_loop.py`）、提示词（`prompts.py`）、trace（`trace.py`）、VLM 网关（`vlm.py`） |
+| `mapping/` | VGGT-SLAM 服务端：关键帧（`keyframes.py`）、caption 与 BGE 检索（`caption_store.py`）、pointing / SAM 后端（`sam_backend.py`）、尺度标定（`scale_calibration.py`）、决策 VLM 网关（`vllm_client.py`） |
+| `tests/` | 单元 / 集成测试 |
+| `scripts/` | 运维：映射服务启动（`run_mapping_server.sh`）、正式跑批（`run_formal10_*.sh`）、VGGT-SLAM 安装（`setup_vggtslam.sh`）、trace 阅读（`pretty_vlm_log.py`）、只读诊断检查（`diagnostics/`）、远端工具（`remote/`） |
+| `_benchmark_eval/` | benchmark 评测 harness（`evaluate.sh`、episode 定义、task adapter），agent 的配套测评平台 |
+| `VGGT-SLAM/` | 单目重建后端子模块 |
+| `runtime_paths.py` | 路径配置 |
 
 ## 1. 概述：harness 设计思想
 
@@ -23,14 +67,13 @@
 建立永久黑名单。凡是能由 VGGT 点云恢复出有效 3D 点的像素都可以成为
 可导航 instance；类别与任务匹配关系由 VLM 根据证据持续判断。
 
-在与 benchmark 的关系上，本系统承担双重角色：**参考实现**（用强组件
-搭建的 baseline，证明任务可解且不饱和）与**诊断仪器**（决策、工具、
-审核、尺度全程留痕，为 benchmark 的有效性提供实证证据——见第 2 节
-第 8 条与 BENCHMARK_DESIGN.md 3.6）。
+在与 benchmark 的关系上，本系统承担双重角色（**参考实现**与
+**诊断仪器**）：基准分数与诊断证据的完整论述见文档开头的项目定位，
+对应指标定义见 [PAPER_OUTLINE.md](PAPER_OUTLINE.md) §3.3。
 
 ### 1.1 为什么用 harness 应对这类任务
 
-MOS/MOC 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的
+Many-Object Navigation（ManyON）/All-Object Navigation（AllON）任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不覆盖的
 中间地带，harness 是针对这一错位的架构选择：
 
 - **长时程 vs 上下文与成本**：一个 episode 长达数百步。端到端 VLM
@@ -38,7 +81,7 @@ MOS/MOC 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不�
   早期观察必然被挤出窗口。harness 把低层控制交给确定性执行器
   （GOTO 执行到底、事件点才交还），决策密度降到每 300 步 12–20 次，
   VLM 的注意力只花在真正的决策点上。
-- **记忆是 harness 的结构性强项，而 VLM 单靠上下文做不到**：MOS/MOC
+- **记忆是 harness 的结构性强项，而 VLM 单靠上下文做不到**：ManyON/AllON
   要求可靠维护"找到过哪些、是否重复、哪里还没探索"——这正是 benchmark
   的核心考点之一。harness 把这些状态外化为显式数据结构：三层去重记忆
   保证实例身份与报告幂等，world-state 每步重建任务账本与最近动作，
@@ -103,8 +146,8 @@ MOS/MOC 任务的要求恰好落在"端到端 VLM"与"纯启发式管线"都不�
    U_t 时间序列、frontier 选择非贪心率、预算压力行为漂移、工具调用链
    深度等"选择存在性"证据均可从 trace 离线算出，用于实证检验
    benchmark 是否真的在搜索、选择、判别、终止各环节制造了决策空间
-   （指标定义见 BENCHMARK_DESIGN.md 3.6）；诊断层各指标对应的失败模式
-   （重复报告、提前终止、池覆盖不足等）也都在本系统的实测中被真实
+   （指标定义见 [PAPER_OUTLINE.md](PAPER_OUTLINE.md) §3.3）；诊断层各指标对应的失败模式
+   （重复报告、提前终止、搜索覆盖不足等）也都在本系统的实测中被真实
    观测到，形成指标设计的存在性证明。
 
 ## 3. 系统架构总览
@@ -535,7 +578,7 @@ trace 开关时内联。
 ## 11. 评测采集接口 `get_target_pool()`（只读旁路）
 
 benchmark 评测器在每步 `act()` 之后调用 `NavAgent.get_target_pool()`，
-统计"已实例化但未上报的目标"（U_t）与发现池质量。该接口是纯只读旁路：
+统计"已实例化但未上报的目标"（U_t）与发现池的搜索质量（SQ）。该接口是纯只读旁路：
 不写任何导航/决策状态，不复用也不影响 `NAV_ORACLE_GEOMETRY` 消融开关，
 不做网络/磁盘 IO，O(实例数)，每次调用现算（实例点随回环刷新，不缓存
 结果）。

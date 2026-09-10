@@ -270,10 +270,14 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   repeatedly selecting the first marker in a stalled branch.
 - SCAN: spin 360 degrees in place (12 left turns, four sampled views).
   It only shows what is visible from your current position — it cannot
-  reveal other sides of an object, so it cannot verify a candidate. Use
-  it to survey your surroundings when the map and captions suggest
-  nothing useful; to see an object from another angle, move around it
-  instead (GOTO_INSTANCE / START_ADJUST).
+  reveal other sides of an object, so it cannot verify a candidate.
+  Frontier legs only look straight ahead: whenever a leg ends in a new
+  or unfamiliar area, SCAN first to survey all directions — it is the
+  cheapest way to spot targets and side rooms you just walked past.
+  Also use it when the map and captions suggest nothing useful. To see
+  an object from another angle, move around it instead (GOTO_INSTANCE
+  / START_ADJUST); a quick TURN_LEFT/RIGHT look-around is available
+  inside START_ADJUST.
 - START_ADJUST (takeover): short local adjustment when the camera pose
   needs refinement, or a small turn/step would reveal unseen space. Prefer
   it when no frontier or instance looks promising. During takeover tools
@@ -353,13 +357,14 @@ when in doubt between reporting a near/confirmed target and walking away
 to explore more, REPORT.
 
 FINISH: you never call it. The harness ends the episode automatically once
-goals_unfound is empty. Your only job is to find and report every target
+task.found (distinct instances reported) reaches task.goals_total, even if
+photo bindings remain incomplete. Your job is to find and report every target
 before the step budget runs out.
 
 # What you receive at each decision
 
 1. A JSON world state:
-   - task: goal / mode (always "all" here) / found (photos checked off) /
+   - task: goal / mode (always "all" here) / found (instances reported) /
      goal_descriptions / goals_unfound / goal_conflicts (see Memory below).
    - step, max_steps, steps_remaining: your action budget. Plan around it.
    - instances: candidate targets registered so far (see Memory below). A
@@ -616,10 +621,14 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   branch.
 - SCAN: spin 360 degrees in place (12 left turns, four sampled views).
   It only shows what is visible from your current position — it cannot
-  reveal other sides of an object, so it cannot verify a candidate. Use
-  it to survey your surroundings when the map and captions suggest
-  nothing useful; to see an object from another angle, move around it
-  instead (GOTO_INSTANCE / START_ADJUST).
+  reveal other sides of an object, so it cannot verify a candidate.
+  Frontier legs only look straight ahead: whenever a leg ends in a new
+  or unfamiliar area, SCAN first to survey all directions — it is the
+  cheapest way to spot targets and side rooms you just walked past.
+  Also use it when the map and captions suggest nothing useful. To see
+  an object from another angle, move around it instead (GOTO_INSTANCE
+  / START_ADJUST); a quick TURN_LEFT/RIGHT look-around is available
+  inside START_ADJUST.
 - START_ADJUST (takeover): short local adjustment when the camera pose
   needs refinement, or a small turn/step would reveal unseen space. Prefer
   it when no frontier or instance looks promising. During takeover tools
@@ -664,7 +673,7 @@ Stop calling tools as soon as the supplied evidence is sufficient.
   an instance you have not approached, and never report the same physical
   instance twice.
 - FINISH: not yours to call — the harness ends the episode automatically
-  once every goal_image_N is found.
+  once the number of distinct instances reported reaches task.goals_total.
 
 Cold start: if new_keyframes and relevant_frames are absent and there are no instances yet, no
 observations have been collected, so retrieval tools will return nothing.
@@ -830,7 +839,8 @@ def _image_goal_section(task):
         "not-yet-found targets are attached). task.goal_descriptions gives "
         "a text description per goal_image_N; task.goals_unfound lists the "
         "indexes still to find. The harness FINISHes the episode "
-        "automatically once every goal_image_N is marked found — you never "
+        "automatically once task.found (instances reported) reaches "
+        "task.goals_total, regardless of incomplete photo bindings — you never "
         "need to (and should not) call FINISH yourself; until then keep "
         "searching for the remaining goals. "
         "You can also spot targets yourself: whenever you see an outlined "

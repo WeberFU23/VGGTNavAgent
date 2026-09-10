@@ -1,7 +1,8 @@
 """图像目标（image-goal）支持回归测试。
 
-覆盖：模式检测与收图、冷启动描述与失败回退、决策附件只含未找到目标、
-goal_index 记账链（实例化 -> 实例 -> report 撤下）、description 模式不受影响。
+覆盖：模式检测与收图、冷启动描述与失败标记（不可用而非任务句占位）、
+决策附件只含未找到目标、goal_index 记账链（实例化 -> 实例 -> report 撤下）、
+description 模式不受影响。
 """
 
 import os
@@ -81,13 +82,28 @@ def test_description_mode_untouched():
     assert agent._goal_images_payload() == []
 
 
-def test_cold_start_description_fallback():
+def test_cold_start_description_unavailable_not_faked():
+    """冷启动描述生成失败：标记为空（不可用），不再用任务句伪装有效
+    描述；检索查询跳过它，但照片仍随决策附件发给 VLM。"""
     vlm = _FakeVLM(None)  # API 失败
     agent = _make_agent(vlm)
     obs = _obs(goal_type="image", goal_images=[_goal_rgb(1)])
     agent._last_observation = obs
     agent._capture_goal_images(obs)
-    assert agent._goal_descriptions == ["Find the target"]
+    assert agent._goal_descriptions == [""]
+    assert agent._goal_retrieval_queries() == []
+    assert [label for label, _ in agent._goal_images_payload()] == [
+        "goal_image_0"]
+
+
+def test_cold_start_description_rejects_task_sentence_echo():
+    """VLM 原样复述任务句也不算有效描述，必须留空等待重试。"""
+    vlm = _FakeVLM("goal_image_0: Find the target")
+    agent = _make_agent(vlm)
+    obs = _obs(goal_type="image", goal_images=[_goal_rgb(1)])
+    agent._last_observation = obs
+    agent._capture_goal_images(obs)
+    assert agent._goal_descriptions == [""]
 
 
 def test_payload_excludes_found_goals():
@@ -321,19 +337,53 @@ def test_image_system_prompt_split():
     assert '"tool_call":' in image
 
 
-def test_image_mode_force_finish_when_all_goals_found():
+def test_image_mode_force_finish_when_report_quota_reached():
     agent = _make_agent(_FakeVLM("goal_image_0: clock\ngoal_image_1: chair"))
     agent._capture_goal_images(_obs(
         goal_type="image", goal_images=[_goal_rgb(1), _goal_rgb(2)]))
     agent._target_mode = "all"
-    agent.decision_loop = None  # 强制走确定性路径
+    agent._decider_should_finish = lambda obs: (_ for _ in ()).throw(
+        AssertionError("image finish must not consult VLM"))
     obs = _obs(step=100)
     # 未找齐：不结束（step=100 也达不到规则兜底的 late 条件）
-    agent._goal_found = {0}
+    agent._reported_count = 1
+    agent._goal_found = {0, 1}  # Photo checklist cannot override report count.
     assert agent._should_finish(obs) is False
-    # 找齐：无需 VLM 参与，强制 FINISH
-    agent._goal_found = {0, 1}
+    # Unbound reports still satisfy the quota.
+    agent._reported_count = 2
+    agent._goal_found = set()
     assert agent._should_finish(obs) is True
+    agent._reported_count = 3
+    assert agent._should_finish(obs) is True
+
+
+def test_image_report_quota_finishes_on_next_act():
+    from benchmark_api import Action
+    from agents.decision_state import build_world_state
+
+    agent = _two_goal_agent()
+    obs = _obs(step=101, goal_type="image")
+    for point in ([0, 0, 0], [4, 0, 0]):
+        node = agent.instance_store.add(point, "target")
+        agent.target_instance_id = node.iid
+        assert agent._report_found(node.iid) == int(Action.TARGET_FOUND)
+    assert agent._goal_found == set()
+    state = build_world_state(agent, obs, start_xy=[0, 0], scale=1.0)
+    assert state["task"]["found"] == 2
+    assert state["task"]["goals_unfound"] == [0, 1]
+    assert state["task"]["goals_matched_count"] == 0
+
+    agent._feed_frame = lambda obs: None
+    agent._capture_pool_world_anchor = lambda obs: None
+    agent._record_and_update = lambda obs, action: None
+    assert agent.act(obs) == int(Action.FINISH)
+
+
+def test_empty_image_list_does_not_finish_immediately():
+    agent = _make_agent()
+    agent._image_goal_mode = True
+    agent._goal_images = []
+    assert agent._should_finish(_obs()) is False
 
 
 def test_force_finish_not_applied_in_description_mode():
@@ -342,3 +392,22 @@ def test_force_finish_not_applied_in_description_mode():
     agent.decision_loop = None
     agent._goal_found = {0}  # description 模式下此集合不应生效
     assert agent._should_finish(_obs(step=100)) is False
+
+
+def test_missing_descriptions_retried_with_backoff():
+    """论断 6 补全：描述缺失的 goal 每隔 query_interval 步只补缺失项
+    重试，间隔内节流不再调用。"""
+    vlm = _FakeVLM(None)  # 冷启动失败
+    agent = _make_agent(vlm)
+    obs = _obs(goal_type="image", goal_images=[_goal_rgb(1)])
+    agent._last_observation = obs
+    agent._capture_goal_images(obs)
+    assert agent._goal_descriptions == [""]
+    calls_before = len(vlm.chat_calls)
+    # 间隔不足：节流，不重试
+    agent._retry_goal_descriptions(_obs(step=5, goal_type="image"))
+    assert len(vlm.chat_calls) == calls_before
+    # 到达间隔：重试成功补齐
+    vlm.description_reply = "goal_image_0: a brass wall clock"
+    agent._retry_goal_descriptions(_obs(step=25, goal_type="image"))
+    assert agent._goal_descriptions == ["a brass wall clock"]

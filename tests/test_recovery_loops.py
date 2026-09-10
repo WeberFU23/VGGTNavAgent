@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.nav_agent import NavAgent
+from benchmark_api import Action
 from decision import DecisionResult
 
 
@@ -130,3 +131,33 @@ def test_pending_proposal_reingest_is_silent():
     assert agent._last_dup_reviews == []
     assert len(agent.instance_store.nodes) == 1
     assert len(agent.instance_store.observations) == 2
+
+
+# --- 审计论断 2：world_state_updated 决策的 REPORT_FOUND/SCAN 必须分发执行 --
+# （MHPL step73 报告决策被丢弃、6s7 step215 SCAN 变 TURN_RIGHT 的回归）
+
+def _dispatch_agent(decision):
+    agent = _make_agent()
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"rgb")
+    agent._build_decider_input = lambda obs, **kwargs: ({}, None)
+    agent._plan_exploration = lambda obs, select=True: None
+    agent.decision_loop = SimpleNamespace(
+        decide=lambda *a, **k: decision, logger=None)
+    return agent
+
+
+def test_world_state_updated_report_found_is_executed():
+    agent = _dispatch_agent(DecisionResult("REPORT_FOUND", "1"))
+    reported = []
+    agent._report_found = lambda iid=None: (
+        reported.append(iid) or int(Action.TARGET_FOUND))
+    action = agent._choose_high_level_target(_obs(), "world_state_updated")
+    assert reported == ["1"]
+    assert action == int(Action.TARGET_FOUND)
+
+
+def test_world_state_updated_scan_is_executed():
+    agent = _dispatch_agent(DecisionResult("SCAN"))
+    action = agent._choose_high_level_target(_obs(), "world_state_updated")
+    assert agent._scanning is True
+    assert action == int(Action.TURN_LEFT)

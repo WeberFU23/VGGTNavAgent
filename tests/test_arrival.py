@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -89,6 +90,63 @@ def test_immediate_goto_arrival_runs_arrival_decision_and_reports():
     assert action == int(Action.TARGET_FOUND)
     assert agent._reported_count == 1
     assert node.reported is True
+
+
+@pytest.mark.parametrize("event", ["world_state_updated", "scan_complete"])
+@pytest.mark.parametrize("active", [False, True])
+def test_global_report_executes_once(event, active):
+    agent = _make_agent()
+    node = agent.instance_store.add([0.5, 0, 0], "gray fabric sofa")
+    agent.target_instance_id = node.iid if active else None
+    agent._estimated_current_pose = lambda: (0.0, 0.0, 0.0)
+    agent._metric_scale_value = lambda: 1.0
+    agent._plan_exploration = lambda *args, **kwargs: None
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
+    agent._build_decider_input = lambda obs: ({"instances": [], "task": {}}, None)
+    agent.decision_loop = SimpleNamespace(decide=lambda *args, **kwargs:
+        DecisionResult("REPORT_FOUND", str(node.iid)))
+
+    action = agent._choose_high_level_target(_obs(), event)
+
+    assert action == int(Action.TARGET_FOUND)
+    assert agent._reported_count == 1
+    assert len(agent.instance_store.report_claims) == 1
+    assert node.reported
+    assert agent.mode == "reported"
+
+
+@pytest.mark.parametrize("event", ["world_state_updated", "scan_complete"])
+def test_global_scan_starts_and_consumes_scan_actions(event):
+    agent = _make_agent()
+    agent._plan_exploration = lambda *args, **kwargs: None
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"current-jpeg")
+    agent._build_decider_input = lambda obs: ({"instances": [], "task": {}}, None)
+    agent.decision_loop = SimpleNamespace(decide=lambda *args, **kwargs:
+        DecisionResult("SCAN"))
+    agent._scan_steps = 9
+    agent._scan_images = [b"stale"]
+
+    assert agent._choose_high_level_target(_obs(), event) == int(Action.TURN_LEFT)
+    assert agent._scanning
+    assert agent._scan_steps == 0
+    assert agent._scan_images == []
+    assert agent._handle_scan(_obs(step=101)) == int(Action.TURN_LEFT)
+    assert agent._scan_steps == 1
+    assert agent._scan_images == [b"current-jpeg"]
+
+
+@pytest.mark.parametrize("pose,scale", [((2.0, 0.0, 0.0), 1.0),
+                                        (None, 1.0),
+                                        ((0.0, 0.0, 0.0), None)])
+def test_nonactive_report_requires_known_nearby_geometry(pose, scale):
+    agent = _make_agent()
+    node = agent.instance_store.add([0, 0, 0], "gray fabric sofa")
+    agent._estimated_current_pose = lambda: pose
+    agent._metric_scale_value = lambda: scale
+
+    assert agent._report_found(str(node.iid)) != int(Action.TARGET_FOUND)
+    assert agent._reported_count == 0
+    assert not node.reported
 
 
 def test_failed_instance_plan_clears_stale_active_target():

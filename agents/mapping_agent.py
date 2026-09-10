@@ -40,6 +40,7 @@ class MappingAgent:
         self.rng = np.random.default_rng(0)
         self._last_visual = None
         self._last_motion_failed = False
+        self._last_motion_status = "unknown"
         self._visual_stall_count = 0
         self.stuck_steps = 0
         self._server_busy = False
@@ -71,6 +72,7 @@ class MappingAgent:
         self.episode_id = None
         self._last_visual = None
         self._last_motion_failed = False
+        self._last_motion_status = "unknown"
         self._visual_stall_count = 0
         self.stuck_steps = 0
         self._server_busy = False
@@ -118,30 +120,7 @@ class MappingAgent:
             self.client.wait_idle(timeout=30.0)
         rgb = observation.rgb
         visual = np.asarray(rgb)[::16, ::16, :3].astype(np.int16)
-        self._last_motion_failed = False
-        if self._last_visual is not None and \
-                observation.previous_action == int(Action.MOVE_FORWARD) and \
-                visual.shape == self._last_visual.shape:
-            delta = float(np.mean(np.abs(visual - self._last_visual)))
-            threshold = float(os.environ.get("MAPPING_STUCK_RGB_DELTA", "1.0"))
-            # RGB alone is weak evidence in textureless corridors. Require two
-            # consecutive static forward observations before discarding a path.
-            if delta < threshold:
-                self._visual_stall_count += 1
-            else:
-                self._visual_stall_count = 0
-            confirm_steps = max(1, int(os.environ.get(
-                "MAPPING_STUCK_CONFIRM_STEPS", "2")))
-            self._last_motion_failed = \
-                self._visual_stall_count >= confirm_steps
-            if self._last_motion_failed and self.calibrator.actions and \
-                    self.calibrator.actions[-1] == int(Action.MOVE_FORWARD):
-                # 上一步命令未产生视觉运动，不把它当作尺度样本或航位
-                # 推算中的真实前进。-1 是内部 no-op，不会发给 benchmark。
-                self.calibrator.actions[-1] = -1
-        else:
-            self._visual_stall_count = 0
-        self._last_visual = visual
+        self._update_visual_motion(visual, observation.previous_action)
         # 实验：喂给 SLAM 前中心裁剪，把 hfov 从 90° 收窄到 VGGT
         # 训练分布内的范围（0.5 -> 约 53°）。只影响 SLAM 输入，
         # agent 自身感知与 benchmark 相机配置不变。
@@ -183,6 +162,31 @@ class MappingAgent:
                   f"queued={info.get('queued_keyframes')} "
                   f"busy={info.get('busy')}")
         return info
+
+    def _update_visual_motion(self, visual, previous_action):
+        """A first static forward observation is unknown, never success."""
+        self._last_motion_failed = False
+        self._last_motion_status = "unknown"
+        if (self._last_visual is not None
+                and previous_action == int(Action.MOVE_FORWARD)
+                and visual.shape == self._last_visual.shape):
+            delta = float(np.mean(np.abs(visual - self._last_visual)))
+            threshold = float(os.environ.get("MAPPING_STUCK_RGB_DELTA", "1.0"))
+            if delta < threshold:
+                self._visual_stall_count += 1
+                confirm = max(1, int(os.environ.get(
+                    "MAPPING_STUCK_CONFIRM_STEPS", "2")))
+                if self._visual_stall_count >= confirm:
+                    self._last_motion_status = "failed"
+                    self._last_motion_failed = True
+                    if self.calibrator.actions and self.calibrator.actions[-1] == int(Action.MOVE_FORWARD):
+                        self.calibrator.actions[-1] = -1
+            else:
+                self._visual_stall_count = 0
+                self._last_motion_status = "succeeded"
+        else:
+            self._visual_stall_count = 0
+        self._last_visual = visual
 
     def _explore_action(self, observation):
         """简单随机探索：默认前进，偶发转向；检测卡住（位置没动）则转向。"""

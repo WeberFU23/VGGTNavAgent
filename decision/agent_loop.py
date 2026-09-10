@@ -10,6 +10,7 @@ VLMDecisionClient.agentic_chat，单测用 mock）。
 """
 
 import json
+import inspect
 import os
 import threading
 import time
@@ -119,6 +120,8 @@ class DecisionLoop:
         # 决策级 API 重试次数（chat_fn 返回 None/异常时），默认 1 次
         self.api_retries = max(
             0, int(os.environ.get("NAV_DECIDER_API_RETRIES", "1")))
+        # (tool, canonical_args) -> 连续失败次数；>=2 次直接拦截不再执行
+        self._tool_fail_counts = {}
         self._trace_session = uuid.uuid4().hex
         self._trace_sequence = 0
         self._trace_record = None
@@ -164,6 +167,7 @@ class DecisionLoop:
             images = self._with_topdown_map(images, map_png)
         tool_calls = 0
         tool_results = []
+        failed_tool_requests = set()
         # decision_window 条目素材：本轮工具调用/结果（截断）、最终被接受
         # 的 reply 与当时附加图片的标签；校验重试的中间废品不进。
         exchange = {"tool_calls": [], "tool_results": [],
@@ -179,6 +183,15 @@ class DecisionLoop:
                           tool_calls)
                 return None
             tool_call = self._extract_tool_call(data)
+            if tool_call and str(tool_call.get("name") or "").upper() in ACTIONS:
+                # Some models wrap an action in tool_call syntax. Treat a
+                # parameter-free action as the decision it clearly expresses.
+                action_name = str(tool_call.get("name") or "").upper()
+                extra = {k: v for k, v in tool_call.items() if k != "name"}
+                if not extra:
+                    data = {"action": action_name, "target_id": None,
+                            "reason": str(data.get("reason") or "")}
+                    tool_call = None
             if tool_call and str(event) == "adjustment":
                 # takeover 期间禁止工具调用：按非法输出走校验失败重试路径。
                 result, err = None, "tools are disabled during adjustment"
@@ -188,7 +201,19 @@ class DecisionLoop:
                         event, state, images, tool_calls, tool_results,
                         exchange)
                 tool_calls += 1
-                feedback, tool_img, ok = self._run_tool(tool_call)
+                signature = json.dumps(tool_call, sort_keys=True,
+                                       ensure_ascii=False, default=str)
+                if signature in failed_tool_requests:
+                    feedback, tool_img, ok = self._tool_error(
+                        str(tool_call.get("name") or ""),
+                        "REPEATED_FAILED_CALL",
+                        "This identical request already failed in this "
+                        "decision. Correct its arguments or choose another "
+                        "available frame/tool.")
+                else:
+                    feedback, tool_img, ok = self._run_tool(tool_call)
+                    if not ok:
+                        failed_tool_requests.add(signature)
                 tool_name = str(tool_call.get("name") or "")
                 tool_results.append(
                     f"Tool {tool_calls}/{self.max_tool_rounds} "
@@ -393,16 +418,32 @@ class DecisionLoop:
         if tool_call is None and isinstance(data.get("tool"), str):
             tool_call = {"name": data["tool"]}
             for key in ("arguments", "args", "parameters"):
-                if isinstance(data.get(key), dict):
-                    tool_call.update(data[key])
+                if key in data:
+                    tool_call[key] = data[key]
                     break
         if isinstance(tool_call, dict):
-            for key in ("arguments", "args", "parameters"):
-                nested = tool_call.get(key)
-                if isinstance(nested, dict):
+            # 循环展开嵌套的 arguments/args/parameters（dict 或 JSON
+            # 字符串），最多 3 层；无法解析的残留键直接丢弃，绝不让
+            # "arguments" 作为 **kwargs 漏进 Python 工具函数
+            # （unexpected keyword argument 类 TOOL_EXCEPTION）。
+            for _pass in range(3):
+                unwrapped = False
+                for key in ("arguments", "args", "parameters"):
+                    if key not in tool_call:
+                        continue
+                    nested = tool_call[key]
+                    if isinstance(nested, str):
+                        try:
+                            nested = json.loads(nested)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            nested = None
                     tool_call = {k: v for k, v in tool_call.items()
                                  if k != key}
-                    tool_call.update(nested)
+                    if isinstance(nested, dict):
+                        tool_call.update(nested)
+                        unwrapped = True
+                    break
+                if not unwrapped:
                     break
         return tool_call
 
@@ -515,6 +556,37 @@ class DecisionLoop:
         return self._serialize_tool_feedback(payload)
 
     def _execute_tool(self, tool_call):
+        """同一参数同一失败连续 >=2 次的调用直接拦截，不再执行。
+
+        拦截返回可纠错的 REPEATED_FAILURE，避免 VLM 在同一无效调用上
+        空转消耗墙钟预算。
+        """
+        name = str(tool_call.get("name") or "")
+        try:
+            cache_key = (name, json.dumps(
+                {k: v for k, v in tool_call.items() if k != "name"},
+                sort_keys=True, default=str))
+        except Exception:
+            cache_key = None
+        if cache_key is not None and \
+                self._tool_fail_counts.get(cache_key, 0) >= 2:
+            return self._tool_error(
+                name, "REPEATED_FAILURE",
+                "this identical call already failed twice; do not retry "
+                "it with the same arguments — change the arguments or "
+                "choose another action")
+        result = self._execute_tool_once(tool_call)
+        if cache_key is not None:
+            ok = bool(result[2]) if isinstance(result, tuple) and \
+                len(result) >= 3 else True
+            if ok:
+                self._tool_fail_counts.pop(cache_key, None)
+            else:
+                self._tool_fail_counts[cache_key] = \
+                    self._tool_fail_counts.get(cache_key, 0) + 1
+        return result
+
+    def _execute_tool_once(self, tool_call):
         """执行工具，返回 (统一 JSON, [(label, bytes)]|None, ok)。
 
         工具返回 dict 中的 "_tool_images"（[[label, bytes], ...] 拒绝证据图）
@@ -571,6 +643,18 @@ class DecisionLoop:
             }
             return (self._trace_feedback(payload),
                     tool_images, True)
+        except TypeError as exc:
+            hint = ""
+            try:
+                params = list(inspect.signature(fn).parameters)
+                hint = (f"; {name} expects arguments: "
+                        + ", ".join(params))
+            except Exception:
+                pass
+            return self._tool_error(
+                name, "BAD_ARGUMENTS",
+                f"{exc}{hint}. Fix the argument names/types and retry, "
+                "or choose another action.")
         except Exception as exc:
             return self._tool_error(name, "TOOL_EXCEPTION", exc)
 
@@ -659,18 +743,16 @@ class DecisionLoop:
                               tool_calls=tool_calls, steps=steps), None
 
     def _enforce_finish(self, result, world_state):
-        """强制终止的硬条件：many 数量未达、image-goal 仍有未找到的
-        目标时拒绝 FINISH；其他判断交给 VLM。"""
+        """Reject FINISH until the many/image report quota is reached."""
         if result.action != "FINISH":
             return result
         task = world_state.get("task", {})
         needs_count = task.get("mode") == "many" \
             and task.get("expected") is not None \
             and task.get("found", 0) < task["expected"]
-        # image-goal: 照片数即目标数，还有未找到的 goal 时不允许
-        # VLM 提前 FINISH（找齐后由 NavAgent._should_finish 强制结束）。
-        image_unfinished = task.get("goal_type") == "image" and bool(
-            task.get("goals_unfound"))
+        image_unfinished = task.get("goal_type") == "image" and (
+            not task.get("goals_total")
+            or task.get("found", 0) < task["goals_total"])
         if not (needs_count or image_unfinished):
             return result
         instances = [item for item in world_state.get("instances", [])

@@ -1288,15 +1288,60 @@ if __name__ == "__main__":
     print("decider tests passed")
 
 
-def test_finish_blocked_in_image_mode_until_all_goals_found():
+def test_finish_blocked_in_image_mode_until_report_quota_reached():
     state = _state()
     state["task"]["goal_type"] = "image"
-    state["task"]["goals_unfound"] = [1]
+    state["task"]["goals_total"] = 2
+    state["task"]["found"] = 1
+    state["task"]["goals_unfound"] = []
     blocked = DecisionLoop(_ScriptedChat([{"action": "FINISH"}])).decide(
         "finish_check", state)
     assert blocked.action == "GOTO_INSTANCE"
     assert blocked.validation == "finish_downgraded"
-    state["task"]["goals_unfound"] = []
+    state["task"]["found"] = 2
+    state["task"]["goals_unfound"] = [0, 1]
     allowed = DecisionLoop(_ScriptedChat([{"action": "FINISH"}])).decide(
         "finish_check", state)
     assert allowed.action == "FINISH"
+
+
+# ------------------------------------------- 工具参数归一化与重复失败拦截
+def test_extract_tool_call_normalizes_nested_and_string_arguments():
+    """审计论断 5a：arguments 为 JSON 字符串、双层嵌套、无法解析的
+    残留键都必须归一化或丢弃，绝不漏进 **kwargs。"""
+    extract = DecisionLoop._extract_tool_call
+    out = extract({"tool": "propose_candidates",
+                   "arguments": "{\"frame_id\": 5}"})
+    assert out == {"name": "propose_candidates", "frame_id": 5}
+    out = extract({"tool_call": {"name": "x",
+                                 "arguments": {"arguments": {"frame_id": 3}}}})
+    assert out == {"name": "x", "frame_id": 3}
+    out = extract({"tool_call": {"name": "x", "arguments": "not json"}})
+    assert out == {"name": "x"}
+    out = extract({"tool_call": {"name": "x", "frame_id": 7}})
+    assert out == {"name": "x", "frame_id": 7}
+
+
+def test_repeated_identical_tool_failure_is_blocked():
+    """审计论断 5c：同一参数同一失败连续 2 次后，第 3 次相同调用直接
+    拦截（REPEATED_FAILURE），不再执行；TypeError 带签名提示。"""
+    calls = []
+
+    def bad_tool(frame_id):
+        calls.append(frame_id)
+        raise TypeError("got an unexpected keyword argument")
+
+    loop = DecisionLoop(lambda *a, **k: None,
+                        tools={"propose_candidates": bad_tool})
+    call = {"name": "propose_candidates", "frame_id": 5}
+    r1 = loop._execute_tool(dict(call))
+    assert r1[2] is False
+    assert "frame_id" in r1[0]  # BAD_ARGUMENTS 带签名提示
+    r2 = loop._execute_tool(dict(call))
+    assert r2[2] is False
+    r3 = loop._execute_tool(dict(call))
+    assert r3[2] is False and "REPEATED_FAILURE" in r3[0]
+    assert calls == [5, 5]  # 第 3 次未执行
+    # 参数不同则不受拦截
+    r4 = loop._execute_tool({"name": "propose_candidates", "frame_id": 6})
+    assert calls == [5, 5, 6] and r4[2] is False

@@ -45,6 +45,10 @@ class NavAgent(MappingAgent):
         self.replan_interval = int(os.environ.get("NAV_REPLAN_INTERVAL", "20"))
         self.nav_collision_limit = max(1, int(os.environ.get(
             "NAV_NAV_COLLISION_LIMIT", "3")))
+        self.nav_no_progress_steps = max(1, int(os.environ.get(
+            "NAV_NAV_NO_PROGRESS_STEPS", "40")))
+        self.nav_target_max_steps = max(1, int(os.environ.get(
+            "NAV_NAV_TARGET_MAX_STEPS", "200")))
         self.nav_escape_turns = max(1, int(os.environ.get(
             "NAV_NAV_ESCAPE_TURNS", "1")))
         self.nav_block_radius_m = max(0.1, float(os.environ.get(
@@ -52,6 +56,10 @@ class NavAgent(MappingAgent):
         self.nav_block_ttl_steps = max(1, int(os.environ.get(
             "NAV_NAV_BLOCK_TTL_STEPS", "30")))
         self.reach_m = float(os.environ.get("NAV_REACH_M", "0.8"))
+        # REPORT_FOUND 放行前的实测距离硬门槛（米）：到达信号与真实距离
+        # 可能脱节（目标点吸附/尺度漂移），超过该距离的报告一律拒绝。
+        self.report_active_max_m = float(os.environ.get(
+            "NAV_REPORT_ACTIVE_MAX_M", "1.5"))
         # 尺度候选的物理合理量程（米/地图单位）：室内场景不可能出界，
         # 界外候选直接丢弃，防止极端噪声成为尺度种子。
         self.scale_plausible_min = float(os.environ.get(
@@ -165,6 +173,7 @@ class NavAgent(MappingAgent):
         # 次后放弃当前目标并触发 nav_failed 决策。explore 模式已有碰撞恢复，
         # nav 模式此前没有——撞墙会永远重规划同一路径直到步数耗尽。
         self._nav_collision_streak = 0
+        self._nav_progress = None
         self._nav_stuck_replanned = False
         self._nav_recovery_queue = []
         self._nav_recovery_stage = 0
@@ -194,6 +203,7 @@ class NavAgent(MappingAgent):
         self._image_goal_mode = False
         self._goal_images = []
         self._goal_descriptions = []
+        self._goal_desc_retry_step = -10 ** 9
         self._goal_found = set()
         self._instance_goal_index = {}
         # goal_index 绑定冲突（一图一实例）：[{goal_index,
@@ -894,12 +904,20 @@ class NavAgent(MappingAgent):
                 snapshot["action_scale_ignored_reported"] = True
             return float(current) if current is not None else 1.0
 
-        if not self.scale_plausible_min <= candidate <= \
-                self.scale_plausible_max:
+        plausible = self.scale_plausible_min <= candidate <= \
+                self.scale_plausible_max
+        if not plausible and current is None:
+            # 绝对物理闸门只管冷启动播种：相机高度量程外的值不可信。
             self._log_event(
                 f"camera-height scale rejected out of range "
                 f"{candidate:.3f} (source={src})")
-            return float(current) if current is not None else 1.0
+            return 1.0
+        if not plausible:
+            # 锁定后的越界候选是 SLAM 全局重缩放的特征，不是噪声：交给
+            # pending 稳定性通道，连续一致即 relock，不再一票否决。
+            self._log_event(
+                f"camera-height scale candidate out of range "
+                f"{candidate:.3f} (source={src}); tracking for relock")
 
         stable_needed = max(2, int(os.environ.get(
             "NAV_GRID_SCALE_STABLE_COUNT", "3")))
@@ -1009,10 +1027,15 @@ class NavAgent(MappingAgent):
         rebuilt = nav.OccupancyGrid.from_frame_points(
             frames, align_R, unit_per_m=unit_per_m)
         if rebuilt is None:
+            # 锁定尺度下重建失败通常意味着 SLAM 重缩放使旧锁失效。冻结导航
+            # 会让 frontier 表停滞、决策空转；本周期降级为 provisional grid
+            # 自带的尺度维持导航，连续一致的候选经 pending 通道 relock 后，
+            # 锁定重建自然恢复。
             self._log_event(
-                "metric grid rebuild failed under locked camera-height scale; "
-                "navigation deferred")
-            return None, None
+                "metric grid rebuild failed under locked camera-height "
+                f"scale {scale:.3f}; falling back to provisional scale "
+                f"{raw_scale:.3f} for this cycle")
+            return provisional, float(raw_scale)
         return rebuilt, float(scale)
 
     def _summarize_frontier_branches(self, frontiers, start_xy, grid, scale,
@@ -1143,20 +1166,35 @@ class NavAgent(MappingAgent):
         self._image_goal_mode = True
         self._goal_images = encoded
         self._goal_descriptions = [""] * len(encoded)
+        self._goal_desc_retry_step = int(getattr(
+            observation, "step_count", 0) or 0)
         self._goal_found = set()
         self._log_event(
             f"image-goal mode: captured {len(encoded)} goal image(s)")
         self._ensure_goal_descriptions()
 
-    def _ensure_goal_descriptions(self):
-        """冷启动：为每张目标照片生成检索友好描述（只调一次，失败回退）。"""
+    def _retry_goal_descriptions(self, observation):
+        """冷启动描述缺失的 goal 每隔 query_interval 步重试一次生成，
+        只补缺失项；缺失期间该 goal 不参与 caption 检索，但照片仍随
+        决策附件发给 VLM（视觉匹配不依赖文字描述）。
+        """
         if not self._image_goal_mode or not self._goal_images:
             return
-        if any(self._goal_descriptions):
+        if all(self._goal_descriptions):
             return
-        images = [(f"goal_image_{i}", payload)
-                  for i, payload in enumerate(self._goal_images)]
-        prompt = (
+        step = int(getattr(observation, "step_count", 0) or 0)
+        if step - self._goal_desc_retry_step < self.query_interval:
+            return
+        self._goal_desc_retry_step = step
+        self._ensure_goal_descriptions()
+
+    def _ensure_goal_descriptions(self):
+        """Generate every goal description, retrying only missing images."""
+        if not self._image_goal_mode or not self._goal_images:
+            return
+        if self._goal_descriptions and all(self._goal_descriptions):
+            return
+        prompt_base = (
             "Each attached image shows one target object outlined by a "
             "bright border. For every image, write one retrieval-friendly "
             "description of the outlined object only: its category and "
@@ -1165,24 +1203,47 @@ class NavAgent(MappingAgent):
             "photo, the room around it, or any other object. Reply with "
             "exactly one line per image, prefixed by its label, e.g. "
             "'goal_image_0: a red folding chair with metal legs'.")
-        try:
-            text = self.vlm.chat_text(prompt, images=images,
-                                      max_tokens=800)
-        except Exception:
-            text = None
-        descs = [""] * len(self._goal_images)
-        if text:
+        descs = list(self._goal_descriptions or
+                     ([""] * len(self._goal_images)))
+
+        def apply_reply(text):
+            if not text:
+                return
             for line in str(text).splitlines():
                 line = line.strip()
                 match = re.match(r"goal_image_(\d+)\s*[:：]\s*(.+)", line)
                 if match:
                     idx = int(match.group(1))
                     if 0 <= idx < len(descs) and not descs[idx]:
-                        descs[idx] = match.group(2).strip()[:300]
-        # 回退：解析不到的索引用原 goal_text 占位，保证字段不为空。
-        fallback = str(getattr(self._last_observation, "goal_text", "") or
-                       "the outlined target object")
-        self._goal_descriptions = [d or fallback for d in descs]
+                        value = match.group(2).strip()[:300]
+                        # The generic task sentence is not a usable retrieval
+                        # description, even if the model echoes it verbatim.
+                        if value.lower() != str(getattr(
+                                self._last_observation, "goal_text", "") or
+                                "").strip().lower():
+                            descs[idx] = value
+
+        missing = [i for i, value in enumerate(descs) if not value]
+        for attempt in range(3):
+            if not missing:
+                break
+            images = [(f"goal_image_{i}", self._goal_images[i])
+                      for i in missing]
+            prompt = prompt_base
+            if attempt:
+                prompt += ("\nThe previous response missed these labels: "
+                           + ", ".join(f"goal_image_{i}" for i in missing)
+                           + ". Describe every attached label now.")
+            try:
+                apply_reply(self.vlm.chat_text(
+                    prompt, images=images, max_tokens=800))
+            except Exception:
+                pass
+            missing = [i for i, value in enumerate(descs) if not value]
+        self._goal_descriptions = descs
+        if missing:
+            self._log_event("goal descriptions unavailable for: " +
+                            ", ".join(f"goal_image_{i}" for i in missing))
         self._log_event(
             f"goal descriptions ready: {self._goal_descriptions}")
 
@@ -1342,6 +1403,7 @@ class NavAgent(MappingAgent):
         return action
 
     def _clear_current_target(self):
+        self._nav_progress = None
         self.target_point = None
         self.target_candidate_id = None
         self.target_instance_id = None
@@ -1395,13 +1457,9 @@ class NavAgent(MappingAgent):
             self.mode = "explore"
             return self._explore_action(observation)
         self._arrival_failures = 0
-        if result.action == "REPORT_FOUND":
-            return self._report_found(result.target_id)
-        if result.action == "SCAN":
-            self._scanning = True
-            self._scan_steps = 0
-            self._scan_images = []
-            return int(Action.TURN_LEFT)
+        immediate = self._execute_report_or_scan(result)
+        if immediate is not None:
+            return immediate
         if result.action == "EXPLORE":
             # _decider_next has already activated the selected frontier.
             return (decided_action if decided_action is not None
@@ -1707,11 +1765,45 @@ class NavAgent(MappingAgent):
                 pass
 
     def _report_found(self, instance_id=None):
-        """Atomically claim and report the active canonical instance."""
+        """Atomically claim an active or geometrically nearby instance."""
         node = self.instance_store.get(instance_id)
-        if node is None or node.iid != self.target_instance_id:
-            self._log_event("ignored REPORT_FOUND not bound to active instance")
+        if node is None:
+            self._log_event("ignored REPORT_FOUND for invalid instance")
             return int(Action.TURN_LEFT)
+        if node.iid != self.target_instance_id:
+            pose = self._estimated_current_pose()
+            scale = self._metric_scale_value()
+            near_m = float(os.environ.get("NAV_REPORT_NEAR_DIST_M", "1.0"))
+            distance = (math.hypot(node.point[0] - pose[0],
+                                   node.point[1] - pose[1]) * scale
+                        if pose is not None and scale is not None else math.inf)
+            if not math.isfinite(distance) or distance > near_m:
+                self._log_event("ignored REPORT_FOUND for non-active distant instance")
+                return int(Action.TURN_LEFT)
+        else:
+            # 到达信号与真实距离可能脱节（目标点吸附/尺度漂移后未回刷）：
+            # 放行前用当前位姿实测到实例点的距离，超阈值拒绝并继续接近。
+            pose = self._estimated_current_pose()
+            scale = self._metric_scale_value()
+            if pose is not None and scale is not None:
+                distance = math.hypot(node.point[0] - pose[0],
+                                      node.point[1] - pose[1]) * scale
+                if distance > self.report_active_max_m:
+                    self._log_event(
+                        f"rejected REPORT_FOUND: active instance "
+                        f"{node.iid} still {distance:.2f}m away "
+                        f"(> {self.report_active_max_m:.2f}m); "
+                        "keep approaching")
+                    # 回刷目标点并沿新路径继续接近，而不是原地重复报告。
+                    self.target_point = np.asarray(
+                        node.point, dtype=np.float64)
+                    self.mode = "nav"
+                    obs = self._last_observation
+                    if obs is not None and self._plan_to_target(obs):
+                        action, arrived, stuck = self._nav_action(obs)
+                        if not arrived and not stuck and action is not None:
+                            return int(action)
+                    return int(Action.TURN_LEFT)
         step = int(getattr(self._last_observation, "step_count", 0) or 0)
         claim = self.instance_store.claim(node, step=step)
         if claim is None:
@@ -3013,6 +3105,7 @@ class NavAgent(MappingAgent):
                 if not any(l == label for l, _ in images):
                     images.append((label, payload))
             state_fn = state_fn or (lambda: self._build_decider_input(observation))
+            self._retry_goal_descriptions(observation)
             state, map_png = state_fn()
             result = self.decision_loop.decide(
                 event, state, map_png, images=images,
@@ -3412,13 +3505,9 @@ class NavAgent(MappingAgent):
                 self._clear_current_target()
                 self.mode = "explore"
             return self._explore_action(observation)
-        if result.action == "REPORT_FOUND":
-            return self._report_found(result.target_id)
-        if result.action == "SCAN":
-            self._scanning = True
-            self._scan_steps = 0
-            self._scan_images = []
-            return int(Action.TURN_LEFT)
+        immediate = self._execute_report_or_scan(result)
+        if immediate is not None:
+            return immediate
         # EXPLORE has already activated the autonomous frontier follower in
         # _decider_next. Clearing here would silently turn it back into random
         # walking after END_ADJUST.
@@ -3532,14 +3621,9 @@ class NavAgent(MappingAgent):
             self._clear_current_target()
             self.mode = "explore"
             return self._explore_action(observation)
-        if result.action == "REPORT_FOUND":
-            # 卡在目标旁边但能直接确认的情况（报告校验仍要求 active id）
-            return self._report_found(result.target_id)
-        if result.action == "SCAN":
-            self._scanning = True
-            self._scan_steps = 0
-            self._scan_images = []
-            return int(Action.TURN_LEFT)
+        immediate = self._execute_report_or_scan(result)
+        if immediate is not None:
+            return immediate
         if result.action == "EXPLORE":
             return (decided_action if decided_action is not None
                     else self._autonomous_explore_action(observation))
@@ -3550,6 +3634,21 @@ class NavAgent(MappingAgent):
         self._clear_current_target()
         self.mode = "explore"
         return self._explore_action(observation)
+
+    def _execute_report_or_scan(self, result):
+        """Execute immediate decisions consistently across event callers.
+
+        _decider_next leaves these actions to its caller; execute them here
+        exactly once, including global and post-scan decisions.
+        """
+        if result.action == "REPORT_FOUND":
+            return self._report_found(result.target_id)
+        if result.action == "SCAN":
+            self._scanning = True
+            self._scan_steps = 0
+            self._scan_images = []
+            return int(Action.TURN_LEFT)
+        return None
 
     def _choose_high_level_target(self, observation,
                                   event="world_state_updated", images=None):
@@ -3563,6 +3662,9 @@ class NavAgent(MappingAgent):
             result, action = self._decider_next(
                 observation, event, images=images)
             if result is not None:
+                immediate = self._execute_report_or_scan(result)
+                if immediate is not None:
+                    return immediate
                 return (action if action is not None else
                         super()._explore_action(observation))
             # 只有模型不可用/非法才进入确定性保底。
@@ -3581,19 +3683,19 @@ class NavAgent(MappingAgent):
         return self._explore_action(observation)
 
     def _should_finish(self, observation):
+        if getattr(self, "_image_goal_mode", False):
+            # Image tasks have a known report quota, independent of photo
+            # bindings. Missing/conflicting goal_index must not block FINISH.
+            total = len(self._goal_images)
+            complete = total > 0 and self._reported_count >= total
+            if complete:
+                self._log_event(
+                    f"image-goal: {self._reported_count}/{total} instances "
+                    "reported -> force FINISH")
+            return complete
         if self._target_mode == "many" and self._target_count is not None:
             return self._reported_count >= int(self._target_count)
         if self._target_mode == "all":
-            # image-goal: 目标照片数即目标数，全部 goal 标记 found 后强制 FINISH，
-            # 不再走 VLM/规则终止判断（找齐后游荡到预算上限是
-            # image 模式的主要失败源）。
-            if (getattr(self, "_image_goal_mode", False)
-                    and self._goal_images
-                    and len(self._goal_found) >= len(self._goal_images)):
-                self._log_event(
-                    "image-goal: all %d goal images found -> force FINISH"
-                    % len(self._goal_images))
-                return True
             if getattr(self, "decision_loop", None) is not None:
                 decided = self._decider_should_finish(observation)
                 if decided is not None:
@@ -4148,6 +4250,14 @@ class NavAgent(MappingAgent):
             return False
         path = self.grid.shortcut(path)
         self.follower.set_path(path)
+        if (self._nav_progress is None or
+                self._nav_progress.get("target_id") != self.target_instance_id):
+            self._nav_progress = {
+                "target_id": self.target_instance_id,
+                "start_step": int(observation.step_count),
+                "last_progress_step": int(observation.step_count),
+                "best_distance_m": math.inf,
+            }
         self._metric_replan_required = False
         self._plan_failures = 0
         dist_m = sum(np.linalg.norm(np.asarray(path[i + 1]) - np.asarray(path[i]))
@@ -4169,6 +4279,30 @@ class NavAgent(MappingAgent):
         except Exception:
             pass
 
+        goal_xy = (self.align_R @ self.target_point)[:2]
+        dist_m = math.hypot(goal_xy[0] - self.follower.x,
+                            goal_xy[1] - self.follower.y) * scale
+        progress = self._nav_progress
+        if progress is None:
+            progress = self._nav_progress = {
+                "target_id": self.target_instance_id,
+                "start_step": int(observation.step_count),
+                "last_progress_step": int(observation.step_count),
+                "best_distance_m": dist_m,
+            }
+        if dist_m + 0.10 < float(progress["best_distance_m"]):
+            progress["best_distance_m"] = dist_m
+            progress["last_progress_step"] = int(observation.step_count)
+        target_age = int(observation.step_count) - int(progress["start_step"])
+        stalled_age = (int(observation.step_count) -
+                       int(progress["last_progress_step"]))
+        if (target_age >= self.nav_target_max_steps or
+                stalled_age >= self.nav_no_progress_steps):
+            self._log_event(
+                f"nav progress timeout target={self.target_instance_id} "
+                f"age={target_age} stalled={stalled_age} dist={dist_m:.2f}m")
+            return None, False, True
+
         # 碰撞恢复不能在同一张地图上直接重规划：它通常会得到原路径并再次
         # 撞墙。失败后先转向脱困，再把前方小段临时封路重规划；多次失败才
         # 放弃目标。只有“上一动作是前进且实际有视觉位移”才清空失败计数，
@@ -4186,7 +4320,8 @@ class NavAgent(MappingAgent):
             turn = (int(Action.TURN_LEFT) if self._nav_collision_streak % 2
                     else int(Action.TURN_RIGHT))
             self._nav_recovery_queue = [turn] * self.nav_escape_turns
-        elif previous == int(Action.MOVE_FORWARD):
+        elif (previous == int(Action.MOVE_FORWARD)
+              and self._last_motion_status == "succeeded"):
             self._nav_collision_streak = 0
             self._nav_stuck_replanned = False
 
@@ -4204,9 +4339,6 @@ class NavAgent(MappingAgent):
                 (None, False, False)
 
         # 到达判定：到原始目标点的水平距离（评测阈值 1.0m，默认 0.8m 留裕量）
-        goal_xy = (self.align_R @ self.target_point)[:2]
-        dist_m = math.hypot(goal_xy[0] - self.follower.x,
-                            goal_xy[1] - self.follower.y) * scale
         if dist_m < self.reach_m:
             return None, True, False
 

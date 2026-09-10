@@ -908,11 +908,39 @@ def test_nav_collision_escapes_then_replans_then_stuck():
     action, arrived, stuck = agent._nav_action(obs)
     assert stuck and action is None and not arrived
     assert agent._nav_collision_streak == 3
-    # 恢复运动后计数清零，可再次进入卡死检测
+    # 恢复运动（确诊成功的位移）后计数清零，可再次进入卡死检测
     obs.previous_action = int(Action.MOVE_FORWARD)
     agent._last_motion_failed = False
+    agent._last_motion_status = "succeeded"
     action, arrived, stuck = agent._nav_action(obs)
     assert agent._nav_collision_streak == 0 and not stuck
+
+
+def test_nav_collision_unknown_forward_keeps_streak():
+    """XB4 死循环回归：恢复转向后第一次静止前进是 unknown（未确诊），
+    绝不能清零碰撞计数；否则 streak 永远停在 1，循环持续到预算耗尽。"""
+    agent = _nav_action_agent()
+    agent._plan_to_target = lambda obs: True
+    obs = SimpleNamespace(step_count=1, previous_action=None)
+    agent._nav_action(obs)
+    # 第一次确诊碰撞 -> streak=1，进入转向脱困
+    obs.previous_action = int(Action.MOVE_FORWARD)
+    agent._last_motion_failed = True
+    agent._nav_action(obs)
+    assert agent._nav_collision_streak == 1
+    # 恢复转向执行完毕（escape_turns=1，同一调用内弹出），重规划一轮
+    obs.previous_action = int(Action.TURN_LEFT)
+    agent._last_motion_failed = False
+    agent._last_motion_status = "unknown"
+    agent._nav_action(obs)
+    # 恢复后第一次静止前进：尚未确诊（unknown），streak 必须保持 1
+    obs.previous_action = int(Action.MOVE_FORWARD)
+    agent._nav_action(obs)
+    assert agent._nav_collision_streak == 1
+    # 第二次静止前进确诊碰撞 -> streak=2，循环最终能到达 limit
+    agent._last_motion_failed = True
+    agent._nav_action(obs)
+    assert agent._nav_collision_streak == 2
 
 
 def test_nav_stuck_recovery_marks_unreachable_and_asks_decider():
@@ -999,6 +1027,44 @@ def test_metric_snapshot_out_of_range_grid_never_seeds():
         assert agent._metric_snapshot["scale"] is None
         agent._update_metric_snapshot(1.1, "calibrator")
     assert agent._metric_snapshot["scale"] is None
+
+
+def test_metric_snapshot_out_of_range_relocks_when_consistent():
+    """HY1N 回归：锁定后 SLAM 全局重缩放会让候选一致越界，绝对闸门
+    只管播种；连续一致的越界候选必须允许 relock，否则导航永久冻结
+    在旧尺度上（grid 重建反复失败、frontier 表停滞）。"""
+    agent = _make_agent()
+    for _ in range(3):
+        agent._update_metric_snapshot(1.774, "grid")
+    assert agent._metric_snapshot["scale"] == 1.774
+    # 地图重缩放：候选一致地跳到 ~6.6（越出绝对闸门），3 连后 relock
+    assert agent._update_metric_snapshot(6.6, "grid") == 1.774
+    assert agent._update_metric_snapshot(6.6, "grid") == 1.774
+    assert agent._update_metric_snapshot(6.6, "grid") == 6.6
+    assert agent._metric_snapshot["scale"] == 6.6
+
+
+def test_metric_grid_rebuild_failure_falls_back_to_provisional():
+    """锁定尺度下重建失败时降级为 provisional 自带尺度维持本周期导航，
+    不再返回 (None, None) 冻结。"""
+    agent = _make_agent()
+    agent._metric_snapshot.update(scale=1.774, source="camera_height",
+                                  revision=1, pending=None, pending_count=0)
+    provisional = SimpleNamespace(unit_per_m=1.0 / 6.6)
+    real = nav.OccupancyGrid.from_frame_points
+
+    def fake_from_frame_points(frames, align_R, unit_per_m=None):
+        if unit_per_m is None:
+            return provisional
+        return None  # 锁定尺度下重建失败
+
+    nav.OccupancyGrid.from_frame_points = staticmethod(fake_from_frame_points)
+    try:
+        grid, scale = agent._build_metric_grid([{"frame_id": 1}], np.eye(3))
+    finally:
+        nav.OccupancyGrid.from_frame_points = staticmethod(real)
+    assert grid is provisional
+    assert abs(scale - 6.6) < 1e-6
 
 
 def test_unreachable_instance_excluded_from_world_state():
@@ -1177,3 +1243,42 @@ def test_metric_snapshot_fast_converge_from_out_of_range_seed():
     assert agent._metric_snapshot["scale"] == 13.1
     agent._update_metric_snapshot(1.15, "grid")
     assert agent._metric_snapshot["scale"] == 1.15
+
+
+# ------------------------------------------------- REPORT_FOUND 距离硬门槛
+def _report_gate_agent(distance_m):
+    agent = _make_agent()
+    node = agent.instance_store.add(
+        [distance_m, 0.0, 0.0], "a brass clock", frame_id=4,
+        candidate_id="c4")
+    agent.target_instance_id = node.iid
+    agent.target_point = np.asarray(node.point, dtype=np.float64)
+    agent._metric_snapshot.update(scale=1.0, source="test", revision=1,
+                                  pending=None, pending_count=0)
+    agent._estimated_current_pose = lambda: (0.0, 0.0, 0.0)
+    return agent, node
+
+
+def test_report_found_active_instance_too_far_is_rejected():
+    """审计论断 4：到达信号与真实距离脱节时，活动实例的报告必须被拒，
+    转为回刷目标点继续接近，不得入账（TEE step328 式 FP 的防线）。"""
+    agent, node = _report_gate_agent(3.9)
+    planned = []
+    agent._plan_to_target = lambda obs: planned.append(1) or True
+    agent._nav_action = lambda obs: (int(Action.MOVE_FORWARD), False, False)
+    agent._last_observation = SimpleNamespace(step_count=100)
+    action = agent._report_found(node.iid)
+    assert action == int(Action.MOVE_FORWARD)
+    assert planned == [1]
+    assert agent._reported_count == 0
+    assert agent.instance_store.report_claims == []
+    assert any("rejected REPORT_FOUND" in e for e in agent._events)
+
+
+def test_report_found_active_instance_within_gate_is_accepted():
+    agent, node = _report_gate_agent(0.7)
+    agent._last_observation = SimpleNamespace(step_count=100)
+    action = agent._report_found(node.iid)
+    assert action == int(Action.TARGET_FOUND)
+    assert agent._reported_count == 1
+    assert len(agent.instance_store.report_claims) == 1

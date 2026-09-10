@@ -202,9 +202,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         task["goals_total"] = len(goal_images)
         task["goals_unfound"] = [i for i in range(len(goal_images))
                                  if i not in found_idx]
-        # image 模式以清单为准：found = 已勾掉的目标照片数（可能少于
-        # _reported_count——未绑定 goal_index 的报告不计入清单）。
-        task["found"] = len(found_idx)
+        # found counts reports, as in other modes. Photo bindings remain a
+        # retrieval checklist, not the termination criterion.
+        task["goals_matched_count"] = len(found_idx)
         # goal_index 绑定冲突（一图一实例被两个实例同时声称），待 VLM 裁决。
         conflicts_fn = getattr(agent, "active_goal_conflicts", None)
         task["goal_conflicts"] = (conflicts_fn() if callable(conflicts_fn)

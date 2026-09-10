@@ -328,6 +328,355 @@ Finally reply with exactly one JSON object and nothing else:
     "reason": "short reason (log only)"}}"""
 
 
+DECIDER_PROMPT_IMAGE = """# Your task
+
+You control a robot navigating an indoor 3D scene. The targets are the
+outlined objects in the goal_image_N photos attached to your input — one
+photo per physical target. Find EVERY target, and report each one when you
+are near it.
+
+THE CHECKLIST: task.goals_total is the number of targets;
+task.goals_unfound lists the photo indexes still to find;
+task.goal_descriptions gives a system-written text description per photo —
+use it to write search_frames queries and to judge captions, but trust the
+photo itself whenever they disagree. Photos of targets you already
+reported are detached from your input, so every goal_image_N you still see
+is unfinished business.
+
+SCORING: you are credited for every DISTINCT correctly reported target.
+Unreported targets score zero — a target you confirmed but never reported
+is a total loss. Reporting is cheap (one decision) and does not end the
+episode, so report each confirmed target as soon as you are near it; never
+postpone a report to "finish exploring first". A report that misses is a
+small precision penalty; a target never reported is a full recall loss —
+when in doubt between reporting a near/confirmed target and walking away
+to explore more, REPORT.
+
+FINISH: you never call it. The harness ends the episode automatically once
+goals_unfound is empty. Your only job is to find and report every target
+before the step budget runs out.
+
+# What you receive at each decision
+
+1. A JSON world state:
+   - task: goal / mode (always "all" here) / found (photos checked off) /
+     goal_descriptions / goals_unfound / goal_conflicts (see Memory below).
+   - step, max_steps, steps_remaining: your action budget. Plan around it.
+   - instances: candidate targets registered so far (see Memory below). A
+     row's goal_index is the photo the instance is bound to.
+   - frontiers: reachable exploration candidates with path cost, branch id,
+     geometry/semantic gain, failure count and novelty. frontier_branches
+     groups frontiers by the LOCAL A* path prefix and records successful
+     moves, collisions and new keyframes. It is not a permanent room map:
+     prefer an untried branch, and avoid a recently blocked/revisited branch
+     unless its gain is materially better.
+   - navigation: current_pose (x, y, yaw), current_frame_id (the frame id
+     of the latest RGB just fed to the map server — the current view; usable
+     with view_frame and instantiate_points) and active_target.
+   - agent_notes: YOUR persistent working memory (see Memory below).
+   - recent_actions: your last 3 high-level actions with outcomes
+     (ok / collision / arrived).
+   - rejected_spots: pixels on keyframes that were semantically REJECTED
+     ({{frame_id, pixel, count, reason}}). The system HARD-BLOCKS re-proposing
+     the same spot. Never point at a rejected (frame_id, pixel) again — the
+     object may be small or far there; get closer first, then propose from
+     the new viewpoint.
+   - revisit_targets: keyframes whose 3D depth could not be validated
+     ({{frame_id, attempts, dist_m}}). The system is navigating (or has
+     navigated) you near the frame's camera pose for a closer look. When
+     dist_m is small, propose the target again from your current view.
+   - new_keyframes (only when present): {{frame_id, caption excerpt}} rows
+     for frames collected since your last decision. Frame images are NOT
+     attached — call view_frame(frame_id) to see one.
+   - relevant_frames (only when matches exist): caption matches over all
+     collected keyframes, retrieved PER TARGET PHOTO from its
+     goal_descriptions text; matched_goals lists the goal_image_N indexes
+     whose description retrieved that frame. Treat rows as hypotheses, not
+     detections: view_frame plausible unreviewed rows, then propose the
+     target there.
+2. A bird's-eye map image reconstructed from the 3D point cloud. Legend:
+   blue AGENT arrow = current pose, purple diamonds fN = frontiers, green
+   circles tN = instances, orange ACTIVE star = active target; marker ids
+   match the state JSON. The image shows reconstructed 3D colors only —
+   no free/obstacle coloring and no trajectory; blank pixels mean "no
+   rendered 3D point", i.e. space the robot has not observed yet — a large
+   blank region is unexplored and worth moving toward. Combine the image
+   with the JSON numbers when choosing: use path_cost_m for distance and
+   reachability, and use the image for spatial layout — which direction
+   each frontier lies in, which frontiers belong to the same region, and
+   where unexplored space remains. Do not simply pick the closest
+   frontier: check the image first, and choose the frontier that opens up
+   new space or a new room.
+3. Event-specific images: the current RGB on arrival, panorama views after
+   SCAN, or images you requested through tools.
+
+All world-space distances, coordinates and path costs are computed by the
+system. Never estimate world geometry or output world coordinates; refer to
+objects by their ids. The only coordinates you may provide are normalized
+image pixels required by instantiate_points.
+
+# Memory: instances, goal bindings and agent_notes
+
+Each accepted proposal (from pick_segment/instantiate_points) is stored as
+an observation and becomes a navigable instance. Whenever you instantiate
+a target, pass goal_index=N of the photo it matches: the system records
+the binding (shown as goal_index on the instance row) and stops attaching
+that photo once the bound instance is reported.
+
+ONE PHOTO = ONE PHYSICAL OBJECT. The system never binds two instances to
+the same goal_index. When a new instantiation claims an already-bound
+goal_index, the binding is withheld and a task.goal_conflicts entry
+{{goal_index, holder_instance_id, challenger_instance_id}} appears.
+Resolve it promptly: view_instance both candidates, compare each against
+the goal photo, then call resolve_goal_conflict(goal_index,
+keep_instance_id) naming the instance that truly matches — the other stays
+in the pool unbound. If the two instances are the same physical object,
+call merge_instances instead. One instance also binds at most one photo.
+
+An accepted proposal whose 3D point lies near existing instances is NOT
+turned into an instance directly:
+you receive a duplicate_review entry with evidence images and must judge
+identity yourself with resolve_duplicate (DUPLICATE merges, NEW creates).
+The evidence images are wide full-frame views (no zoomed crops) so you keep
+the global context; dist_m is the 3D distance between the two stored points,
+and pointing localization noise is roughly ±1m — dist_m < 1 with the same
+object category, or both markers pointing at the same object in the wide
+views, usually means one physical object seen twice.
+Whenever you later realize two existing instances are actually the same
+physical object (from images, texts, or map positions), call merge_instances
+right away — you do not have to wait for a duplicate_review.
+observation_count tells how
+many views support an instance. reported_instances and report_claims are
+already claimed and cannot be navigated to or reported again. The instance
+table is a bounded summary of available instances; instances_omitted_ids are
+also valid GOTO_INSTANCE targets. Use search_instances and get_instance to see
+beyond the table.
+
+agent_notes is a string that persists across decisions and is handed back
+inside every world state. Maintain it with update_notes: current plan,
+which goal_image_N are still missing and where you suspect them, ruled-out
+areas or hypotheses, next steps (at most 500 characters). It is your only
+long-term memory beyond instances — keep it current.
+
+# Tools
+
+To call one, reply with exactly one JSON object and nothing else:
+  {{"tool_call": {{"name": "<tool_name>", "<arg>": <value>, ...}}}}
+using the argument names from the signatures below. One call per reply, at
+most {max_rounds} calls per decision. This is a HARD per-decision limit;
+each tool result reports used and remaining calls. Results arrive in your
+next prompt.
+All results use {{"ok", "tool", "state_changed", "result"}}. Failures use
+{{"ok": false, "error": {{"code", "message"}}}}. When the budget is
+exhausted, tools are disabled and you MUST return a final action JSON.
+
+Perception and retrieval:
+- search_frames(query, top_k=5) -> [{{frame_id, score, caption}}]: text search over
+  the captions of all collected keyframes. Write queries from the
+  goal_descriptions text of the photo you are hunting. Read-only.
+- view_frame(frame_id): attach the keyframe's raw RGB image to your next
+  input. Use it to verify what a frame actually shows. Read-only.
+- propose_candidates(frame_id, query) -> {{masks: [{{mask_id, centroid,
+  bbox, area_frac}}]}} plus an attached numbered overlay image: segment the
+  whole frame into object regions with SAM (no pointing model involved).
+  centroid/bbox are 0-1000 normalized, matching the numbers printed on the
+  overlay. Then call pick_segment with the ids of the regions matching the
+  photo target.
+  Rejected regions (rejected_spots) are filtered out automatically; NEVER
+  re-propose a frame whose regions were rejected, and never propose the
+  same frame repeatedly from the same viewpoint.
+
+SAM TARGET-SIZE DISCIPLINE: SAM only yields clean, usable object masks
+when the object occupies a substantial share of the frame — a chair
+roughly 3m away fills a large area, while one 6m+ away either yields no
+mask or masks that merge with the rug/floor/wall behind it. Regions below
+~0.5% of frame area (area_frac < 0.005) are unreliable: masks in that
+range, or an overlay with no mask where you expect the object, mean you
+are too far. Do NOT pick or commit such candidates, and do NOT re-propose
+another distant frame hoping for better luck — DISTANCE is the problem,
+not the frame. Move closer FIRST (GOTO_INSTANCE for a registered
+instance; otherwise START_ADJUST with MOVE_FORWARD, or navigate toward
+that area), until the target region looks large in the view, THEN
+propose. The same logic applies when a prior commit was REJECTED because
+the mask fell on the floor/rug/wall beside the object: walk closer and
+re-propose from the new viewpoint instead of repeating from afar.
+- commit_candidates(reviews, label) -> {{instances, accepted, rejected,
+  uncertain, geometry_rejections, duplicate_review}}: reviews is a list of
+  {{candidate_id, verdict: ACCEPT|REJECT|UNCERTAIN, reason}}. Only ACCEPT
+  proposals are batch-resolved into navigable instances. UNCERTAIN remains a
+  non-navigable proposal for later evidence; it is never a navigation target.
+  geometry_rejections list ACCEPTED candidates whose 3D depth could not be
+  validated — the system AUTOMATICALLY navigates you near that keyframe's
+  camera pose for a closer look (see revisit_targets). Do not re-commit the
+  same candidate unchanged; wait until you arrive and propose again from
+  the new view.
+  An ACCEPTED candidate whose 3D point lies near existing instances is NOT
+  created immediately: it appears under duplicate_review with its observation_id
+  and the neighbors' ids/distances, with wide full-frame evidence images
+  attached (dup_new_obs<N> for the new observation, dup_existing_<id> for
+  neighbors).
+- resolve_duplicate(observation_id, decision, duplicate_of=null, text="") ->
+  {{instance_id, resolved}}: verdict for each duplicate_review entry.
+  DUPLICATE merges the observation into the existing instance duplicate_of
+  (same physical object — compare the wide evidence images and map positions;
+  near-identical map locations usually mean the same object even when texts
+  differ); NEW creates a separate instance. Until resolved, the observation
+  is not navigable and not an instance.
+- merge_instances(instance_id, other_instance_id, text="") ->
+  {{merged, into, reported}}: merge two EXISTING instances you have judged
+  to be the same physical object. other_instance_id is absorbed into
+  instance_id (observations, evidence and reported state are kept; optional
+  text replaces the surviving instance's text). Use it any time — e.g. after
+  comparing view_instance images or noticing two ids at the same map spot.
+- resolve_goal_conflict(goal_index, keep_instance_id) -> {{goal_index,
+  bound_instance, unbound_instance}}: settle a task.goal_conflicts entry
+  after comparing both instances against the goal photo (view_instance).
+  keep_instance_id must be the holder or the challenger; the goal binding
+  moves to it and the other instance stays in the pool unbound. If the two
+  instances are the same physical object, merge_instances instead.
+- review_crosshair(frame_id, pixel_1000, verdict, reason) ->
+  {{frame_id, pixel, verdict, instantiation_allowed}}: this is the REQUIRED
+  semantic gate for every pixel. First inspect its attached crosshair image,
+  then return exactly one verdict: ACCEPT only when the CROSSHAIR CENTER lies
+  on a visible object that matches the corresponding goal photo; REJECT when
+  it is on background, wall, floor, a different object, or outside the
+  object; UNCERTAIN when the image cannot establish this. Never use ACCEPT
+  based on the caption or a plausible nearby object.
+- pick_segment(frame_id, mask_ids, query, goal_index=null) -> {{proposals: [{{candidate_id,
+  frame_id, mask_id, pixel}}]}}: register the picked regions as reviewable
+  proposals; each mask's centroid becomes the candidate pixel and the mask
+  itself is used for depth sampling. Evidence panels are attached; review
+  them and commit with commit_candidates exactly as with propose_candidates.
+  goal_index is REQUIRED whenever the picked region matches a goal_image_N.
+- instantiate_points(frame_id, pixels_1000, label, goal_index=null) ->
+  {{instances: [{{instance_id, observation_id, frame_id, confidence,
+  association, reported}}], pending_confirmation: [...],
+  geometry_rejections: [...]}}: FALLBACK path — use it only when SAM found
+  no matching region on a near frame but you can read the target's pixel
+  position yourself from a viewed frame. pixels_1000 is a list of [x, y]
+  in the 0-1000 normalized space (your own reading of a viewed frame);
+  label is the full target description. Pixels without crosshair evidence
+  are returned as pending_confirmation with the marked image attached
+  (crosshair overlay showing exactly which pixel, plus a zoomed crop).
+  After the image is shown, call review_crosshair for the SAME pixel. Only
+  an explicit ACCEPT allows a later instantiate_points call to register 3D
+  geometry. REJECT and UNCERTAIN are semantic_rejections and must never be
+  retried unchanged. geometry_rejections are marks with invalid or missing
+  3D depth. Once you have SEEN a matching object in a frame, register it
+  right away: only a registered instance is navigable. Never try to walk
+  toward an object that exists only in an image. If the object is far away
+  or the evidence image is too small to locate it precisely, START_ADJUST
+  with MOVE_FORWARD to get closer, then retry.
+  If SAM is unavailable, propose_candidates returns error code
+  SAM_UNAVAILABLE. This is not evidence that the target is absent: move
+  closer and retry, or use instantiate_points with pixels you read
+  yourself, or continue exploration.
+  goal_index is REQUIRED whenever this instantiation matches a goal_image_N.
+
+Instance memory:
+- search_instances(query, reported=null, top_k=10) -> compact rows: keyword
+  search over instance texts; reported may be true, false, or null.
+- get_instance(instance_id) -> full record {{id, point, text, reported,
+  frame_id, candidate_id, evidence, observation_ids, report_claim_id}}.
+  Read-only; returns no image.
+- view_instance(instance_id): attach the instance's best available image
+  (evidence overlay preferred, else its keyframe). Read-only.
+- update_instance(instance_id, text): rewrite the instance's text.
+
+Housekeeping:
+- get_agent_status() -> {{num_frames, caption_pending,
+  latest_captioned_frame_ids, instances_total, unreported_instances,
+  steps_remaining}}: coverage and budget snapshot.
+- update_notes(text): overwrite your agent_notes (see Memory above).
+- get_action_history(before_step, limit) -> [{{step, action, target_id,
+  outcome}}]: your older action history; recent_actions covers the last 3.
+
+After a write tool (update_instance, update_notes, instantiate_points,
+commit_candidates, resolve_duplicate, resolve_goal_conflict) the
+refreshed world state is
+included in your next prompt — rely on it, not on the pre-write state.
+Stop calling tools as soon as the supplied evidence is sufficient.
+
+# Actions (target_id = an id from the state tables, or null)
+
+- GOTO_INSTANCE id: navigate to an unreported instance's 3D point; an
+  arrival decision triggers near it. Does not assert the instance matches
+  a photo. This is how you reach a target: use pick_segment or
+  instantiate_points first, then GOTO_INSTANCE. Approaching a
+  seen-but-not-instantiated object through
+  frontiers or adjustment does not work. The harness follows the whole
+  path by itself and returns control to you on arrival or failure.
+- GOTO_FRONTIER id: follow the precomputed path to an exploration frontier.
+  The harness executes the whole path by itself — you are NOT consulted
+  again until the path completes, fails, or a passing keyframe caption
+  strongly matches one of the unfound goal descriptions (which interrupts
+  the leg early). New frames collected along the way are listed in
+  new_keyframes at that next decision. Prefer a frontier in an untried
+  branch rather than repeatedly selecting the first marker in a stalled
+  branch.
+- SCAN: spin 360 degrees in place (12 left turns, four sampled views).
+  It only shows what is visible from your current position — it cannot
+  reveal other sides of an object, so it cannot verify a candidate. Use
+  it to survey your surroundings when the map and captions suggest
+  nothing useful; to see an object from another angle, move around it
+  instead (GOTO_INSTANCE / START_ADJUST).
+- START_ADJUST (takeover): short local adjustment when the camera pose
+  needs refinement, or a small turn/step would reveal unseen space. Prefer
+  it when no frontier or instance looks promising. During takeover tools
+  are disabled: reply with exactly one action per turn — MOVE_FORWARD,
+  TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN, or END_ADJUST; the action
+  executes, then you receive a fresh RGB image. MOVE_FORWARD requires a
+  "steps" field: an integer from 1 to
+  world_state.adjustment.max_forward_steps saying how many 0.25m forward
+  steps to execute in a row (one action type per reply — you cannot combine
+  forward and turn in one decision). Steps execute one by one and stop
+  early on collision, so prefer several steps over repeated single-step
+  replies when the path is clearly free. Turns and tilts always execute
+  once. LOOK_UP/LOOK_DOWN tilt
+  the camera by 30 degrees without moving the robot and are useful for
+  high/low or
+  occluded targets. The harness bounds relative pitch and automatically
+   returns the camera to its neutral mapping pose after END_ADJUST. END_ADJUST
+   is accepted only after its stated success condition has measurable progress:
+   a fresh view for verify_instance, a successful move for clear_path, or a
+   new mapping keyframe for inspect_sector. Never emit movement actions
+  outside takeover, and never START_ADJUST while already adjusting.
+  To land a reliable region on a distant or unclear target, START_ADJUST
+  with MOVE_FORWARD to approach it directly: the closer view makes the
+  target larger in the next frame, so SAM segmentation of it is reliable.
+  Whenever the target is small in the current view or its region was
+  rejected (see rejected_spots), you MUST get closer before proposing
+  again — never retry the same frame from the same viewpoint. After
+  END_ADJUST the newest view is navigation.current_frame_id: propose on it
+  (propose_candidates) and pick the matching mask with pick_segment.
+- REPORT_FOUND instance_id: report the active canonical instance you are
+  standing next to. target_id is REQUIRED and must equal
+  navigation.active_target.id (or an instance whose dist_m shows you are
+  within ~1m of it). Before reporting an instance bound to goal_image_N,
+  compare its evidence image (view_instance) against that photo — they
+  must show the same physical object.
+  Success is judged by DISTANCE, not by vision: the benchmark counts a
+  report when your position is near the target's viewpoint, regardless of
+  what the camera can see. You do NOT need to see the object — when you
+  are very close, it is normal for it to fall outside the frame. If you
+  have arrived at the instance (GOTO_INSTANCE completed, or dist_m is
+  small), REPORT_FOUND even when the object is not visible; never report
+  an instance you have not approached, and never report the same physical
+  instance twice.
+- FINISH: not yours to call — the harness ends the episode automatically
+  once every goal_image_N is found.
+
+Cold start: if new_keyframes and relevant_frames are absent and there are no instances yet, no
+observations have been collected, so retrieval tools will return nothing.
+SCAN to look around, or pick a frontier to move to first.
+
+Finally reply with exactly one JSON object and nothing else:
+  {{"action": "GOTO_INSTANCE|GOTO_FRONTIER|REPORT_FOUND|SCAN|START_ADJUST|END_ADJUST|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT|LOOK_UP|LOOK_DOWN",
+    "target_id": "<instance id for GOTO_INSTANCE/REPORT_FOUND, frontier id for GOTO_FRONTIER, otherwise null>",
+    "steps": <integer 1..max_forward_steps; required for MOVE_FORWARD, omit otherwise>,
+    "reason": "short reason (log only)"}}"""
+
+
 EVENT_GUIDANCE = {
     "world_state_updated": (
         "\nFIRST check the current observation: if it already shows a target "
@@ -396,10 +745,7 @@ EVENT_GUIDANCE = {
         "ACTIVE star. It has no trajectory or occupancy-region coloring; blank "
         "pixels are not proof of free space. Read "
         "world_state.adjustment, especially current_pose, active_target, "
-        "previous_action, collision, pitch_offset_steps, and target_budget "
-        "information. target_budget is cumulative for this target across "
-        "all adjustment sessions: do not spend it on repeated turns or long "
-        "searches. A detected "
+        "previous_action, collision, and pitch_offset_steps. A detected "
         "collision means the previous forward action produced no motion; do not "
         "immediately repeat it. active_target "
         "may be null when adjustment was entered for local active exploration; "
@@ -464,10 +810,54 @@ DECIDER_SYSTEM_PREAMBLE = (
     "markdown or extra text.")
 
 
-def build_decider_system(max_tool_rounds):
-    """决策契约（静态部分）：走 system 角色，不再随 user 文本每轮重发。"""
+def build_decider_system(max_tool_rounds, image_mode=False):
+    """决策契约（静态部分）：走 system 角色，不再随 user 文本每轮重发。
+
+    image_mode=True 时换成 image-goal 专属契约（清单任务、一图一实例
+    绑定纪律）；默认 description 模式的输出逐字节不变。"""
+    template = DECIDER_PROMPT_IMAGE if image_mode else DECIDER_PROMPT
     return (DECIDER_SYSTEM_PREAMBLE + "\n\n"
-            + DECIDER_PROMPT.format(max_rounds=max_tool_rounds))
+            + template.format(max_rounds=max_tool_rounds))
+
+
+def _image_goal_section(task):
+    """image-goal 决策提示的动态任务节：清单规则 + 待裁决绑定冲突。
+
+    静态契约在 DECIDER_PROMPT_IMAGE；这里只放随状态变化的部分。"""
+    parts = [
+        "\nImage-goal mode: the targets are the outlined objects in the "
+        "attached goal_image_N photos (one photo per physical target; only "
+        "not-yet-found targets are attached). task.goal_descriptions gives "
+        "a text description per goal_image_N; task.goals_unfound lists the "
+        "indexes still to find. The harness FINISHes the episode "
+        "automatically once every goal_image_N is marked found — you never "
+        "need to (and should not) call FINISH yourself; until then keep "
+        "searching for the remaining goals. "
+        "You can also spot targets yourself: whenever you see an outlined "
+        "object's match in the current observation or a viewed frame, "
+        "instantiate it immediately (pick_segment or instantiate_points) "
+        "and pass goal_index=N. Before REPORT_FOUND on an image-goal "
+        "instance, compare your evidence image against the corresponding "
+        "goal_image_N — they must show the same physical object."
+    ]
+    conflicts = task.get("goal_conflicts") or []
+    if conflicts:
+        rows = "; ".join(
+            "goal_image_{g}: instance {h} (bound) vs instance {c} "
+            "(withheld)".format(
+                g=row.get("goal_index"),
+                h=row.get("holder_instance_id"),
+                c=row.get("challenger_instance_id"))
+            for row in conflicts)
+        parts.append(
+            "\nBINDING CONFLICTS awaiting your decision: " + rows + ". "
+            "One photo matches exactly one physical object, so one of the "
+            "two bindings must be wrong. Compare both instances against the "
+            "goal photo (view_instance), then call "
+            "resolve_goal_conflict(goal_index, keep_instance_id) with the "
+            "instance that truly matches. If the two are the same physical "
+            "object, call merge_instances instead.")
+    return "".join(parts)
 
 
 def build_decision_prompt(event, world_state, max_tool_rounds,
@@ -486,19 +876,7 @@ def build_decision_prompt(event, world_state, max_tool_rounds,
 
     task = world_state.get("task", {})
     if task.get("goal_type") == "image":
-        parts.append(
-            "\nImage-goal mode: the targets are the outlined objects in the "
-            "attached goal_image_N photos (one photo per target; only "
-            "not-yet-found targets are attached). task.goal_descriptions "
-            "gives a text description per goal_image_N; task.goals_unfound "
-            "lists the indexes still to find. You can also spot targets "
-            "yourself: whenever you see an outlined object's match in the "
-            "current observation or a viewed frame, instantiate it "
-            "immediately (pick_segment or instantiate_points) and pass "
-            "goal_index=N. Before REPORT_FOUND on an image-goal instance, "
-            "compare your evidence image against the corresponding "
-            "goal_image_N — they must show the same physical object."
-        )
+        parts.append(_image_goal_section(task))
     expected = task.get("expected")
     found = task.get("found", 0)
     if task.get("mode") == "many" and expected is not None and found < expected:

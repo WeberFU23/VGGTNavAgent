@@ -70,12 +70,9 @@ class NavAgent(MappingAgent):
             "NAV_ADJUST_MAX_STEPS", "10")))
         self.adjust_max_tilt_steps = max(0, int(os.environ.get(
             "NAV_ADJUST_MAX_TILT_STEPS", "1")))
-        self.adjust_max_sessions_per_target = max(1, int(os.environ.get(
-            "NAV_ADJUST_MAX_SESSIONS_PER_TARGET", "2")))
-        self.adjust_max_total_steps_per_target = max(1, int(os.environ.get(
-            "NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET", "8")))
-        self.adjust_max_turns_per_target = max(1, int(os.environ.get(
-            "NAV_ADJUST_MAX_TURNS_PER_TARGET", "4")))
+        # 跨 session 的 per-target 累计预算已移除：同一区域允许多次
+        # 调整（同一个地方反复微调是合理行为），防死循环由 per-session
+        # 防护承担：单轮步数上限、转向连击冷却、END_ADJUST 进展门槛。
         # 一次 MOVE_FORWARD 决策允许连续执行的最大前进步数（每步 0.25m）；
         # VLM 必须显式选择步数，harness 逐步执行、碰撞即停。
         self.adjust_max_forward_steps = max(1, int(os.environ.get(
@@ -119,6 +116,8 @@ class NavAgent(MappingAgent):
                            "instantiate_points": self._tool_instantiate_points,
                            "pick_segment": self._tool_pick_segment,
                            "resolve_duplicate": self._tool_resolve_duplicate,
+                           "resolve_goal_conflict":
+                               self._tool_resolve_goal_conflict,
                            "merge_instances": self._tool_merge_instances,
                            "get_agent_status": self._tool_get_agent_status,
                            "update_notes": self._tool_update_notes,
@@ -174,6 +173,7 @@ class NavAgent(MappingAgent):
         # 导航确认不可达的实例（episode 内排除出 VLM 候选表；REPORT_FOUND
         # 仍可用——agent 可能就停在目标旁边，直接观察可确认）。
         self._unreachable_instance_ids = set()
+        self._instance_plan_failures = {}
         self._scanning = False          # 到达后原地 360° 扫描确认中
         self._scan_steps = 0
         self._scan_images = []
@@ -196,6 +196,10 @@ class NavAgent(MappingAgent):
         self._goal_descriptions = []
         self._goal_found = set()
         self._instance_goal_index = {}
+        # goal_index 绑定冲突（一图一实例）：[{goal_index,
+        # holder_instance_id, challenger_instance_id}]，交决策 VLM 用
+        # resolve_goal_conflict 裁决后清除。
+        self._goal_conflicts = []
         self._selected_evidence = None
         self._arrival_transition_active = False
         # 到达决策 API 故障计数：transient 失败时保持目标并逐步重试，
@@ -212,8 +216,10 @@ class NavAgent(MappingAgent):
         # Prevent START_ADJUST -> END_ADJUST -> START_ADJUST recursion within
         # one benchmark observation when the VLM repeats the same request.
         self._adjust_reentry_blocked_step = None
-        self._adjustment_key = None
-        self._adjustment_budgets = {}
+        # 同一 session 内的转向连击记录（repeated_same_turn 防护）；
+        # 每次 START_ADJUST 都是新 session，不再跨 session 累计预算。
+        self._adjust_turn_streak = 0
+        self._adjust_last_turn = None
         self._adjust_goal = None
         self._adjust_start_frame_id = None
         # MOVE_FORWARD steps>1 的续执行计数：逐步执行，碰撞即停并交还 VLM。
@@ -247,6 +253,14 @@ class NavAgent(MappingAgent):
             "NAV_ARRIVAL_RETRIES", "2")))
         self.arrival_max_failures = max(1, int(os.environ.get(
             "NAV_ARRIVAL_MAX_FAILURES", "3")))
+        # GOTO_INSTANCE 规划失败：同一实例连续失败
+        # NAV_INSTANCE_PLAN_FAIL_LIMIT 次才标记 unreachable；未达上限
+        # 时在 NAV_INSTANCE_PLAN_RETRY_STEPS 步冷却期内拒绝重选，
+        # 避免"选择->规划失败->清除->重选"原地循环。
+        self.instance_plan_fail_limit = max(1, int(os.environ.get(
+            "NAV_INSTANCE_PLAN_FAIL_LIMIT", "3")))
+        self.instance_plan_retry_steps = max(0, int(os.environ.get(
+            "NAV_INSTANCE_PLAN_RETRY_STEPS", "40")))
         # 决策层状态：近期事件流 + 最近一次探索规划的 frontier 缓存
         self._events = []
         self._last_frontier_clusters = []
@@ -582,21 +596,37 @@ class NavAgent(MappingAgent):
             return None
         # 每帧只参与一次命中判定，避免同一命中反复打断。
         self._caption_hit_max_seen = max(new_ids)
-        query = str(getattr(self, "target_text", "") or "").strip()
-        if not query:
+        # image-goal 模式：每个未找到目标各出一路 caption 检索（描述来自
+        # 冷启动）；description 模式保持单路目标短语查询，行为不变。
+        if self._image_goal_mode:
+            queries = self._goal_retrieval_queries()
+        else:
+            query = str(getattr(self, "target_text", "") or "").strip()
+            queries = [(None, query)] if query else []
+        if not queries:
             return None
-        try:
-            hits = self.client.retrieve_captions(query, top_k=3) or []
-        except Exception:
+        best = None
+        for goal_index, query in queries:
+            try:
+                hits = self.client.retrieve_captions(query, top_k=3) or []
+            except Exception:
+                continue
+            for h in hits:
+                fid = int(h.get("frame_id", -1))
+                if fid not in new_ids:
+                    continue
+                score = float(h.get("score", 0.0))
+                if score >= self.caption_hit_min_score and \
+                        (best is None or score > best[0]):
+                    best = (score, fid, goal_index)
+        if best is None:
             return None
-        hit = next((h for h in hits
-                    if int(h.get("frame_id", -1)) in new_ids), None)
-        if hit is None or float(hit.get("score", 0.0)) \
-                < self.caption_hit_min_score:
-            return None
+        score, fid, goal_index = best
+        suffix = (f" goal_image_{goal_index}"
+                  if goal_index is not None else "")
         self._log_event(
-            f"caption hit interrupt: frame {hit.get('frame_id')} "
-            f"score={float(hit.get('score', 0.0)):.3f}")
+            f"caption hit interrupt: frame {fid} "
+            f"score={score:.3f}{suffix}")
         self._explore_follower = None
         self._active_frontier_key = None
         self._active_branch_key = None
@@ -1164,6 +1194,58 @@ class NavAgent(MappingAgent):
                 for i in range(len(self._goal_images))
                 if i not in self._goal_found and self._goal_images[i]]
 
+    def _goal_retrieval_queries(self):
+        """image-goal 模式的检索查询表：[(goal_index, description)]。
+
+        每个未找到且描述非空的目标各出一路；description 模式或全部已
+        找到时返回空表（调用方各自回退/关闭检索通道）。"""
+        if not self._image_goal_mode or not self._goal_images:
+            return []
+        queries = []
+        for i in range(len(self._goal_images)):
+            if i in self._goal_found:
+                continue
+            desc = (str(self._goal_descriptions[i]).strip()
+                    if i < len(self._goal_descriptions) else "")
+            if desc:
+                queries.append((i, desc))
+        return queries
+
+    def _goal_relevant_frames(self):
+        """逐目标 caption 检索（image-goal）：多路 BGE 查询按帧合并去重。
+
+        每帧保留最高分与命中它的目标索引集合（matched_goals），按分数
+        截断到 relevant_frame_top_k——对应 description 模式的单路
+        relevant_frames，并让 VLM 直接看到"该帧对应哪张目标照片"。"""
+        merged = {}
+        for goal_index, query in self._goal_retrieval_queries():
+            try:
+                rows = self.client.retrieve_captions(
+                    query, top_k=self.relevant_frame_top_k) or []
+            except Exception:
+                continue
+            for row in rows:
+                if row.get("frame_id") is None:
+                    continue
+                fid = int(row["frame_id"])
+                score = float(row.get("score", 0.0) or 0.0)
+                entry = merged.get(fid)
+                if entry is None:
+                    entry = {"frame_id": fid, "score": score,
+                             "caption": str(row.get("caption", ""))[:300],
+                             "matched_goals": set()}
+                    merged[fid] = entry
+                if score > entry["score"]:
+                    entry["score"] = score
+                    entry["caption"] = str(row.get("caption", ""))[:300]
+                entry["matched_goals"].add(int(goal_index))
+        ranked = sorted(merged.values(), key=lambda r: -r["score"])
+        return [{"frame_id": r["frame_id"],
+                 "score": round(r["score"], 3),
+                 "matched_goals": sorted(r["matched_goals"]),
+                 "caption": r["caption"]}
+                for r in ranked[:self.relevant_frame_top_k]]
+
     def act(self, observation):
         self._feed_frame(observation)
         self._last_observation = observation
@@ -1560,8 +1642,7 @@ class NavAgent(MappingAgent):
                     "decider_mode", "query_interval", "explore_replan_interval",
                     "finish_patience", "finish_frontier_patience",
                     "finish_map_stable_steps", "adjust_max_steps",
-                    "adjust_max_forward_steps", "adjust_max_sessions_per_target",
-                    "adjust_max_total_steps_per_target", "adjust_max_turns_per_target",
+                    "adjust_max_forward_steps", "adjust_max_tilt_steps",
                     "relevant_frame_top_k", "nav_collision_limit",
                     "arrival_max_failures", "map_max_instances",
                     "decision_map_max_points",
@@ -2098,6 +2179,94 @@ class NavAgent(MappingAgent):
             return idx
         return None
 
+    def _goal_holder(self, goal_index):
+        """持有该目标照片绑定的存活实例 id；顺带清理悬挂绑定。"""
+        holder = None
+        stale = []
+        for iid, idx in self._instance_goal_index.items():
+            if self.instance_store.get(iid) is None:
+                stale.append(iid)
+            elif idx == goal_index and holder is None:
+                holder = iid
+        for iid in stale:
+            self._instance_goal_index.pop(iid, None)
+        return holder
+
+    def _bind_goal_index(self, iid, goal_index):
+        """把实例绑定到目标照片索引：一图一实例。
+
+        无持有者直接绑定；已有其他实例持有时不静默覆盖——挂起为
+        _goal_conflicts 行，交决策 VLM 用 resolve_goal_conflict 裁决。
+        实例已有绑定时保留先到的绑定。"""
+        if goal_index is None or iid in self._instance_goal_index:
+            return
+        holder = self._goal_holder(goal_index)
+        if holder is None or holder == iid:
+            self._instance_goal_index[iid] = int(goal_index)
+            return
+        row = {"goal_index": int(goal_index),
+               "holder_instance_id": holder,
+               "challenger_instance_id": iid}
+        if row not in self._goal_conflicts:
+            self._goal_conflicts.append(row)
+            self._goal_conflicts = self._goal_conflicts[-8:]
+        self._log_event(
+            f"goal_image_{int(goal_index)} binding conflict: instance "
+            f"{holder} holds it, instance {iid} claims it; binding "
+            "withheld pending resolve_goal_conflict")
+
+    def active_goal_conflicts(self):
+        """清理并返回当前有效的 goal_index 绑定冲突（world_state 用）。"""
+        rows = []
+        for row in self._goal_conflicts:
+            goal_index = row.get("goal_index")
+            if goal_index in self._goal_found:
+                continue                    # 目标已报告，冲突无意义
+            holder = row.get("holder_instance_id")
+            challenger = row.get("challenger_instance_id")
+            if self.instance_store.get(holder) is None or \
+                    self.instance_store.get(challenger) is None:
+                continue                    # 一方已被 merge 吸收
+            if self._instance_goal_index.get(holder) != goal_index:
+                continue                    # 绑定已变（裁决/合并），失效
+            if challenger in self._instance_goal_index:
+                continue                    # 挑战者已另有所绑，自然消解
+            rows.append(dict(row))
+        self._goal_conflicts = [dict(row) for row in rows]
+        return rows
+
+    def _tool_resolve_goal_conflict(self, goal_index, keep_instance_id):
+        """goal_index 绑定冲突裁决：绑定移到 keep，另一方解绑。"""
+        if not self._image_goal_mode:
+            return {"error": "resolve_goal_conflict is only available in "
+                             "image-goal mode"}
+        goal_index = self._validate_goal_index(goal_index)
+        if goal_index is None:
+            return {"error": "invalid goal_index"}
+        row = next((r for r in self._goal_conflicts
+                    if r.get("goal_index") == goal_index), None)
+        if row is None:
+            return {"error": f"no pending conflict for "
+                             f"goal_image_{goal_index}"}
+        keep = self.instance_store.get(keep_instance_id)
+        if keep is None:
+            return {"error": f"instance {keep_instance_id!r} not found"}
+        pair = {row["holder_instance_id"], row["challenger_instance_id"]}
+        if keep.iid not in pair:
+            return {"error": f"instance {keep.iid} is not part of the "
+                             f"goal_image_{goal_index} conflict "
+                             f"{sorted(pair)}"}
+        other = next(iter(pair - {keep.iid}))
+        self._instance_goal_index.pop(other, None)
+        self._instance_goal_index[keep.iid] = int(goal_index)
+        self._goal_conflicts = [r for r in self._goal_conflicts
+                                if r.get("goal_index") != goal_index]
+        self._log_event(
+            f"goal_image_{int(goal_index)} bound to instance {keep.iid}; "
+            f"instance {other} unbound")
+        return {"goal_index": int(goal_index), "bound_instance": keep.iid,
+                "unbound_instance": other}
+
     def _tool_pick_segment(self, frame_id, mask_ids, query="", goal_index=None):
         """把 SoM 选中的 mask 注册为待审核候选（复用 commit 流程）。
 
@@ -2614,19 +2783,27 @@ class NavAgent(MappingAgent):
         # Always expose task-directed retrieval candidates.  They remain
         # hypotheses until their RGB is viewed and the explicit tri-state
         # semantic review accepts a marked point.
-        query = self.target_text or self._target_phrase(observation)
-        if query:
-            try:
-                relevant = self.client.retrieve_captions(
-                    query, top_k=self.relevant_frame_top_k)
-                state["relevant_frames"] = [
-                    {"frame_id": int(row["frame_id"]),
-                     "score": round(float(row.get("score", 0.0)), 3),
-                     "caption": str(row.get("caption", ""))[:300]}
-                    for row in relevant if row.get("frame_id") is not None]
-            except Exception as exc:
-                state["semantic_retrieval"] = {
-                    "available": False, "error": str(exc)[:160]}
+        if self._image_goal_mode:
+            # image-goal：逐未找到目标各查一路，按帧合并去重（行内含
+            # matched_goals）；description 模式保持单路目标短语查询。
+            relevant_rows = self._goal_relevant_frames()
+            if relevant_rows:
+                state["relevant_frames"] = relevant_rows
+        else:
+            query = self.target_text or self._target_phrase(observation)
+            if query:
+                try:
+                    relevant = self.client.retrieve_captions(
+                        query, top_k=self.relevant_frame_top_k)
+                    state["relevant_frames"] = [
+                        {"frame_id": int(row["frame_id"]),
+                         "score": round(float(row.get("score", 0.0)), 3),
+                         "caption": str(row.get("caption", ""))[:300]}
+                        for row in relevant
+                        if row.get("frame_id") is not None]
+                except Exception as exc:
+                    state["semantic_retrieval"] = {
+                        "available": False, "error": str(exc)[:160]}
         map_png = None
         if grid is not None:
             try:
@@ -2688,6 +2865,17 @@ class NavAgent(MappingAgent):
             nd = self.instance_store.get(result.target_id)
             if nd is not None and not nd.reported and \
                     nd.iid not in self._unreachable_instance_ids:
+                plan_fail = self._instance_plan_failures.get(nd.iid)
+                if plan_fail is not None and (
+                        int(observation.step_count)
+                        - plan_fail["last_step"]
+                        ) < self.instance_plan_retry_steps:
+                    self._log_event(
+                        f"GOTO_INSTANCE {nd.iid} ignored: plan failed "
+                        f"{plan_fail['count']}x at step "
+                        f"{plan_fail['last_step']}; retry after step "
+                        f"{plan_fail['last_step'] + self.instance_plan_retry_steps}")
+                    return False
                 self.target_instance_id = nd.iid
                 self.target_point = self._raw_point(nd.point)
                 self.target_candidate_id = nd.candidate_id
@@ -2705,15 +2893,28 @@ class NavAgent(MappingAgent):
                 self._log_event(f"decider -> GOTO_INSTANCE {nd.iid}")
                 self._arrival_failures = 0
                 if self._plan_to_target(observation):
+                    self._instance_plan_failures.pop(nd.iid, None)
                     self.mode = "nav"
                     return True
-                # Planning failure must not leave an instance displayed as an
-                # active target while control has already returned to explore.
+                # 规划失败不再永久丢弃实例：计入失败计数并进入重选冷却；
+                # 连续失败达到上限才标记 unreachable（REPORT 仍可用）。
                 failed_id = nd.iid
+                row = self._instance_plan_failures.setdefault(
+                    failed_id, {"count": 0, "last_step": 0})
+                row["count"] += 1
+                row["last_step"] = int(observation.step_count)
                 self._clear_current_target()
                 self.mode = "explore"
-                self._log_event(
-                    f"GOTO_INSTANCE {failed_id} plan failed; target cleared")
+                if row["count"] >= self.instance_plan_fail_limit:
+                    self._unreachable_instance_ids.add(failed_id)
+                    self._log_event(
+                        f"GOTO_INSTANCE {failed_id} plan failed "
+                        f"{row['count']}x; instance marked unreachable")
+                else:
+                    self._log_event(
+                        f"GOTO_INSTANCE {failed_id} plan failed "
+                        f"({row['count']}/{self.instance_plan_fail_limit}); "
+                        "instance kept in pool")
                 return False
         if result.action == "GOTO_FRONTIER" and result.target_id is not None:
             cluster = None
@@ -2878,22 +3079,13 @@ class NavAgent(MappingAgent):
 
     def _start_adjustment(self, observation, source_event,
                           context_images=None):
-        """Enter VLM-controlled single-step visual adjustment."""
-        key = ("instance", int(self.target_instance_id)) \
-            if self.target_instance_id is not None else \
-            ("candidate", str(self.target_candidate_id or source_event))
-        budget = self._adjustment_budgets.setdefault(key, {
-            "sessions": 0, "steps": 0, "turns": 0,
-            "turn_streak": 0, "last_turn": None,
-        })
-        if budget["sessions"] >= self.adjust_max_sessions_per_target or \
-                budget["steps"] >= self.adjust_max_total_steps_per_target:
-            self._log_event(
-                f"adjustment budget exhausted for {key}: {budget}")
-            return self._abandon_adjustment_target(
-                observation, "target_adjustment_budget_exhausted")
-        budget["sessions"] += 1
-        self._adjustment_key = key
+        """Enter VLM-controlled single-step visual adjustment.
+
+        跨 session 累计预算已移除：同一区域允许多次调整，死循环由
+        per-session 防护承担（单轮步数上限、转向连击冷却、END 进展门槛）。
+        """
+        self._adjust_turn_streak = 0
+        self._adjust_last_turn = None
         self._adjusting = True
         self._adjust_steps = 0
         self._adjust_source_event = str(source_event)
@@ -2915,7 +3107,7 @@ class NavAgent(MappingAgent):
             if label != "current_observation"]
         self._log_event(
             f"adjustment started from {self._adjust_source_event}; "
-            f"goal={self._adjust_goal}; target_budget={budget}")
+            f"goal={self._adjust_goal}")
         return self._adjustment_action(observation)
 
     def _abandon_adjustment_target(self, observation, reason):
@@ -2926,7 +3118,6 @@ class NavAgent(MappingAgent):
             f"adjustment abandon target={self.target_instance_id} "
             f"candidate={self.target_candidate_id}: {reason}")
         self._adjusting = False
-        self._adjustment_key = None
         self._adjust_steps = 0
         self._adjust_source_event = None
         self._adjust_context_images = []
@@ -2955,8 +3146,6 @@ class NavAgent(MappingAgent):
             self._last_motion_failed and
             previous_id == int(Action.MOVE_FORWARD))
         navigation = state.get("navigation", {})
-        target_budget = dict(self._adjustment_budgets.get(
-            self._adjustment_key, {}))
         state["adjustment"] = {
             "active": True,
             "source_event": self._adjust_source_event,
@@ -2973,12 +3162,6 @@ class NavAgent(MappingAgent):
                 0, self.adjust_max_steps - self._adjust_steps),
             "max_forward_steps": self.adjust_max_forward_steps,
             "forward_repeat_remaining": self._adjust_repeat_remaining,
-            "target_budget": {
-                **target_budget,
-                "max_sessions": self.adjust_max_sessions_per_target,
-                "max_total_steps": self.adjust_max_total_steps_per_target,
-                "max_turns": self.adjust_max_turns_per_target,
-            },
             "pitch_offset_steps": self._adjust_pitch_steps,
             "pitch_offset_degrees": 30 * self._adjust_pitch_steps,
             "max_pitch_offset_steps": self.adjust_max_tilt_steps,
@@ -3030,13 +3213,6 @@ class NavAgent(MappingAgent):
 
     def _adjustment_action(self, observation):
         """Ask the VLM for exactly one atomic motion, then re-observe."""
-        budget = self._adjustment_budgets.get(self._adjustment_key, {})
-        if budget.get("steps", 0) >= self.adjust_max_total_steps_per_target:
-            return self._abandon_adjustment_target(
-                observation, "target_total_adjustment_steps_exhausted")
-        if budget.get("turns", 0) >= self.adjust_max_turns_per_target:
-            return self._abandon_adjustment_target(
-                observation, "target_turn_budget_exhausted")
         if self._adjust_leveling:
             if self._adjust_pitch_steps:
                 return self._level_adjustment_camera(observation)
@@ -3067,9 +3243,8 @@ class NavAgent(MappingAgent):
                 done = (self._adjust_repeat_total
                         - self._adjust_repeat_remaining)
                 self._adjust_repeat_remaining -= 1
-                budget["steps"] = budget.get("steps", 0) + 1
-                budget["turn_streak"] = 0
-                budget["last_turn"] = None
+                self._adjust_turn_streak = 0
+                self._adjust_last_turn = None
                 self._adjust_steps += 1
                 trace_result = DecisionResult(
                     "MOVE_FORWARD",
@@ -3100,10 +3275,8 @@ class NavAgent(MappingAgent):
                 # bounded observation so the VLM can re-evaluate with evidence.
                 action = (int(Action.TURN_LEFT) if self._adjust_steps % 2 == 0
                           else int(Action.TURN_RIGHT))
-                budget["steps"] = budget.get("steps", 0) + 1
-                budget["turns"] = budget.get("turns", 0) + 1
-                budget["turn_streak"] = 0
-                budget["last_turn"] = None
+                self._adjust_turn_streak = 0
+                self._adjust_last_turn = None
                 self._adjust_steps += 1
                 self._trace_adjustment_execution(observation, result, action)
                 self._log_event(
@@ -3130,18 +3303,16 @@ class NavAgent(MappingAgent):
                 f"adjustment produced no executable action: {result.action}")
             return self._end_adjustment_and_resume(observation, "invalid")
         if result.action in ("TURN_LEFT", "TURN_RIGHT"):
-            same_turn = budget.get("last_turn") == result.action
-            if same_turn and budget.get("turn_streak", 0) >= 2:
+            same_turn = self._adjust_last_turn == result.action
+            if same_turn and self._adjust_turn_streak >= 2:
                 return self._abandon_adjustment_target(
                     observation, "repeated_same_turn")
-            budget["turns"] = budget.get("turns", 0) + 1
-            budget["turn_streak"] = budget.get("turn_streak", 0) + 1 \
-                if same_turn else 1
-            budget["last_turn"] = result.action
+            self._adjust_turn_streak = (self._adjust_turn_streak + 1
+                                        if same_turn else 1)
+            self._adjust_last_turn = result.action
         else:
-            budget["turn_streak"] = 0
-            budget["last_turn"] = None
-        budget["steps"] = budget.get("steps", 0) + 1
+            self._adjust_turn_streak = 0
+            self._adjust_last_turn = None
         self._adjust_steps += 1
         if result.action == "LOOK_UP":
             self._adjust_pitch_steps += 1
@@ -3151,13 +3322,11 @@ class NavAgent(MappingAgent):
         self._adjust_repeat_total = 0
         if result.action == "MOVE_FORWARD":
             # VLM 必须显式给出 steps；本步已执行并计数，其余步数逐步续执行，
-            # 碰撞即停。上限同时受会话/目标预算钳制。
+            # 碰撞即停。上限受单指令步数与 session 剩余步数钳制。
             requested = max(1, int(result.steps or 1))
             allowed = max(1, min(
                 requested, self.adjust_max_forward_steps,
-                self.adjust_max_steps - self._adjust_steps,
-                self.adjust_max_total_steps_per_target
-                - budget.get("steps", 0) + 1))
+                self.adjust_max_steps - self._adjust_steps))
             self._adjust_repeat_total = allowed
             self._adjust_repeat_remaining = allowed - 1
         self._trace_adjustment_execution(observation, result, action)
@@ -3196,9 +3365,6 @@ class NavAgent(MappingAgent):
         else:
             action_name, action = "LOOK_UP", int(Action.LOOK_UP)
             self._adjust_pitch_steps += 1
-        budget = self._adjustment_budgets.get(self._adjustment_key)
-        if budget is not None:
-            budget["steps"] = budget.get("steps", 0) + 1
         self._adjust_steps += 1
         trace_result = result or DecisionResult(
             action_name, reason="automatic camera leveling",
@@ -3225,7 +3391,6 @@ class NavAgent(MappingAgent):
         self._adjust_end_reason = None
         self._adjust_goal = None
         self._adjust_start_frame_id = None
-        self._adjustment_key = None
         self._adjust_repeat_remaining = 0
         self._adjust_repeat_total = 0
         self._adjust_reentry_blocked_step = observation.step_count
@@ -3419,6 +3584,16 @@ class NavAgent(MappingAgent):
         if self._target_mode == "many" and self._target_count is not None:
             return self._reported_count >= int(self._target_count)
         if self._target_mode == "all":
+            # image-goal: 目标照片数即目标数，全部 goal 标记 found 后强制 FINISH，
+            # 不再走 VLM/规则终止判断（找齐后游荡到预算上限是
+            # image 模式的主要失败源）。
+            if (getattr(self, "_image_goal_mode", False)
+                    and self._goal_images
+                    and len(self._goal_found) >= len(self._goal_images)):
+                self._log_event(
+                    "image-goal: all %d goal images found -> force FINISH"
+                    % len(self._goal_images))
+                return True
             if getattr(self, "decision_loop", None) is not None:
                 decided = self._decider_should_finish(observation)
                 if decided is not None:
@@ -3709,6 +3884,15 @@ class NavAgent(MappingAgent):
                     association = "new"
             if node is None:
                 cid = str(h.get("candidate_id") or f"obs{observation_id}")
+                existing = self._proposal_queue.get(cid)
+                # 同一观测已在候审（uncertain/duplicate_review）时静默刷新：
+                # 重复挂起与日志会让决策层被同一提案反复打断（刷屏死循环）。
+                if existing is not None and \
+                        existing.get("observation_id") == observation_id and \
+                        existing.get("status") in ("uncertain",
+                                                   "duplicate_review"):
+                    existing["step"] = int(step)
+                    continue
                 under_review = any(
                     row["observation_id"] == observation_id
                     for row in dup_reviews)
@@ -3734,9 +3918,7 @@ class NavAgent(MappingAgent):
                 "frame_id": h.get("frame_id"),
                 "confidence": round(float(h.get("point_score", 0.0)), 3),
             })
-            if hit_goal_index is not None and \
-                    node.iid not in self._instance_goal_index:
-                self._instance_goal_index[node.iid] = hit_goal_index
+            self._bind_goal_index(node.iid, hit_goal_index)
         if not changed and not dup_reviews:
             self._no_hit_queries += 1
             return None if select else []
@@ -3806,10 +3988,10 @@ class NavAgent(MappingAgent):
             resolved = "duplicate"
         else:
             return {"error": "decision must be NEW or DUPLICATE"}
-        # image-goal 记账：观测证据上带着目标索引时挂到最终实例上。
+        # image-goal 记账：观测证据上带着目标索引时挂到最终实例上；
+        # 一图一实例，冲突挂起为 goal_conflicts 交 resolve_goal_conflict。
         obs_goal = (observation.evidence or {}).get("goal_index")
-        if obs_goal is not None and node.iid not in self._instance_goal_index:
-            self._instance_goal_index[node.iid] = int(obs_goal)
+        self._bind_goal_index(node.iid, obs_goal)
         for proposal in self._proposal_queue.values():
             if proposal.get("observation_id") == observation.oid:
                 proposal["status"] = f"resolved_{resolved}"
@@ -3829,15 +4011,26 @@ class NavAgent(MappingAgent):
             return {"error": f"instance {other_instance_id!r} not found"}
         if keep.iid == drop.iid:
             return {"error": "cannot merge an instance into itself"}
-        self.instance_store.merge_instances(keep, drop)
+        # merge_instances 签名是 id 而非节点；传节点会被 int() 静默拒绝。
+        merged = self.instance_store.merge_instances(keep.iid, drop.iid)
+        if merged is None:
+            return {"error": "merge failed: instance store rejected the pair"}
         if text:
             keep.text = str(text)
-        # image-goal 记账：drop 带目标索引而 keep 没有时迁移过去。
+        # image-goal 记账：drop 带目标索引而 keep 没有时迁移过去；keep
+        # 已有不同绑定时记录丢弃（被丢目标的照片仍在决策输入中，可再绑）。
         drop_goal = self._instance_goal_index.pop(drop.iid, None)
-        if drop_goal is not None and keep.iid not in self._instance_goal_index:
-            self._instance_goal_index[keep.iid] = drop_goal
+        if drop_goal is not None:
+            if keep.iid not in self._instance_goal_index:
+                self._instance_goal_index[keep.iid] = drop_goal
+            else:
+                self._log_event(
+                    f"goal_image_{drop_goal} binding dropped on merge into "
+                    f"instance {keep.iid} (already bound to goal_image_"
+                    f"{self._instance_goal_index[keep.iid]})")
         # 清理 agent 侧对 drop 的引用
         self._unreachable_instance_ids.discard(drop.iid)
+        self._instance_plan_failures.pop(drop.iid, None)
         if self.target_instance_id == drop.iid:
             self.target_instance_id = None
             self.target_point = None

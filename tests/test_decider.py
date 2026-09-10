@@ -1286,3 +1286,17 @@ if __name__ == "__main__":
     test_navagent_search_instances_uses_vlm_keywords()
     test_navagent_view_instance_prefers_candidate_overlay()
     print("decider tests passed")
+
+
+def test_finish_blocked_in_image_mode_until_all_goals_found():
+    state = _state()
+    state["task"]["goal_type"] = "image"
+    state["task"]["goals_unfound"] = [1]
+    blocked = DecisionLoop(_ScriptedChat([{"action": "FINISH"}])).decide(
+        "finish_check", state)
+    assert blocked.action == "GOTO_INSTANCE"
+    assert blocked.validation == "finish_downgraded"
+    state["task"]["goals_unfound"] = []
+    allowed = DecisionLoop(_ScriptedChat([{"action": "FINISH"}])).decide(
+        "finish_check", state)
+    assert allowed.action == "FINISH"

@@ -1,13 +1,14 @@
 """临时远端操作助手：python remote_ssh.py run "cmd" [timeout] | put local remote | get remote local"""
+import os
 import re
 import sys
 
 import paramiko
 
-HOST = "connect.bjb1.seetacloud.com"
-PORT = 43920
+HOST = os.environ.get("RHOST", "connect.bjb1.seetacloud.com")
+PORT = int(os.environ.get("RPORT", "48455"))
 USER = "root"
-PASS = "KwO9gWV6pH5s"
+PASS = os.environ.get("RPASS", "cF/hGEtNEHn0")
 
 
 def _rp(path):

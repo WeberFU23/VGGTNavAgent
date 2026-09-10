@@ -1,0 +1,108 @@
+% =====================================================================
+% AutoNav-Bench — Section 3 (Benchmark) draft + Table 1 (benchmark
+% comparison) to be inserted at the end of Section 2.1.
+% Requires packages: booktabs, pifont
+%   \newcommand{\cmark}{\ding{51}}  \newcommand{\xmark}{\ding{55}}
+% Construction/metric minutiae removed to the appendix.
+% =====================================================================
+
+% ---------------------------------------------------------------------
+% PART A: insert at the END of Section 2.1
+% ---------------------------------------------------------------------
+
+Table~\ref{tab:benchmarks} contrasts representative benchmarks along these task properties; none combines unordered multi-instance search, attribute- and image-specified goals, cross-category composition, unknown target counts, complete collection, and deduplication within a single protocol.
+
+\begin{table*}[t]
+\centering
+\caption{Task properties of representative embodied navigation benchmarks. \emph{Variable-number}: target count withheld from the agent. \emph{Complete collection}: success requires finding every matching instance. \emph{Parallel search}: instances unordered, searched jointly rather than as a prescribed sequence.}
+\label{tab:benchmarks}
+\setlength{\tabcolsep}{4pt}
+\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule
+Benchmark & Multi-obj. & Attr. & Image & Attr.\ comb. & Multi-cat. & Var.-num. & Complete & Parallel \\
+\midrule
+ObjectNav   & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+HM3D-OVON   & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+MultiON     & \cmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+OneMap      & \cmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+GOAT-Bench  & \cmark & \cmark & \cmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+LaMoN       & \cmark & \cmark & \xmark & \cmark & \xmark & \xmark & \xmark & \xmark \\
+\midrule
+AutoNav-Bench (ours) & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+% ---------------------------------------------------------------------
+% PART B: Section 3
+% ---------------------------------------------------------------------
+
+\section{Benchmark}
+\label{sec:benchmark}
+
+AutoNav-Bench is built on 36 scenes from the HM3D validation split [HM3D]. We define the tasks and agent interface (\S\ref{sec:task}), sketch dataset construction and statistics (\S\ref{sec:construction}, \S\ref{sec:statistics}), and specify the evaluation protocol (\S\ref{sec:metrics}).
+
+\subsection{Task Definition}
+\label{sec:task}
+
+\textbf{Interface.}
+The agent observes only egocentric RGB frames from a camera 1.5\,m above the floor and knows its action increments; no depth, GPS, or pose is given. Actions are \textsc{move\_forward} (0.25\,m), \textsc{turn\_left}/\textsc{turn\_right} (30$^\circ$), \textsc{look\_up}/\textsc{look\_down} (30$^\circ$), \textsc{target\_found} (report a target), and \textsc{finish} (declare completion). The budget is $B{=}800$ steps regardless of target count.
+
+\textbf{Targets and reporting.}
+A goal specification $g$ is a category name, an attribute description (``Locate every chair made of wood.''), or reference images each outlining one target. It selects a set $Y=\{c_1,\dots,c_N\}$ of legal targets; instances within 0.2\,m are merged into a cluster that acts as one target but absorbs up to $n$ reports before further ones count as duplicates. \textsc{target\_found} claims every unclaimed target with a viewpoint within $d_{\mathrm{succ}}{=}0.25$\,m geodesic of the agent: reporting requires approaching, and a signal claiming nothing new is a false positive.
+
+\textbf{Two tasks.}
+In \emph{ManyON} the count is given: claim $k$ distinct instances out of $M \geq k$ candidates, subset and visit order free. In \emph{AllON} the count is withheld: claim all $N$ instances \emph{and} emit \textsc{finish}; truncation at the budget is not success. Prescribed-sequence multi-goal tasks admit a single visit plan, whereas ManyON offers $\binom{M}{k}$ subsets and $k!$ orderings each, and AllON adds a stopping decision unsupported by any known count.
+
+\subsection{Dataset Construction}
+\label{sec:construction}
+
+Episodes are built from the semantic annotations of 36 HM3D validation scenes. Instance geometry is parsed from the semantic meshes; categories are whitelist-filtered and synonym-merged; only reachable instances with valid navigation viewpoints are kept. For each category with $n \geq 2$ target clusters we create one AllON query and up to three ManyON queries with $k \in [2, n]$; 119 AllON queries compose targets across categories. \emph{Attribute} goals rely on a judge VLM that labels per-instance attributes from dedicated object views. \emph{Image} goals render each target from a navigable viewpoint at camera height with the target outlined by a bounding box, which resolves ambiguity among identical siblings and raises the fraction of usable instances from 22\% to 68\%. Text queries are paraphrased into three instructions by an LLM, one sampled per episode. Start poses are sampled on the navmesh 0.3--30\,m geodesic from the nearest target, and the optimal route over the legal set is precomputed as the efficiency reference below. Category lists, clustering and rendering parameters, and solver details are deferred to the appendix.
+
+\subsection{Dataset Statistics}
+\label{sec:statistics}
+
+Table~\ref{tab:dataset} summarizes the 750 episodes. Required counts are uniform over $[2,10]$ in both tasks, and ManyON candidate pools are large (median 15, up to 130 instances), so subset selection is genuinely combinatorial. The image track is defined for AllON only, as per-target reference images presuppose an enumerable goal set.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Episode statistics (750 episodes, 36 scenes, 20--21 per scene). $k$/$N$: instances to find; $M$: legal candidates in the scene. AllON requires all $N$ matching instances, so $M{=}N$.}
+\label{tab:dataset}
+\begin{tabular}{llccc}
+\toprule
+Task & Goal type & \#Episodes & Required & Pool $M$ \\
+\midrule
+ManyON & category  & 150 & $k \in [2,10]$ & 2--130 (med.\ 15.5) \\
+ManyON & attribute & 150 & $k \in [2,10]$ & 2--78 (med.\ 15.0) \\
+\midrule
+AllON  & category  & 150 & $N \in [2,10]$ & $=N$ \\
+AllON  & attribute & 150 & $N \in [2,10]$ & $=N$ \\
+AllON  & image     & 150 & $N \in [2,10]$ & $=N$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Evaluation Protocol}
+\label{sec:metrics}
+
+\emph{Outcome metrics} rank agents; \emph{process diagnostics} attribute performance to specific capabilities. Diagnostics are not ranked, each isolates one failure source observed in practice, and no behavior is charged twice — paths after the final discovery, for instance, are excluded from path efficiency and scored only by the stopping diagnostic. Inapplicable metrics are null and skipped in aggregation, never zero.
+
+\textbf{Outcome metrics.}
+\emph{SR}: ManyON requires $\geq k$ distinct claims within budget; AllON requires all $N$ claims and an explicit \textsc{finish}. \emph{Precision/Recall/F1} score the report set under the dedup-aware crediting rule, with Recall denominators $k$ (ManyON) and $N$ (AllON); Precision guards against report-everything strategies. \emph{SPL-multi} weights success by path efficiency against the precomputed optimal route, the agent's path truncated at its last successful claim: $\mathrm{SPL\text{-}multi}_i = S_i \cdot l_i^{*} / \max(p_i^{\mathrm{tr}}, l_i^{*})$.
+
+\textbf{Search--planning decomposition.}
+For agents exposing their discovered candidate pool, we factor the path ratio using five route quantities: $l^{*}$, the optimal subset-and-order route over all legal targets; $l^{\mathrm{pool}}$, the same over the discovered pool; $l^{\mathrm{sub}}$, optimal order over the reported subset; $g^{\mathrm{ord}}$, geodesic sum along the actual report order; and $p^{\mathrm{tr}}$, the traveled path. Then
+\begin{equation}
+\mathrm{SPL\text{-}multi} = S \times \underbrace{(SQ \times PE)}_{\text{search}} \times \underbrace{(TSQ \times OQ)}_{\text{planning}},
+\end{equation}
+with Search Quality $SQ = l^{*}/l^{\mathrm{pool}}$, Path Efficiency $PE = g^{\mathrm{ord}}/p^{\mathrm{tr}}$, Target Selection Quality $TSQ = l^{\mathrm{pool}}/l^{\mathrm{sub}}$, and Ordering Quality $OQ = l^{\mathrm{sub}}/g^{\mathrm{ord}}$. The product telescopes to $l^{*}/p^{\mathrm{tr}}$, attributing losses cleanly to search versus planning. A side channel, Search Coverage $SC = \min(1, |\text{matched pool}|/\text{required})$, reports whether the pool suffices; when it does not, $SQ$ is null, and $TSQ$ is undefined for AllON, where no subset choice exists.
+
+\textbf{Further diagnostics.}
+\emph{RTSR} $= (m - |\mathrm{unique}(S)|)/m$ over the claim sequence $S$ isolates duplicate reporting from misrecognition. For AllON, a four-way split (\{all found, missed\} $\times$ \{self-terminated, truncated\}) plus \emph{Stopping Regret} — wasted steps after the final discovery, or missing targets times the average discovery interval — separates stopping errors from budget exhaustion. Two trajectory-only diagnostics are agent-agnostic: \emph{OSR} replays success with approached (rather than reported) targets, and together with \emph{report conversion} splits $\mathrm{found} = \mathrm{OSR} \times \mathrm{conversion}$ into arrival versus recognition; \emph{NE} records each report's distance to the nearest legal viewpoint, separating near-miss from off-target false positives. Finally, \emph{choice-opportunity} statistics verify that genuine decisions arise: $U_t$ counts instantiated-but-unreported candidates at each decision step, and trace-based measures quantify non-greedy frontier choices, budget-pressure action drift, and tool-chain depth. These dataset-validity diagnostics are never ranked.
+
+\textbf{Aggregation.}
+All metrics are computed per episode and macro-averaged; Precision/Recall/F1 and RTSR are additionally micro-averaged. Solver approximations, thresholds, and null-handling rules are deferred to the appendix.

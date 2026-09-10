@@ -35,6 +35,7 @@ remote_results/
 /*_diagnostics_*.tar
 /diag_code_sync_*.tar
 .diagnostics/
+测试规格.txt
 
 # ===== 数据文件 / 权重 =====
 /_benchmark_*/

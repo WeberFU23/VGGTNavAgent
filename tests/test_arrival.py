@@ -235,34 +235,32 @@ def test_adjustment_can_tilt_camera_and_auto_levels_before_resume():
     assert ("adjustment_direct_evidence", b"tilted-evidence") in resumed_images
 
 
-def test_adjustment_stops_when_target_cumulative_budget_is_exhausted():
-    """同一 target 的跨 session 预算耗尽时，不再请求 VLM。"""
+def test_adjustment_has_no_cross_session_budget():
+    """跨 session 累计预算已移除：同一区域可反复 START_ADJUST。"""
     agent = _make_agent()
-    agent._adjustment_key = ("candidate", "c1")
-    agent._adjustment_budgets[agent._adjustment_key] = {
-        "sessions": 1, "steps": agent.adjust_max_total_steps_per_target,
-        "turns": 0, "turn_streak": 0, "last_turn": None,
-    }
-    abandoned = []
-    agent._abandon_adjustment_target = lambda obs, reason: (
-        abandoned.append(reason) or int(Action.TURN_LEFT))
+    agent._build_decider_input = lambda obs, **kwargs: ({}, None)
+    agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"rgb")
+    replies = [DecisionResult("MOVE_FORWARD"),
+               DecisionResult("MOVE_FORWARD")]
     agent.decision_loop = SimpleNamespace(
-        decide=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("budget exhaustion must not query VLM")))
+        decide=lambda *a, **k: replies.pop(0), logger=None)
+    agent._explore_action = lambda obs: int(Action.TURN_LEFT)
+    assert not hasattr(agent, "_adjustment_budgets")
 
-    assert agent._adjustment_action(_obs()) == int(Action.TURN_LEFT)
-    assert abandoned == ["target_total_adjustment_steps_exhausted"]
+    first = agent._start_adjustment(_obs(step=100), "world_state_updated")
+    assert first == int(Action.MOVE_FORWARD)
+    agent._abandon_adjustment_target(_obs(step=101), "test_done")
+    # 不做任何"预算恢复"，第二次 START_ADJUST 依然直接进入 session。
+    second = agent._start_adjustment(_obs(step=102), "world_state_updated")
+    assert second == int(Action.MOVE_FORWARD)
+    assert agent._adjusting
 
 
 def test_adjustment_rejects_repeated_same_turn_before_another_loop():
     """第三次连续同向转动直接冷却 target，避免原地旋转。"""
     agent = _make_agent()
-    key = ("candidate", "c1")
-    agent._adjustment_key = key
-    agent._adjustment_budgets[key] = {
-        "sessions": 1, "steps": 2, "turns": 2,
-        "turn_streak": 2, "last_turn": "TURN_LEFT",
-    }
+    agent._adjust_turn_streak = 2
+    agent._adjust_last_turn = "TURN_LEFT"
     agent._build_decider_input = lambda obs, **kwargs: ({}, None)
     agent.vlm = SimpleNamespace(encode_rgb=lambda rgb: b"rgb")
     agent.decision_loop = SimpleNamespace(

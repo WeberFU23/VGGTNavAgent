@@ -102,9 +102,10 @@ def test_payload_excludes_found_goals():
     assert [label for label, _ in payload] == ["goal_image_1"]
 
 
-def _hit(point, candidate_id, goal_index=None):
-    return {"point": list(point), "found": True, "frame_id": 10,
-            "candidate_id": candidate_id, "pixel": [100.0, 100.0],
+def _hit(point, candidate_id, goal_index=None, frame_id=10,
+         pixel=(100.0, 100.0)):
+    return {"point": list(point), "found": True, "frame_id": frame_id,
+            "candidate_id": candidate_id, "pixel": list(pixel),
             "bbox": None, "point_score": 1.0, "text": "target",
             "goal_index": goal_index}
 
@@ -165,3 +166,179 @@ def test_prompt_image_section_only_in_image_mode():
     text = prompts.build_decision_prompt("world_state_updated", state_img, 15)
     assert "Image-goal mode" in text
     assert "goal_index=N" in text
+
+
+def _two_goal_agent():
+    agent = _make_agent(_FakeVLM("goal_image_0: clock\ngoal_image_1: chair"))
+    agent._capture_goal_images(_obs(
+        goal_type="image", goal_images=[_goal_rgb(1), _goal_rgb(2)]))
+    agent._last_observation = _obs(step=100)
+    return agent
+
+
+def test_goal_retrieval_queries_skip_found():
+    agent = _two_goal_agent()
+    assert agent._goal_retrieval_queries() == [(0, "clock"), (1, "chair")]
+    agent._goal_found.add(0)
+    assert agent._goal_retrieval_queries() == [(1, "chair")]
+    agent._goal_found.add(1)
+    assert agent._goal_retrieval_queries() == []
+
+
+def test_goal_relevant_frames_merge_per_frame():
+    agent = _two_goal_agent()
+    replies = {
+        "clock": [{"frame_id": 5, "score": 0.9, "caption": "a wall clock"},
+                  {"frame_id": 7, "score": 0.5, "caption": "c7"}],
+        "chair": [{"frame_id": 5, "score": 0.7, "caption": "clock again"},
+                  {"frame_id": 9, "score": 0.8, "caption": "a chair"}],
+    }
+    agent.client = SimpleNamespace(
+        retrieve_captions=lambda query, top_k=5: replies[query])
+    rows = agent._goal_relevant_frames()
+    by_id = {row["frame_id"]: row for row in rows}
+    # 同一帧被两个目标命中：合并成一行并带 matched_goals；分数取最高
+    assert by_id[5]["matched_goals"] == [0, 1]
+    assert by_id[5]["score"] == 0.9
+    assert by_id[9]["matched_goals"] == [1]
+    assert rows[0]["frame_id"] == 5              # 按分数降序
+    # 找到 goal 0 后只剩一路查询
+    agent._goal_found.add(0)
+    rows = agent._goal_relevant_frames()
+    assert all(row["matched_goals"] == [1] for row in rows)
+
+
+def test_caption_hit_interrupt_queries_unfound_goals():
+    agent = _two_goal_agent()
+    agent._goal_found.add(0)                     # 只为未找到的 goal 1 检索
+    seen = []
+    agent.client = SimpleNamespace(
+        get_captioned_frame_ids=lambda: (True, [42]),
+        retrieve_captions=lambda query, top_k=3: (
+            seen.append(query),
+            [{"frame_id": 42, "score": 0.9, "caption": "chair"}])[1])
+    chosen = []
+    agent._choose_high_level_target = (
+        lambda observation, event: chosen.append(event) or "DECIDE")
+    out = agent._caption_hit_decision(_obs(step=10))
+    assert out == "DECIDE"
+    assert seen == ["chair"]
+    assert any("goal_image_1" in e for e in agent._events)
+
+
+def test_goal_index_conflict_withheld_then_rebound():
+    agent = _two_goal_agent()
+    obs = _obs(step=100)
+    first = agent._ingest_semantic_hits(
+        obs, [_hit([0.0, 0.0, 0.0], "c1", goal_index=0)], select=False)
+    second = agent._ingest_semantic_hits(
+        obs, [_hit([8.0, 8.0, 0.0], "c2", goal_index=0, frame_id=20,
+                   pixel=(500.0, 500.0))], select=False)
+    id_first = first[0]["instance_id"]
+    id_second = second[0]["instance_id"]
+    # 一图一实例：第二次绑定被扣下，冲突挂起且实例照常创建
+    assert agent._instance_goal_index == {id_first: 0}
+    assert agent.active_goal_conflicts() == [
+        {"goal_index": 0, "holder_instance_id": id_first,
+         "challenger_instance_id": id_second}]
+    # 裁决：绑定转移到真身，另一方解绑，冲突清除
+    out = agent._tool_resolve_goal_conflict(0, id_second)
+    assert out["bound_instance"] == id_second
+    assert out["unbound_instance"] == id_first
+    assert agent._instance_goal_index == {id_second: 0}
+    assert agent.active_goal_conflicts() == []
+
+
+def test_resolve_goal_conflict_validation():
+    agent = _two_goal_agent()
+    obs = _obs(step=100)
+    agent._ingest_semantic_hits(
+        obs, [_hit([0.0, 0.0, 0.0], "c1", goal_index=0)], select=False)
+    agent._ingest_semantic_hits(
+        obs, [_hit([8.0, 8.0, 0.0], "c2", goal_index=0, frame_id=20,
+                   pixel=(500.0, 500.0))], select=False)
+    third = agent._ingest_semantic_hits(
+        obs, [_hit([4.0, 4.0, 0.0], "c3", goal_index=1, frame_id=30,
+                   pixel=(300.0, 300.0))], select=False)
+    # 局外实例不能接收绑定
+    out = agent._tool_resolve_goal_conflict(0, third[0]["instance_id"])
+    assert "error" in out
+    # 无冲突的 goal_index 报错
+    assert "error" in agent._tool_resolve_goal_conflict(1, third[0][
+        "instance_id"])
+    # description 模式禁用
+    plain = _make_agent()
+    assert "error" in plain._tool_resolve_goal_conflict(0, 1)
+
+
+def test_goal_conflict_pruned_after_merge_and_report():
+    agent = _two_goal_agent()
+    obs = _obs(step=100)
+    first = agent._ingest_semantic_hits(
+        obs, [_hit([0.0, 0.0, 0.0], "c1", goal_index=0)], select=False)
+    second = agent._ingest_semantic_hits(
+        obs, [_hit([8.0, 8.0, 0.0], "c2", goal_index=0, frame_id=20,
+                   pixel=(500.0, 500.0))], select=False)
+    id_first = first[0]["instance_id"]
+    id_second = second[0]["instance_id"]
+    # merge 吸收一方后冲突自动失效
+    agent._tool_merge_instances(id_first, id_second)
+    assert agent.active_goal_conflicts() == []
+    # 重建冲突后报告目标：冲突同样失效
+    agent._bind_goal_index(id_first, 0)
+    other = agent._ingest_semantic_hits(
+        obs, [_hit([20.0, 20.0, 0.0], "c4", goal_index=0, frame_id=40,
+                   pixel=(700.0, 700.0))], select=False)
+    assert agent.active_goal_conflicts()[0]["challenger_instance_id"] == \
+        other[0]["instance_id"]
+    agent.target_instance_id = id_first
+    agent._report_found(id_first)
+    assert agent.active_goal_conflicts() == []
+
+
+def test_decision_prompt_shows_binding_conflicts():
+    state_img = {"task": {"goal": "g", "mode": "all", "found": 0,
+                          "expected": None, "goal_type": "image",
+                          "goal_descriptions": ["a clock"],
+                          "goals_unfound": [0], "goals_total": 1,
+                          "goal_conflicts": [
+                              {"goal_index": 0, "holder_instance_id": 3,
+                               "challenger_instance_id": 5}]}}
+    text = prompts.build_decision_prompt("world_state_updated", state_img, 15)
+    assert "BINDING CONFLICTS" in text
+    assert "resolve_goal_conflict" in text
+
+
+def test_image_system_prompt_split():
+    desc = prompts.build_decider_system(15)
+    image = prompts.build_decider_system(15, image_mode=True)
+    assert desc != image
+    assert "resolve_goal_conflict" not in desc   # description 契约不变
+    assert "goals_unfound" in image
+    assert "matched_goals" in image
+    assert "resolve_goal_conflict(goal_index, keep_instance_id)" in image
+    # 工具 JSON 契约仍在 image 契约里
+    assert '"tool_call":' in image
+
+
+def test_image_mode_force_finish_when_all_goals_found():
+    agent = _make_agent(_FakeVLM("goal_image_0: clock\ngoal_image_1: chair"))
+    agent._capture_goal_images(_obs(
+        goal_type="image", goal_images=[_goal_rgb(1), _goal_rgb(2)]))
+    agent._target_mode = "all"
+    agent.decision_loop = None  # 强制走确定性路径
+    obs = _obs(step=100)
+    # 未找齐：不结束（step=100 也达不到规则兜底的 late 条件）
+    agent._goal_found = {0}
+    assert agent._should_finish(obs) is False
+    # 找齐：无需 VLM 参与，强制 FINISH
+    agent._goal_found = {0, 1}
+    assert agent._should_finish(obs) is True
+
+
+def test_force_finish_not_applied_in_description_mode():
+    agent = _make_agent()
+    agent._target_mode = "all"
+    agent.decision_loop = None
+    agent._goal_found = {0}  # description 模式下此集合不应生效
+    assert agent._should_finish(_obs(step=100)) is False

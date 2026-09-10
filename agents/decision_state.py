@@ -60,6 +60,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
     report_near_m = float(os.environ.get("NAV_REPORT_NEAR_DIST_M", "1.0"))
     unreachable_ids = getattr(agent, "_unreachable_instance_ids",
                               None) or set()
+    # 实例规划失败计数（GOTO_INSTANCE 连续 plan failed），供 VLM 判断
+    # 是否值得稍后重选；达到上限的实例进入 unreachable_ids。
+    plan_fail_map = getattr(agent, "_instance_plan_failures", None) or {}
     keep_unreachable = set()
     for nd in nodes:
         if nd.iid not in unreachable_ids:
@@ -123,6 +126,9 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         }
         if nd.iid in unreachable_ids:
             row["unreachable"] = True
+        pf = plan_fail_map.get(nd.iid)
+        if pf:
+            row["plan_failures"] = int(pf.get("count", 0))
         if nd.iid in nearby_map:
             row["nearby"] = nearby_map[nd.iid]
         goal_index = getattr(agent, "_instance_goal_index", {}).get(nd.iid)
@@ -196,6 +202,13 @@ def build_world_state(agent, observation, grid=None, frontiers=None,
         task["goals_total"] = len(goal_images)
         task["goals_unfound"] = [i for i in range(len(goal_images))
                                  if i not in found_idx]
+        # image 模式以清单为准：found = 已勾掉的目标照片数（可能少于
+        # _reported_count——未绑定 goal_index 的报告不计入清单）。
+        task["found"] = len(found_idx)
+        # goal_index 绑定冲突（一图一实例被两个实例同时声称），待 VLM 裁决。
+        conflicts_fn = getattr(agent, "active_goal_conflicts", None)
+        task["goal_conflicts"] = (conflicts_fn() if callable(conflicts_fn)
+                                  else [])
 
     return {
         "task": task,

@@ -38,7 +38,8 @@ REPORT_NEAR_DIST_M = float(os.environ.get("NAV_REPORT_NEAR_DIST_M", "1.0"))
 
 # 写工具：成功执行后世界状态已变化，动作校验前必须刷新 world-state。
 WRITE_TOOLS = ("update_instance", "update_notes", "instantiate_points",
-               "commit_candidates", "resolve_duplicate")
+               "commit_candidates", "resolve_duplicate",
+               "resolve_goal_conflict")
 
 EVENT_ACTIONS = {
     # 除 finish_check / adjustment 外放行高层动作（EXPLORE 除外——VLM 滥用
@@ -151,7 +152,13 @@ class DecisionLoop:
         self._trace_sink = trace_sink
         self._trace_call_context = trace_call_context
         state = world_state
-        self._system_prompt = build_decider_system(self.max_tool_rounds)
+        # image-goal 模式使用独立重写的系统提示词（清单式任务契约）；
+        # description 模式的提示词逐字节不变。
+        task = world_state.get("task", {}) if isinstance(world_state, dict) \
+            else {}
+        self._system_prompt = build_decider_system(
+            self.max_tool_rounds,
+            image_mode=str(task.get("goal_type", "")).lower() == "image")
         images = list(images or [])
         if map_png:
             images = self._with_topdown_map(images, map_png)
@@ -652,14 +659,19 @@ class DecisionLoop:
                               tool_calls=tool_calls, steps=steps), None
 
     def _enforce_finish(self, result, world_state):
-        """只强制 benchmark 明确给出的 many 数量；其他判断交给 VLM。"""
+        """强制终止的硬条件：many 数量未达、image-goal 仍有未找到的
+        目标时拒绝 FINISH；其他判断交给 VLM。"""
         if result.action != "FINISH":
             return result
         task = world_state.get("task", {})
         needs_count = task.get("mode") == "many" \
             and task.get("expected") is not None \
             and task.get("found", 0) < task["expected"]
-        if not needs_count:
+        # image-goal: 照片数即目标数，还有未找到的 goal 时不允许
+        # VLM 提前 FINISH（找齐后由 NavAgent._should_finish 强制结束）。
+        image_unfinished = task.get("goal_type") == "image" and bool(
+            task.get("goals_unfound"))
+        if not (needs_count or image_unfinished):
             return result
         instances = [item for item in world_state.get("instances", [])
                      if not item.get("reported", False)]

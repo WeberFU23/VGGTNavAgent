@@ -510,6 +510,7 @@ prompt transcript 与 decision_window 条目共用同一口径。API 调用失�
 | `pick_segment(frame_id, mask_ids, query)` | 选中 mask 注册为 proposal（质心为像素、mask 用于深度采样），随后走 commit 流程，写 |
 | `commit_candidates(reviews, label)` | 批量 `ACCEPT/REJECT/UNCERTAIN`；只解析 ACCEPT 写入 active instance（3m 内有邻居的挂起 duplicate_review），写 |
 | `resolve_duplicate(observation_id, decision, duplicate_of, text)` | 去重复核裁决：DUPLICATE 并入既有实例 / NEW 新建，写 |
+| `resolve_goal_conflict(goal_index, keep_instance_id)` | 仅 image-goal：一图一实例绑定冲突裁决，绑定移到 keep、另一方解绑，写 |
 | `review_crosshair(frame_id, pixel_1000, verdict, reason)` | 对已展示十字图记录三值审核（新代码优先走批量 commit），写 |
 | `instantiate_points(frame_id, pixels_1000, label)` | 像素 → 显式 ACCEPT 语义审核 → 3D 几何验证 → Observation → canonical instance（兜底路径）；返回 `instances`、`semantic_rejections` 与 `geometry_rejections`，写 |
 | `search_instances(query, reported=null, top_k=10)` | 实例 text 关键词 OR 匹配，按命中数排序，只读 |
@@ -576,11 +577,10 @@ VLM 必须输出一个 JSON 对象：
   默认 8，每步 0.25m）：harness 逐步连续执行，碰撞即中断并把新观测交还
   VLM。转向与俯仰仍每次执行一次；`LOOK_UP/LOOK_DOWN` 每次改变俯仰
   30°，相对中性姿态默认限制 ±1 档，`END_ADJUST` 后自动回正。同一
-  target 的 session、累计步数和转向数分别受
-  `NAV_ADJUST_MAX_SESSIONS_PER_TARGET`（默认 2）、
-  `NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET`（默认 8）、
-  `NAV_ADJUST_MAX_TURNS_PER_TARGET`（默认 4）限制；连续同向转超过两次
-  会冷却该 target 并回到探索，禁止 `END_ADJUST`/`START_ADJUST` 循环；
+  session 内连续同向转超过两次会冷却该 target 并回到探索，禁止
+  `END_ADJUST`/`START_ADJUST` 循环。跨 session 不做累计预算限制：
+  同一区域允许多次调整（反复微调是合理行为），防死循环只靠
+  per-session 防护（单轮步数上限、转向连击冷却、END 进展门槛）；
 - `FINISH`：不可逆。many 模式数量不足时被 harness 拒绝并降级。
 
 `EXPLORE` 已从动作表移除（VLM 曾滥用一键探索）；探索应显式选
@@ -589,6 +589,28 @@ VLM 必须输出一个 JSON 对象：
 
 程序只做结构性约束：动作属于当前事件、目标 ID 存在、导航实例尚未报告；
 报告 ID 还必须等于当前 active canonical instance。
+
+### 9.4 image-goal 模式
+
+benchmark 下发 N 张描边目标照片（一张照片 = 一个物理实例，数量即
+清单）而非文字描述时，agent 进入 image-goal 模式，与 description
+模式的差异全部收在 `if self._image_goal_mode` 分支里：
+
+- **提示词整体拆分**：系统契约换成独立重写的 `DECIDER_PROMPT_IMAGE`
+  （`build_decider_system(..., image_mode=True)`，按
+  `task.goal_type == "image"` 分流），围绕"清单任务"组织——目标照片
+  数即目标数，全部找齐后由 `_should_finish` 强制 `FINISH`，VLM 不再
+  承担终止判断（仍有未找到目标时的 `FINISH` 会被 `_enforce_finish`
+  降级为继续探索）；description 契约逐字节不变。
+- **逐目标语义检索**：description 模式的单路 `target_text` 检索在
+  image 模式换成每个未找到目标各出一路 BGE 查询（冷启动为每张目标
+  照片生成一句检索描述），覆盖 caption 命中中断与每次决策自动注入的
+  `relevant_frames`；后者按帧合并去重，行内 `matched_goals` 标出该帧
+  命中了哪几张目标照片。
+- **一图一实例绑定**：实例化时经 `goal_index` 绑定目标照片，系统拒绝
+  两个实例绑定同一索引——冲突挂起到 `task.goal_conflicts`，VLM 比较
+  双方证据图与目标照片后用 `resolve_goal_conflict` 裁决（绑定转移给
+  真身），同物则用 `merge_instances`。报告成功后该照片从决策输入撤下。
 
 ## 10. 执行层
 
@@ -621,8 +643,10 @@ inspect_sector 至少产生一个 mapping keyframe；否则 harness 继续一个
 换目标或 START_ADJUST；到达本身不强制微调。`act()` 常规跟随和 VLM 刚
 下发 `GOTO_INSTANCE` 后的即时跟随共用同一个 arrival transition，因此
 零长度路径/已在阈值内也会当轮审核，不会被误转成探索。实例路径规划失败
-时立即清除 active target，避免物理控制在探索而 world-state 长期保留
-旧目标。
+时清除 active target（避免物理控制在探索而 world-state 长期保留旧目标），
+但实例保留在池中并计入 `plan_failures`；重选受
+`NAV_INSTANCE_PLAN_RETRY_STEPS` 步冷却限制，连续失败达到
+`NAV_INSTANCE_PLAN_FAIL_LIMIT` 次才标记 unreachable（REPORT 校验仍可用）。
 
 ## 11. 可靠性、留痕与评测接口
 
@@ -739,8 +763,8 @@ instance（`self.instance_store.nodes`，含已上报的，`reported` 标志区�
 | `NAV_VLM_MAX_IMAGES` | — | 单轮决策图像预算 | 决策 |
 | `NAV_ADJUST_MAX_STEPS` | 10 | 单次 adjustment 总步数上限 | 执行 |
 | `NAV_ADJUST_MAX_FORWARD_STEPS` | 8 | MOVE_FORWARD 单指令最大步数（0.25m/步） | 执行 |
-| `NAV_ADJUST_MAX_SESSIONS_PER_TARGET` / `NAV_ADJUST_MAX_TOTAL_STEPS_PER_TARGET` / `NAV_ADJUST_MAX_TURNS_PER_TARGET` | 2 / 8 / 4 | 同一 target 的 adjust 频次与总量限制 | 执行 |
 | `NAV_NAV_ESCAPE_TURNS` / `NAV_NAV_BLOCK_RADIUS_M` / `NAV_NAV_BLOCK_TTL_STEPS` / `NAV_NAV_COLLISION_LIMIT` | 1 / 0.35 / 80 / 3 | 碰撞恢复：脱困转向、临时障碍半径与 TTL、unreachable 判定 | 执行 |
+| `NAV_INSTANCE_PLAN_FAIL_LIMIT` / `NAV_INSTANCE_PLAN_RETRY_STEPS` | 3 / 40 | 实例规划失败计数上限与重选冷却 | 执行 |
 | `MAPPING_STUCK_CONFIRM_STEPS` | 2 | 前进受阻的双帧静止确认 | 执行 |
 | `NAV_DEBUG_ROOT` / `NAV_RUN_ID` | — | 诊断输出目录隔离 | 留痕 |
 | `NAV_VLM_TRACE_INLINE_IMAGES` | 0 | trace 中内联图像 base64 | 留痕 |
@@ -790,7 +814,9 @@ instance（`self.instance_store.nodes`，含已上报的，`reported` 标志区�
 - **问题**：契约曾放在 user 消息里每轮全文重发；工具轮间 user 文本
   只增不减，一次重度决策可能带 3–4 份不同版本的 world_state。
 - **选择**：静态契约挪 system 角色；user 由 `{最新 world_state,
-  window, event+引导, 工具 transcript}` 四部分每轮重渲染。
+  window, event+引导, 工具 transcript}` 四部分每轮重渲染。系统契约按
+  目标类型拆分：description 用 `DECIDER_PROMPT`，image-goal 用独立
+  重写的 `DECIDER_PROMPT_IMAGE`（§9.4），互不污染。
 - **理由**：user 每轮只装动态内容，成本有界且为 prompt caching 留好
   静态前缀；world_state 永远只有最新一份，模型不再被互相矛盾的过期
   state 干扰；最新工具结果始终落在近因位置。Event 与事件引导收在

@@ -136,7 +136,7 @@ Perception and retrieval:
   frames may contain the target. Read-only.
 - view_frame(frame_id): attach the keyframe's raw RGB image to your next
   input. Use it to verify what a frame actually shows. Read-only.
-- propose_candidates(frame_id, query) -> {{masks: [{{mask_id, centroid,
+- propose_candidates(query, frame_id=null) -> {{masks: [{{mask_id, centroid,
   bbox, area_frac}}]}} plus an attached numbered overlay image: segment the
   whole frame into object regions with SAM (no pointing model involved).
   centroid/bbox are 0-1000 normalized, matching the numbers printed on the
@@ -202,7 +202,11 @@ re-propose from the new viewpoint instead of repeating from afar.
   them and commit with commit_candidates exactly as with propose_candidates.
   goal_index: only in image-goal mode — the index N of the goal_image_N this
   proposal is meant to match.
-- instantiate_points(frame_id, pixels_1000, label, goal_index=null) ->
+- instantiate_points(pixels_1000, label, frame_id=null, goal_index=null) ->
+  Omit frame_id in propose_candidates/instantiate_points to use the
+  latest ready keyframe (current_frame_id in the world state); an
+  "unknown frame_id" error means that frame is not processed yet --
+  retry with a ready frame instead of guessing numbers.
   {{instances: [{{instance_id, observation_id, frame_id, confidence,
   association, reported}}], pending_confirmation: [...],
   geometry_rejections: [...]}}: FALLBACK path — use it only when SAM found
@@ -481,7 +485,7 @@ Perception and retrieval:
   goal_descriptions text of the photo you are hunting. Read-only.
 - view_frame(frame_id): attach the keyframe's raw RGB image to your next
   input. Use it to verify what a frame actually shows. Read-only.
-- propose_candidates(frame_id, query) -> {{masks: [{{mask_id, centroid,
+- propose_candidates(query, frame_id=null) -> {{masks: [{{mask_id, centroid,
   bbox, area_frac}}]}} plus an attached numbered overlay image: segment the
   whole frame into object regions with SAM (no pointing model involved).
   centroid/bbox are 0-1000 normalized, matching the numbers printed on the
@@ -553,7 +557,11 @@ re-propose from the new viewpoint instead of repeating from afar.
   itself is used for depth sampling. Evidence panels are attached; review
   them and commit with commit_candidates exactly as with propose_candidates.
   goal_index is REQUIRED whenever the picked region matches a goal_image_N.
-- instantiate_points(frame_id, pixels_1000, label, goal_index=null) ->
+- instantiate_points(pixels_1000, label, frame_id=null, goal_index=null) ->
+  Omit frame_id in propose_candidates/instantiate_points to use the
+  latest ready keyframe (current_frame_id in the world state); an
+  "unknown frame_id" error means that frame is not processed yet --
+  retry with a ready frame instead of guessing numbers.
   {{instances: [{{instance_id, observation_id, frame_id, confidence,
   association, reported}}], pending_confirmation: [...],
   geometry_rejections: [...]}}: FALLBACK path — use it only when SAM found

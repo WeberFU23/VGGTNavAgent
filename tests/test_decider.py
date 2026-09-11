@@ -58,9 +58,9 @@ def test_prompt_documents_action_effects_tool_returns_and_no_confidence():
         loop.max_tool_rounds) + loop._build_prompt("arrival", _state())
     flat = " ".join(prompt.split())
     for tool in ("search_frames(query, top_k=5)", "view_frame(frame_id)",
-                 "propose_candidates(frame_id, query)",
+                 "propose_candidates(query, frame_id=null)",
                  "pick_segment(frame_id, mask_ids, query, goal_index=null)",
-                 "instantiate_points(frame_id, pixels_1000, label, goal_index=null)",
+                 "instantiate_points(pixels_1000, label, frame_id=null, goal_index=null)",
                  "review_crosshair(frame_id, pixel_1000, verdict, reason)",
                  "search_instances(",
                  "get_instance(instance_id)",

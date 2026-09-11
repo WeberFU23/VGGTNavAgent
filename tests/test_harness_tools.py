@@ -1282,3 +1282,68 @@ def test_report_found_active_instance_within_gate_is_accepted():
     assert action == int(Action.TARGET_FOUND)
     assert agent._reported_count == 1
     assert len(agent.instance_store.report_claims) == 1
+
+
+# ------------------------------- frame_id 缺省回退与 unknown 帧提示
+def test_instantiate_points_defaults_to_latest_ready_frame():
+    """不传 frame_id 时用最新就绪关键帧，而不是报 BAD_ARGUMENTS。"""
+    seen = {}
+
+    def prepare_pixels(fid, pixels, normalized=True):
+        seen["fid"] = fid
+        cand = _candidate()
+        cand["frame_id"] = fid
+        return {"candidates": [cand]}
+
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent._last_feed_info = {"last_available_frame_id": 42}
+    agent.client = SimpleNamespace(
+        prepare_pixels=prepare_pixels,
+        get_candidate_evidence=lambda cid: ({"found": True}, b"confirm-jpeg"),
+    )
+    out = agent._tool_instantiate_points(None, [[637.1, 359.1]], "basket")
+    assert seen["fid"] == 42
+    assert out["pending_confirmation"], out
+
+
+def test_instantiate_points_no_ready_frame_returns_retryable_error():
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent._last_feed_info = {}
+    agent.client = _two_stage_client()
+    out = agent._tool_instantiate_points(None, [[637.1, 359.1]], "basket")
+    assert "no keyframe ready" in out["error"]
+
+
+def test_unknown_frame_error_carries_ready_frame_hint():
+    """unknown frame_id 错误必须附可用帧号，帮助 VLM 自我修正。"""
+    agent = _make_agent()
+    agent._last_observation = SimpleNamespace(step_count=50)
+    agent._last_feed_info = {"last_available_frame_id": 37}
+    agent.client = SimpleNamespace(
+        prepare_pixels=lambda fid, pixels, normalized=True:
+            {"error": f"unknown frame_id {fid}", "error_code": "TOOL_ERROR"},
+    )
+    out = agent._tool_instantiate_points(5, [[637.1, 359.1]], "basket")
+    msg = out["error"]["message"]
+    assert "unknown frame_id 5" in msg
+    assert "Latest ready keyframe: 37" in msg
+
+
+def test_propose_candidates_defaults_to_latest_ready_frame():
+    seen = {}
+
+    def som_segment(fid, max_masks=None):
+        seen["fid"] = fid
+        return ({"found": True, "frame_id": fid, "width": 518, "height": 518,
+                 "masks": [{"mask_id": 1, "centroid": [637.1, 359.1],
+                            "bbox": [600.0, 320.0, 680.0, 400.0],
+                            "area_frac": 0.05}]}, b"som-jpeg")
+
+    agent = _make_agent()
+    agent._last_feed_info = {"last_available_frame_id": 42}
+    agent.client = SimpleNamespace(som_segment=som_segment)
+    out = agent._tool_propose_candidates()
+    assert seen["fid"] == 42
+    assert out["frame_id"] == 42 and out["masks"]

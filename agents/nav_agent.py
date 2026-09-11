@@ -2212,21 +2212,52 @@ class NavAgent(MappingAgent):
         return {"frame_id": key[0], "pixel": [key[1], key[2]], **review,
                 "instantiation_allowed": verdict == "ACCEPT"}
 
-    def _tool_propose_candidates(self, frame_id, query=""):
+    def _latest_ready_frame_id(self):
+        """最新已入 submap、可直接操作的关键帧号；没有则 None。"""
+        info = self._last_feed_info or {}
+        fid = info.get("last_available_frame_id") or info.get("frame_id")
+        try:
+            return int(fid) if fid is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _unknown_frame_error(self, frame_id, response):
+        """unknown frame 类错误附可用帧提示，帮助 VLM 自我修正。"""
+        err = self._pointing_error(response) or {
+            "error": {"code": "TOOL_ERROR",
+                      "message": f"unknown frame_id {frame_id}"}}
+        msg = str(err["error"].get("message", ""))
+        if "unknown frame" not in msg.lower():
+            return err
+        ready = self._latest_ready_frame_id()
+        hint = (f" Latest ready keyframe: {ready}; use it or a frame "
+                "returned by search_frames."
+                if ready is not None else
+                " No keyframe is ready yet; explore more and retry later.")
+        err["error"]["message"] = (msg + hint)[:400]
+        return err
+
+    def _tool_propose_candidates(self, frame_id=None, query=""):
         """SAM 全分割整帧 → 编号 mask 表 + overlay；VLM 选编号走 pick_segment。
 
         molmo 点指已废弃：分割只依赖 SAM（不依赖 pointing 模型），把
         "生成坐标"变成"选编号"。目标太小/太远时 SAM 会漏分割——先
         START_ADJUST 靠近当前帧再调用，近处 mask 才完整可靠。
         """
+        if frame_id is None:
+            frame_id = self._latest_ready_frame_id()
+            if frame_id is None:
+                return {"error": "no keyframe ready yet; explore "
+                                 "more and retry"}
         try:
             meta, payload = self.client.som_segment(int(frame_id))
         except Exception as exc:
             return {"error": str(exc)[:200]}
         if meta.get("error"):
-            return self._pointing_error(meta)
+            return self._unknown_frame_error(frame_id, meta)
         if not meta.get("found"):
-            return {"masks": [], "error": "unknown or unsegmentable frame"}
+            return self._unknown_frame_error(
+                frame_id, {"error": "unknown or unsegmentable frame"})
         fid = int(frame_id)
         masks = []
         for row in meta.get("masks") or []:
@@ -2506,7 +2537,7 @@ class NavAgent(MappingAgent):
                 out["_tool_images"] = dup_images
         return out
 
-    def _tool_instantiate_points(self, frame_id, pixels_1000, label="",
+    def _tool_instantiate_points(self, frame_id=None, pixels_1000=None, label="",
                                  goal_index=None):
         """按像素坐标实例化 3D 目标（0-1000 归一化坐标）。
 
@@ -2517,6 +2548,11 @@ class NavAgent(MappingAgent):
         goal_index（可选 int）：image-goal 模式下该候选对应的目标照片索引。
         """
         goal_index = self._validate_goal_index(goal_index)
+        if frame_id is None:
+            frame_id = self._latest_ready_frame_id()
+            if frame_id is None:
+                return {"error": "no keyframe ready yet; explore "
+                                 "more and retry"}
         if self._last_observation is None:
             return {"error": "no observation yet"}
         if not isinstance(pixels_1000, (list, tuple)) or not pixels_1000:
@@ -2530,7 +2566,7 @@ class NavAgent(MappingAgent):
             except Exception as exc:
                 return {"error": str(exc)[:200]}
             if prepared.get("error"):
-                return self._pointing_error(prepared)
+                return self._unknown_frame_error(frame_id, prepared)
             candidates = prepared.get("candidates") or []
             if not candidates:
                 return {"instances": [], "semantic_rejections": [],
